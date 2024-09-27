@@ -22,7 +22,7 @@ from ultralytics import YOLO
 model = YOLO("weights/best.pt")
 results = model("screenshot.png", conf=0.1, max_det=2048, iou=0.4, stream=True)
 
-def is_significant_overlap(box1, box2, threshold=0.8):
+def is_significant_overlap(box1, box2, threshold=0.2):
     intersect = box1.intersected(box2)
     intersect_area = intersect.width() * intersect.height()
     smaller_box_area = min(box1.width() * box1.height(), box2.width() * box2.height())
