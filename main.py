@@ -17,31 +17,31 @@ signal.signal(signal.SIGINT, signal.SIG_DFL)
 # Display window
 window = OverlayWindow()
 
-for _ in range(100):
-    x = random.randint(0, 2440)
-    y = random.randint(0, 1440)
-    width = random.randint(20, 100)
-    height = random.randint(20, 100)
 
-    box = Box(x, y, width, height)
-    window.boxes.append(box)
+from ultralytics import YOLO
+
+model = YOLO("weights/best.pt")
+# In the future, use stream for real-time inferences https://docs.ultralytics.com/modes/predict/#inference-sources
+# OR use "screen" to capture screen without taking a screenshot
+results = model("screenshot.png")
+
+for result in results:
+    for box in result.boxes:
+        dim = (box.xywhn).tolist()[0]
+        orig_width = box.orig_shape[1]
+        orig_height = box.orig_shape[0]
+        print("BOX: ", dim, orig_width, orig_height)
+
+        width = int(dim[2]*orig_width)
+        height = int(dim[3]*orig_height)
+        x = int(dim[0]*orig_width-width/2)
+        y = int(dim[1]*orig_height-height/2)
+
+        box = Box(x, y, width, height)
+        window.boxes.append(box)
 
 
 window.show()
 
 # Exit
 sys.exit(app.exec_())
-
-
-from ultralytics import YOLO
-
-model = YOLO("weights/best.pt")
-results = model("screenshot.png")
-
-for result in results:
-    boxes = result.boxes  # Boxes object for bounding box outputs
-    masks = result.masks  # Masks object for segmentation masks outputs
-    keypoints = result.keypoints  # Keypoints object for pose outputs
-    probs = result.probs  # Probs object for classification outputs
-    obb = result.obb  # Oriented boxes object for OBB outputs
-    result.save(filename="result.jpg")  # save to disk
