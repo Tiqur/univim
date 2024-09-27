@@ -23,7 +23,7 @@ from ultralytics import YOLO
 model = YOLO("weights/best.pt")
 # In the future, use stream for real-time inferences https://docs.ultralytics.com/modes/predict/#inference-sources
 # OR use "screen" to capture screen without taking a screenshot
-results = model("screenshot.png")
+results = model("screenshot.png", conf=0.1, max_det=2048, iou=0.4, augment=True)
 
 for result in results:
     for box in result.boxes:
