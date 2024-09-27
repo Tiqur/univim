@@ -29,7 +29,7 @@ def secondary_thread():
             dim = (box.xywhn).tolist()[0]
             orig_width = box.orig_shape[1]
             orig_height = box.orig_shape[0]
-            print("BOX: ", dim, orig_width, orig_height)
+            #print("BOX: ", dim, orig_width, orig_height)
 
             width = int(dim[2]*orig_width)
             height = int(dim[3]*orig_height)
