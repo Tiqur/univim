@@ -1,7 +1,6 @@
 from PyQt5.QtWidgets import QMainWindow, QWidget
-from PyQt5.QtGui import QPainter, QPen
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QPainter, QColor
+from PyQt5.QtGui import QPainter, QColor, QPen, QFont
 from PyQt5.QtGui import QGuiApplication
 
 class Box():
@@ -48,3 +47,9 @@ class OverlayWindow(QMainWindow):
         for box in self.boxes:
             painter.drawRect(box.x, box.y, box.width, box.height)
 
+        # Show settings at top right
+        max_settings_width = 105
+        max_settings_height = 20
+        painter.setBrush(QColor(0, 0, 0))
+        painter.drawRect(0, 0, max_settings_width, max_settings_height)
+        painter.drawText(5, 15, "Confidence: 0.5")
