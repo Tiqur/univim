@@ -30,7 +30,7 @@ def is_significant_overlap(box1, box2, threshold=0.8):
 
 def filter_boxes(boxes):
     # Sort boxes by area in descending order
-    sorted_boxes = sorted(boxes, key=lambda b: b.width() * b.height(), reverse=True)
+    sorted_boxes = sorted(boxes, key=lambda b: b.width() * b.height())
     
     filtered_boxes = []
     for i, box in enumerate(sorted_boxes):
