@@ -2,6 +2,9 @@ import signal
 import sys
 from overlay_window import OverlayWindow
 from PyQt5.QtWidgets import QApplication
+from screenshot import capture_screenshot
+
+capture_screenshot()
 
 # Create Qt application
 app = QApplication(sys.argv)
