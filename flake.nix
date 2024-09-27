@@ -52,6 +52,8 @@
           # Install non-Nix packages using pip
           pip install --upgrade pip
           pip install PyQt5
+          pip install opencv-python
+          pip install Pillow
         '';
       };
     });
