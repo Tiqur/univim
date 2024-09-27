@@ -1,10 +1,10 @@
 import signal
 import sys
 import random
+import threading
 from overlay_window import OverlayWindow, Box
 from PyQt5.QtWidgets import QApplication
 from screenshot import capture_screenshot
-
 
 capture_screenshot()
 
@@ -17,29 +17,30 @@ signal.signal(signal.SIGINT, signal.SIG_DFL)
 # Display window
 window = OverlayWindow()
 
-
 from ultralytics import YOLO
-
 model = YOLO("weights/best.pt")
-# In the future, use stream for real-time inferences https://docs.ultralytics.com/modes/predict/#inference-sources
-# OR use "screen" to capture screen without taking a screenshot
-results = model("screenshot.png", conf=0.1, max_det=2048, iou=0.4, augment=True)
+results = model("screen", conf=0.1, max_det=2048, iou=0.4, stream=True)
 
-for result in results:
-    for box in result.boxes:
-        dim = (box.xywhn).tolist()[0]
-        orig_width = box.orig_shape[1]
-        orig_height = box.orig_shape[0]
-        print("BOX: ", dim, orig_width, orig_height)
+def secondary_thread():
+    for result in results:
 
-        width = int(dim[2]*orig_width)
-        height = int(dim[3]*orig_height)
-        x = int(dim[0]*orig_width-width/2)
-        y = int(dim[1]*orig_height-height/2)
+        # Add boxes to window
+        for box in result.boxes:
+            dim = (box.xywhn).tolist()[0]
+            orig_width = box.orig_shape[1]
+            orig_height = box.orig_shape[0]
+            print("BOX: ", dim, orig_width, orig_height)
 
-        box = Box(x, y, width, height)
-        window.boxes.append(box)
+            width = int(dim[2]*orig_width)
+            height = int(dim[3]*orig_height)
+            x = int(dim[0]*orig_width-width/2)
+            y = int(dim[1]*orig_height-height/2)
 
+            new_box = Box(x, y, width, height)
+            window.add_box(new_box)
+
+x = threading.Thread(target=secondary_thread)
+x.start()
 
 window.show()
 

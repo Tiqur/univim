@@ -37,6 +37,9 @@
             pkgs.zlib
             pkgs.python3
             pkgs.python3Packages.pip
+            pkgs.xorg.xrandr
+            pkgs.xorg.libX11
+            pkgs.xorg.libXrandr
           ]}
 
           export QT_PLUGIN_PATH=venv/lib/python3.10/site-packages/PyQt5/Qt5/plugins

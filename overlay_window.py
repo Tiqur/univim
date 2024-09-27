@@ -1,5 +1,5 @@
 from PyQt5.QtWidgets import QMainWindow, QWidget
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont
 from PyQt5.QtGui import QGuiApplication
 
@@ -11,6 +11,8 @@ class Box():
         self.height = height
 
 class OverlayWindow(QMainWindow):
+    update_signal = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         # Set the window properties
@@ -29,6 +31,15 @@ class OverlayWindow(QMainWindow):
         self.setGeometry(total_geometry)
     
         self.boxes = []
+        self.update_signal.connect(self.update)
+
+    def add_box(self, box):
+        self.boxes.append(box)
+        self.update_signal.emit()
+
+    def clear_boxes(self):
+        self.boxes = []
+        self.update_signal.emit()
 
     def paintEvent(self, event):
         # Handle the paint event
@@ -44,8 +55,12 @@ class OverlayWindow(QMainWindow):
         painter.setPen(pen)
         painter.drawRect(self.rect().adjusted(2, 2, -2, -2))  # Adjust to keep the border inside the window
 
+
         for box in self.boxes:
             painter.drawRect(box.x, box.y, box.width, box.height)
+
+        # Clear previous boxes
+        self.clear_boxes()
 
         # Show settings at top right
         max_settings_width = 105
