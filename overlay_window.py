@@ -54,7 +54,8 @@ class OverlayWindow(QMainWindow):
 
         # Show settings at top right
         max_settings_width = 105
-        max_settings_height = 20
+        max_settings_height = 35
         painter.setBrush(QColor(0, 0, 0))
         painter.drawRect(0, 0, max_settings_width, max_settings_height)
         painter.drawText(5, 15, "Confidence: 0.5")
+        painter.drawText(5, 30, "Overlap: 0.7")
