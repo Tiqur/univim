@@ -53,6 +53,7 @@
           pip install --upgrade pip
           pip install PyQt5
           pip install opencv-python
+          pip install ultralytics
         '';
       };
     });
