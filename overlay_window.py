@@ -191,6 +191,12 @@ class OverlayWindow(QMainWindow):
 
         self.update()
 
+    def scroll_up(self):
+        self.mouse.scroll(0, 2)
+
+    def scroll_down(self):
+        self.mouse.scroll(0, -2)
+
     def click_element(self, index):
         element = self.clickable_elements[index]
         center = element.center()

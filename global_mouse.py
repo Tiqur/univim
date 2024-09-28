@@ -11,7 +11,7 @@ class GlobalMouse:
 
     def on_scroll(self, x, y, dx, dy):
         print("Mouse scrolled")
-        self.stop_event.set()
+        #self.stop_event.set()
 
     def on_click(self, x, y, button, pressed):
         print("Mouse clicked")

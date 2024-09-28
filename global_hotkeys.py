@@ -10,11 +10,15 @@ class GlobalHotKeys(QObject):
         self.start_event = Event()
         self.stop_event = Event()
         self.exit_event = Event()
+        self.scroll_up_event = Event()
+        self.scroll_down_event = Event()
         self.listener = None
         self.alt_pressed = False
         self.is_detection_active = False
 
         self.hotkeys = {
+            keyboard.KeyCode.from_char('j'): self.on_activate_j,
+            keyboard.KeyCode.from_char('k'): self.on_activate_k,
             keyboard.KeyCode.from_char('f'): self.on_activate_f,
             keyboard.Key.esc: self.on_activate_esc,
             keyboard.Key.alt_l: self.on_alt,
@@ -24,6 +28,14 @@ class GlobalHotKeys(QObject):
     def on_activate_esc(self):
         print("ESC key pressed")
         self.stop_event.set()
+
+    def on_activate_j(self):
+        #self.scroll_down_event.set()
+        print("Scroll down")
+
+    def on_activate_k(self):
+        #self.scroll_up_event.set()
+        print("Scroll up")
 
     def on_activate_f(self):
         if self.alt_pressed:

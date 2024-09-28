@@ -25,6 +25,14 @@ def main():
     hotkeys.key_pressed_signal.connect(overlay.key_pressed_signal)
 
     def check_events():
+        if hotkeys.scroll_up_event.is_set():
+            overlay.scroll_up()
+            hotkeys.scroll_up_event.clear()
+
+        if hotkeys.scroll_down_event.is_set():
+            overlay.scroll_down()
+            hotkeys.scroll_down_event.clear()
+
         if hotkeys.start_event.is_set():
             overlay.start_element_detection()
             hotkeys.set_detection_active(True)
