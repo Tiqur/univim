@@ -1,7 +1,6 @@
 from PyQt5.QtWidgets import QMainWindow
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QPainter, QColor, QPen
-from PyQt5.QtGui import QGuiApplication
+from PyQt5.QtGui import QGuiApplication, QPainter, QColor, QPen, QFont, QFontMetrics
 
 class OverlayWindow(QMainWindow):
     update_signal = pyqtSignal()
@@ -12,7 +11,6 @@ class OverlayWindow(QMainWindow):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
 
-        self.setStyleSheet('font-size: 16px')
 
         self.setWindowState(Qt.WindowFullScreen)
         self.setWindowFlags(self.windowFlags() | Qt.X11BypassWindowManagerHint)
@@ -25,6 +23,7 @@ class OverlayWindow(QMainWindow):
         self.boxes = []
         self.update_signal.connect(self.update)
         self.sequence = 1
+        self.font = QFont("Arial", 12)
 
 
     def to_base_26(self, num):
@@ -52,6 +51,40 @@ class OverlayWindow(QMainWindow):
     def send_update_signal(self):
         self.update_signal.emit()
 
+    def draw_box_label(self, painter, p):
+        x = p.x()
+        y = p.y()
+
+        # Set the font and get the metrics
+        painter.setFont(self.font)
+        metrics = QFontMetrics(self.font)
+
+        # Get the width and height of the text
+        shortcut = self.get_next_letter()
+        text_width_px = metrics.width(shortcut)
+        font_height_px = metrics.height()
+
+        # Define padding relative to the font size
+        padding_x = int(font_height_px * 0.1)  # Horizontal padding
+        padding_y = int(font_height_px * 0.1)  # Vertical padding
+
+        # Define the rectangle size based on the text size and padding
+        rect_width = int(text_width_px + 2 * padding_x)
+        rect_height = int(font_height_px + 2 * padding_y)
+
+        # Set the pen color and fill the rectangle behind the text
+        painter.fillRect(x, y, rect_width, rect_height, QColor(0, 255, 255))
+        painter.setPen(QColor(0, 0, 0))
+
+        # Calculate centered positions for the text
+        text_x = x + (rect_width - text_width_px) // 2
+        text_y = y + (rect_height + metrics.ascent() - metrics.descent()) // 2
+
+        # Draw the text at the calculated position
+        painter.drawText(text_x, text_y, shortcut)
+
+
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -70,13 +103,7 @@ class OverlayWindow(QMainWindow):
         painter.setPen(pen)
         for box in self.boxes:
             tl_point = box.topLeft()
-            x = tl_point.x()
-            y = tl_point.y()
-            pen = QPen(QColor(0, 0, 0))
-            painter.fillRect(x, y-15, 30, 15, QColor(0, 255, 255))
-            painter.setPen(QColor(0, 0, 0))
-            shortcut = self.get_next_letter()
-            painter.drawText(x, y-2, shortcut)
+            self.draw_box_label(painter, tl_point)
             painter.setPen(QColor(0, 255, 255))
             painter.drawRect(box)
 
