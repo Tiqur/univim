@@ -17,6 +17,7 @@ class YOLOModelLoader(QRunnable):
 class OverlayWindow(QMainWindow):
     update_overlay_signal = pyqtSignal()
     model_loaded_signal = pyqtSignal()
+    key_pressed_signal = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -26,17 +27,14 @@ class OverlayWindow(QMainWindow):
         self.preload_ai_model()
 
     def setup_window_properties(self):
-        # Set up the window to be frameless, stay on top, and cover the full screen
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setWindowState(Qt.WindowFullScreen)
         self.setWindowFlags(self.windowFlags() | Qt.X11BypassWindowManagerHint)
-
         self.set_fullscreen_geometry()
 
     def set_fullscreen_geometry(self):
-        # Ensure the window covers all available screens
         total_geometry = self.geometry()
         for screen in QGuiApplication.screens():
             total_geometry = total_geometry.united(screen.geometry())
@@ -44,7 +42,7 @@ class OverlayWindow(QMainWindow):
 
     def initialize_variables(self):
         self.clickable_elements = []
-        self.sequence_counter = 1
+        self.element_labels = []
         self.label_font = QFont("Arial", 12)
         self.is_overlay_active = False
         self.ai_model = None
@@ -53,9 +51,9 @@ class OverlayWindow(QMainWindow):
     def setup_signals(self):
         self.update_overlay_signal.connect(self.update)
         self.model_loaded_signal.connect(self.on_ai_model_loaded)
+        self.key_pressed_signal.connect(self.handle_key_press)
 
     def preload_ai_model(self):
-        # Start loading the AI model in a separate thread
         loader = YOLOModelLoader(self.set_ai_model)
         self.thread_pool.start(loader)
 
@@ -71,7 +69,6 @@ class OverlayWindow(QMainWindow):
         self.show()
 
     def capture_screen(self):
-        # Capture the entire screen
         screen = QApplication.primaryScreen()
         screenshot = screen.grabWindow(0)
         screenshot.save('current_screen.png', 'png')
@@ -79,7 +76,7 @@ class OverlayWindow(QMainWindow):
     def start_element_detection(self):
         if self.ai_model is None:
             print("AI model is not loaded yet. Please wait.")
-            QTimer.singleShot(1000, self.start_element_detection)  # Retry after 1 second
+            QTimer.singleShot(1000, self.start_element_detection)
             return
 
         self.capture_screen()
@@ -90,6 +87,7 @@ class OverlayWindow(QMainWindow):
         print("Stopping element detection")
         self.is_overlay_active = False
         self.clickable_elements = []
+        self.element_labels = []
         self.update()
 
     def detect_clickable_elements(self):
@@ -100,6 +98,7 @@ class OverlayWindow(QMainWindow):
             filtered_elements = self.filter_overlapping_elements(all_elements)
             
             self.clickable_elements = filtered_elements
+            self.element_labels = [self.generate_label(i) for i in range(len(filtered_elements))]
             self.update_overlay_signal.emit()
 
     def extract_elements_from_result(self, result):
@@ -129,19 +128,25 @@ class OverlayWindow(QMainWindow):
         smaller_elem_area = min(elem1.width() * elem1.height(), elem2.width() * elem2.height())
         return intersect_area / smaller_elem_area > threshold
 
-    def to_base_26(self, num):
-        # Convert a number to a base-26 representation using letters
+    def generate_label(self, num):
         result = []
         while num > 0:
             num -= 1
             result.append(chr(num % 26 + ord('a')))
             num //= 26
-        return ''.join(reversed(result))
+        return ''.join(reversed(result)) if result else 'a'
 
-    def get_next_label(self):
-        label = self.to_base_26(self.sequence_counter)
-        self.sequence_counter += 1
-        return label
+    def handle_key_press(self, key):
+        if self.is_overlay_active:
+            self.update_labels_starting_with(key)
+            self.update()
+
+    def update_labels_starting_with(self, key):
+        for i, label in enumerate(self.element_labels):
+            if label.startswith(key):
+                self.element_labels[i] = label[1:] if len(label) > 1 else ''
+        self.element_labels = [label for label in self.element_labels if label]
+        self.clickable_elements = [elem for elem, label in zip(self.clickable_elements, self.element_labels) if label]
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -155,19 +160,15 @@ class OverlayWindow(QMainWindow):
         self.draw_clickable_elements(painter)
         self.draw_settings_info(painter)
 
-        self.clickable_elements = []
-        self.sequence_counter = 1
-
     def draw_overlay_border(self, painter):
-        # Draw a cyan border around the entire screen
-        pen = QPen(QColor(0, 255, 255))  # Cyan color
+        pen = QPen(QColor(0, 255, 255))
         pen.setWidth(2)
         painter.setPen(pen)
         painter.drawRect(self.rect().adjusted(2, 2, -2, -2))
 
     def draw_clickable_elements(self, painter):
-        for element in self.clickable_elements:
-            self.draw_element_label(painter, element.topLeft())
+        for element, label in zip(self.clickable_elements, self.element_labels):
+            self.draw_element_label(painter, element.topLeft(), label)
 
             cyan = QColor(0, 255, 255)
             painter.setPen(QPen(cyan))
@@ -176,12 +177,14 @@ class OverlayWindow(QMainWindow):
 
             painter.drawRect(element)
 
-    def draw_element_label(self, painter, position):
+    def draw_element_label(self, painter, position, label):
+        if not label:
+            return
+
         x, y = position.x(), position.y()
         painter.setFont(self.label_font)
         metrics = QFontMetrics(self.label_font)
 
-        label = self.get_next_label()
         text_width = metrics.width(label)
         font_height = metrics.height()
 
@@ -191,8 +194,8 @@ class OverlayWindow(QMainWindow):
         rect_width = text_width + 2 * padding_x
         rect_height = font_height + 2 * padding_y
 
-        painter.fillRect(x, y, rect_width, rect_height, QColor(0, 255, 255))  # Cyan background
-        painter.setPen(QColor(0, 0, 0))  # Black text
+        painter.fillRect(x, y, rect_width, rect_height, QColor(0, 255, 255))
+        painter.setPen(QColor(0, 0, 0))
 
         text_x = x + (rect_width - text_width) // 2
         text_y = y + (rect_height + metrics.ascent() - metrics.descent()) // 2
@@ -200,9 +203,8 @@ class OverlayWindow(QMainWindow):
         painter.drawText(text_x, text_y, label)
 
     def draw_settings_info(self, painter):
-        # Draw settings information in the top-left corner
         settings_width, settings_height = 105, 35
         painter.fillRect(0, 0, settings_width, settings_height, QColor(0, 0, 0))
-        painter.setPen(QColor(255, 255, 255))  # White text
+        painter.setPen(QColor(255, 255, 255))
         painter.drawText(5, 15, "Confidence: 0.5")
         painter.drawText(5, 30, "Overlap: 0.7")
