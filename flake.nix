@@ -7,17 +7,13 @@
   outputs = { systems, nixpkgs, ... } @ inputs: let
     eachSystem = f: nixpkgs.lib.genAttrs (import systems) (system: f nixpkgs.legacyPackages.${system});
   in {
-    #packages = eachSystem (pkgs: {
-    #  hello = pkgs.hello;
-    #});
-
     devShells = eachSystem (pkgs: {
       default = pkgs.mkShell {
-        #buildInputs = with pkgs; [
-        #  libsForQt5.qt5.qtbase
-        #  python310Packages.python
-        #];
-
+        buildInputs = with pkgs; [
+          python310Packages.python
+          python3Packages.pynput
+        ];
+        
         shellHook = ''
           export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
             pkgs.fontconfig
@@ -57,9 +53,9 @@
           pip install PyQt5
           pip install opencv-python
           pip install ultralytics
-          pip install keyboard
         '';
       };
     });
   };
 }
+
