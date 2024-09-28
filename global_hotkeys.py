@@ -10,14 +10,15 @@ class GlobalHotKeys:
 
         # Define the hotkeys
         self.hotkeys = [
-            keyboard.HotKey(keyboard.HotKey.parse('<alt>+f'), self.on_activate_f)
+            keyboard.HotKey(keyboard.HotKey.parse('<alt>+f'), self.on_activate_f),
+            keyboard.HotKey(keyboard.HotKey.parse('<esc>'), self.on_activate_esc)
         ]
 
     def for_canonical(self, f):
         return lambda k: f(self.listener.canonical(k))
 
-    #def on_activate_esc(self):
-    #    self.stop_event.set()
+    def on_activate_esc(self):
+        self.stop_event.set()
 
     def on_activate_f(self):
         self.start_event.set()

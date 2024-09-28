@@ -28,6 +28,9 @@ class OverlayWindow(QMainWindow):
         self.is_rendering = False
         self.model = None
 
+    def start(self):
+        self.show()
+
     def screenshot(self):
         screen = QApplication.primaryScreen()
         screenshot = screen.grabWindow(0)
@@ -36,12 +39,12 @@ class OverlayWindow(QMainWindow):
     def render_start(self):
         self.screenshot()
         self.is_rendering = True
-        self.show()
         threading.Thread(target=self.initialize_and_run_yolo).start()
 
     def render_stop(self):
         self.is_rendering = False
-        self.hide()
+        self.boxes = []
+        #self.hide()
 
     def initialize_and_run_yolo(self):
         from ultralytics import YOLO
@@ -152,9 +155,6 @@ class OverlayWindow(QMainWindow):
         painter.drawText(text_x, text_y, shortcut)
 
     def paintEvent(self, event):
-        if not self.is_rendering:
-            return
-
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -165,6 +165,9 @@ class OverlayWindow(QMainWindow):
         pen.setWidth(2)
         painter.setPen(pen)
         painter.drawRect(self.rect().adjusted(2, 2, -2, -2))
+
+        if not self.is_rendering:
+            return
 
         # Draw all boxes
         pen = QPen(QColor(0, 255, 255))

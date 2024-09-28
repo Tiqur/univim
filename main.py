@@ -12,6 +12,10 @@ def main():
     # Create the overlay window
     window = OverlayWindow()
 
+    # Start the hotkey listener in a separate thread
+    window_thread = threading.Thread(target=window.start)
+    window_thread.start()
+
     # Create the global hotkey listener
     hotkeys = GlobalHotKeys()
 
@@ -33,7 +37,7 @@ def main():
     # Set up a timer to check for events
     timer = QTimer()
     timer.timeout.connect(check_events)
-    timer.start(100)  # Check every 100ms
+    timer.start(10)  # Check every 100ms
 
     # Run the application
     exit_code = app.exec_()
