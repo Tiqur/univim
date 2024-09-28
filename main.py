@@ -9,12 +9,12 @@ def main():
     # Create Qt application
     app = QApplication(sys.argv)
 
-    # Create the overlay window
-    window = OverlayWindow()
+    # Create the OverlayWindow
+    overlay = OverlayWindow()
 
-    # Start the hotkey listener in a separate thread
-    window_thread = threading.Thread(target=window.start)
-    window_thread.start()
+    # Activate the overlay in a separate thread
+    overlay_thread = threading.Thread(target=overlay.activate_overlay)
+    overlay_thread.start()
 
     # Create the global hotkey listener
     hotkeys = GlobalHotKeys()
@@ -23,13 +23,13 @@ def main():
     hotkey_thread = threading.Thread(target=hotkeys.start_listening)
     hotkey_thread.start()
 
-    # Function to check events and update the window
+    # Function to check events and update the overlay
     def check_events():
         if hotkeys.start_event.is_set():
-            window.render_start()
+            overlay.start_element_detection()
             hotkeys.start_event.clear()
         if hotkeys.stop_event.is_set():
-            window.render_stop()
+            overlay.stop_element_detection()
             hotkeys.stop_event.clear()
         if hotkeys.exit_event.is_set():
             app.quit()
@@ -37,7 +37,7 @@ def main():
     # Set up a timer to check for events
     timer = QTimer()
     timer.timeout.connect(check_events)
-    timer.start(10)  # Check every 100ms
+    timer.start(10)  # Check every 10ms
 
     # Run the application
     exit_code = app.exec_()
