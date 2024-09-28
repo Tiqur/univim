@@ -14,8 +14,8 @@ class GlobalMouse:
         self.stop_event.set()
 
     def on_click(self, x, y, button, pressed):
-        # We no longer set the stop event on click
-        pass
+        print("Mouse clicked")
+        self.stop_event.set()
 
     def start_listening(self):
         with mouse.Listener(on_move=self.on_move, on_click=self.on_click, on_scroll=self.on_scroll) as listener:
