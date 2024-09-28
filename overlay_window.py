@@ -27,10 +27,12 @@ class OverlayWindow(QMainWindow):
 
     def setup_window_properties(self):
         # Set up the window to be frameless, stay on top, and cover the full screen
-        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.X11BypassWindowManagerHint)
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setWindowState(Qt.WindowFullScreen)
+        self.setWindowFlags(self.windowFlags() | Qt.X11BypassWindowManagerHint)
+
         self.set_fullscreen_geometry()
 
     def set_fullscreen_geometry(self):
