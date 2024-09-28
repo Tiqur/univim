@@ -1,6 +1,7 @@
 from pynput import keyboard
 from threading import Event
 
+
 class GlobalHotKeys:
     def __init__(self):
         self.start_event = Event()
