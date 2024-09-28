@@ -1,11 +1,22 @@
 from PyQt5.QtWidgets import QMainWindow, QApplication
-from PyQt5.QtCore import Qt, pyqtSignal, QRect
+from PyQt5.QtCore import Qt, pyqtSignal, QRect, QThreadPool, QRunnable
 from PyQt5.QtGui import QGuiApplication, QPainter, QColor, QPen, QFont, QFontMetrics, QScreen
 import sys
 import threading
 
+class YOLOLoader(QRunnable):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def run(self):
+        from ultralytics import YOLO
+        model = YOLO("weights/best.pt")
+        self.callback(model)
+
 class OverlayWindow(QMainWindow):
     update_signal = pyqtSignal()
+    model_loaded_signal = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -23,12 +34,29 @@ class OverlayWindow(QMainWindow):
     
         self.boxes = []
         self.update_signal.connect(self.update)
+        self.model_loaded_signal.connect(self.on_model_loaded)
         self.sequence = 1
         self.font = QFont("Arial", 12)
         self.is_rendering = False
         self.model = None
+        self.thread_pool = QThreadPool()
+
+        # Preload the YOLO model
+        self.preload_model()
+
+    def preload_model(self):
+        loader = YOLOLoader(self.set_model)
+        self.thread_pool.start(loader)
+
+    def set_model(self, model):
+        self.model = model
+        self.model_loaded_signal.emit()
+
+    def on_model_loaded(self):
+        print("YOLO model loaded successfully")
 
     def start(self):
+        print("Overlay window loaded successfully")
         self.show()
 
     def screenshot(self):
@@ -37,9 +65,13 @@ class OverlayWindow(QMainWindow):
         screenshot.save('screenshot.png', 'png')
 
     def render_start(self):
+        if self.model is None:
+            print("YOLO model is not loaded yet. Please wait.")
+            return
+
         self.screenshot()
         self.is_rendering = True
-        threading.Thread(target=self.initialize_and_run_yolo).start()
+        threading.Thread(target=self.run_yolo).start()
 
     def render_stop(self):
         print("STOPPING RENDERING")
@@ -47,10 +79,31 @@ class OverlayWindow(QMainWindow):
         self.boxes = []
         self.update()
 
-    def initialize_and_run_yolo(self):
-        from ultralytics import YOLO
-        self.model = YOLO("weights/best.pt")
-        self.secondary_thread()
+    def run_yolo(self):
+        results = self.model("screenshot.png", conf=0.1, max_det=2048, iou=0.4, stream=True)
+        
+        for result in results:
+            all_boxes = []
+            for box in result.boxes:
+                dim = (box.xywhn).tolist()[0]
+                orig_width = box.orig_shape[1]
+                orig_height = box.orig_shape[0]
+
+                width = int(dim[2]*orig_width)
+                height = int(dim[3]*orig_height)
+                x = int(dim[0]*orig_width-width/2)
+                y = int(dim[1]*orig_height-height/2)
+
+                new_box = QRect(x, y, width, height)
+                all_boxes.append(new_box)
+
+            filtered_boxes = self.filter_boxes(all_boxes)
+            
+            for box in filtered_boxes:
+                self.add_box(box)
+
+            self.send_update_signal()
+
 
     def secondary_thread(self):
         results = self.model("screenshot.png", conf=0.1, max_det=2048, iou=0.4, stream=True)
@@ -161,14 +214,14 @@ class OverlayWindow(QMainWindow):
 
         painter.fillRect(self.rect(), Qt.transparent)
 
+        if not self.is_rendering:
+            return
+
         # Draw cyan border
         pen = QPen(QColor(0, 255, 255))
         pen.setWidth(2)
         painter.setPen(pen)
         painter.drawRect(self.rect().adjusted(2, 2, -2, -2))
-
-        if not self.is_rendering:
-            return
 
         # Draw all boxes
         pen = QPen(QColor(0, 255, 255))
