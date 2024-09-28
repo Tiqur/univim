@@ -9,30 +9,26 @@ class GlobalHotKeys:
         self.listener = None
 
         # Define the hotkeys
-        self.hotkeys = [
-            keyboard.HotKey(keyboard.HotKey.parse('<alt>+f'), self.on_activate_f),
-            keyboard.HotKey(keyboard.HotKey.parse('<esc>'), self.on_activate_esc)
-        ]
-
-    def for_canonical(self, f):
-        return lambda k: f(self.listener.canonical(k))
+        self.hotkeys = {
+            keyboard.KeyCode.from_char('f'): self.on_activate_f,
+            keyboard.Key.esc: self.on_activate_esc
+        }
 
     def on_activate_esc(self):
+        print("ESC key pressed")
         self.stop_event.set()
 
     def on_activate_f(self):
+        print("F key pressed")
         self.start_event.set()
 
     def on_press(self, key):
         print(f"Key pressed: {key}")
-        # Press handler for all hotkeys
-        for hotkey in self.hotkeys:
-            hotkey.press(self.listener.canonical(key))
+        if key in self.hotkeys:
+            self.hotkeys[key]()
 
     def on_release(self, key):
-        # Release handler for all hotkeys
-        for hotkey in self.hotkeys:
-            hotkey.release(self.listener.canonical(key))
+        print(f"Key released: {key}")
 
     def start_listening(self):
         # Start the listener
@@ -45,8 +41,6 @@ class GlobalHotKeys:
         if self.listener:
             self.listener.stop()
 
-
 if __name__ == "__main__":
     global_hotkeys = GlobalHotKeys()
     global_hotkeys.start_listening()
-

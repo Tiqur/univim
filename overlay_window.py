@@ -42,9 +42,10 @@ class OverlayWindow(QMainWindow):
         threading.Thread(target=self.initialize_and_run_yolo).start()
 
     def render_stop(self):
+        print("STOPPING RENDERING")
         self.is_rendering = False
         self.boxes = []
-        #self.hide()
+        self.update()
 
     def initialize_and_run_yolo(self):
         from ultralytics import YOLO
