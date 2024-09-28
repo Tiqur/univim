@@ -130,11 +130,10 @@ class OverlayWindow(QMainWindow):
 
     def generate_label(self, num):
         result = []
-        while num > 0:
-            num -= 1
+        while num >= 0:
             result.append(chr(num % 26 + ord('a')))
-            num //= 26
-        return ''.join(reversed(result)) if result else 'a'
+            num = num // 26 - 1
+        return ''.join(reversed(result))
 
     def handle_key_press(self, key):
         if self.is_overlay_active:
@@ -145,8 +144,10 @@ class OverlayWindow(QMainWindow):
         for i, label in enumerate(self.element_labels):
             if label.startswith(key):
                 self.element_labels[i] = label[1:] if len(label) > 1 else ''
-        self.element_labels = [label for label in self.element_labels if label]
+        
+        # Remove elements with empty labels
         self.clickable_elements = [elem for elem, label in zip(self.clickable_elements, self.element_labels) if label]
+        self.element_labels = [label for label in self.element_labels if label]
 
     def paintEvent(self, event):
         painter = QPainter(self)
