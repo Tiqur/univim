@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import QMainWindow, QApplication
 from PyQt5.QtCore import Qt, pyqtSignal, QRect, QThreadPool, QRunnable, QTimer
-from PyQt5.QtGui import QGuiApplication, QPainter, QColor, QPen, QFont, QFontMetrics, QScreen
+from PyQt5.QtGui import QGuiApplication, QPainter, QColor, QPen, QFont, QFontMetrics, QScreen, QBrush
 import sys
 import threading
 
@@ -166,9 +166,14 @@ class OverlayWindow(QMainWindow):
         painter.drawRect(self.rect().adjusted(2, 2, -2, -2))
 
     def draw_clickable_elements(self, painter):
-        painter.setPen(QPen(QColor(0, 255, 255)))  # Cyan color for element borders
         for element in self.clickable_elements:
             self.draw_element_label(painter, element.topLeft())
+
+            cyan = QColor(0, 255, 255)
+            painter.setPen(QPen(cyan))
+            cyan.setAlpha(20)
+            painter.setBrush((QBrush(cyan)))
+
             painter.drawRect(element)
 
     def draw_element_label(self, painter, position):
