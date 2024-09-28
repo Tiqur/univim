@@ -1,6 +1,8 @@
-from PyQt5.QtWidgets import QMainWindow
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QGuiApplication, QPainter, QColor, QPen, QFont, QFontMetrics
+from PyQt5.QtWidgets import QMainWindow, QApplication
+from PyQt5.QtCore import Qt, pyqtSignal, QRect
+from PyQt5.QtGui import QGuiApplication, QPainter, QColor, QPen, QFont, QFontMetrics, QScreen
+import sys
+import threading
 
 class OverlayWindow(QMainWindow):
     update_signal = pyqtSignal()
@@ -10,7 +12,6 @@ class OverlayWindow(QMainWindow):
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
-
 
         self.setWindowState(Qt.WindowFullScreen)
         self.setWindowFlags(self.windowFlags() | Qt.X11BypassWindowManagerHint)
@@ -24,7 +25,75 @@ class OverlayWindow(QMainWindow):
         self.update_signal.connect(self.update)
         self.sequence = 1
         self.font = QFont("Arial", 12)
+        self.is_rendering = False
+        self.model = None
 
+    def screenshot(self):
+        screen = QApplication.primaryScreen()
+        screenshot = screen.grabWindow(0)
+        screenshot.save('screenshot.png', 'png')
+
+    def render_start(self):
+        self.screenshot()
+        self.is_rendering = True
+        self.show()
+        threading.Thread(target=self.initialize_and_run_yolo).start()
+
+    def render_stop(self):
+        self.is_rendering = False
+        self.hide()
+
+    def initialize_and_run_yolo(self):
+        from ultralytics import YOLO
+        self.model = YOLO("weights/best.pt")
+        self.secondary_thread()
+
+    def secondary_thread(self):
+        results = self.model("screenshot.png", conf=0.1, max_det=2048, iou=0.4, stream=True)
+        
+        for result in results:
+            all_boxes = []
+            for box in result.boxes:
+                dim = (box.xywhn).tolist()[0]
+                orig_width = box.orig_shape[1]
+                orig_height = box.orig_shape[0]
+
+                width = int(dim[2]*orig_width)
+                height = int(dim[3]*orig_height)
+                x = int(dim[0]*orig_width-width/2)
+                y = int(dim[1]*orig_height-height/2)
+
+                new_box = QRect(x, y, width, height)
+                all_boxes.append(new_box)
+
+            filtered_boxes = self.filter_boxes(all_boxes)
+            
+            for box in filtered_boxes:
+                self.add_box(box)
+
+            self.send_update_signal()
+
+
+    def is_significant_overlap(self, box1, box2, threshold=0.2):
+        intersect = box1.intersected(box2)
+        intersect_area = intersect.width() * intersect.height()
+        smaller_box_area = min(box1.width() * box1.height(), box2.width() * box2.height())
+        return intersect_area / smaller_box_area > threshold
+
+    def filter_boxes(self, boxes):
+        sorted_boxes = sorted(boxes, key=lambda b: b.width() * b.height())
+        
+        filtered_boxes = []
+        for i, box in enumerate(sorted_boxes):
+            should_add = True
+            for j in range(i):
+                if self.is_significant_overlap(box, sorted_boxes[j]):
+                    should_add = False
+                    break
+            if should_add:
+                filtered_boxes.append(box)
+        
+        return filtered_boxes
 
     def to_base_26(self, num):
         """Convert a number to a base-26 representation using letters."""
@@ -40,7 +109,6 @@ class OverlayWindow(QMainWindow):
         letter = self.to_base_26(self.sequence)  # Get the current letter
         self.sequence += 1  # Increment to prepare for the next call
         return letter
-
 
     def add_box(self, box):
         self.boxes.append(box)
@@ -83,9 +151,10 @@ class OverlayWindow(QMainWindow):
         # Draw the text at the calculated position
         painter.drawText(text_x, text_y, shortcut)
 
-
-
     def paintEvent(self, event):
+        if not self.is_rendering:
+            return
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -98,7 +167,6 @@ class OverlayWindow(QMainWindow):
         painter.drawRect(self.rect().adjusted(2, 2, -2, -2))
 
         # Draw all boxes
-        # In the future, draw all at once using painter.drawRects(Rect[])
         pen = QPen(QColor(0, 255, 255))
         painter.setPen(pen)
         for box in self.boxes:
