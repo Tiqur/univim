@@ -1,8 +1,9 @@
 from PyQt5.QtWidgets import QMainWindow, QApplication
-from PyQt5.QtCore import Qt, pyqtSignal, QRect, QThreadPool, QRunnable, QTimer
+from PyQt5.QtCore import Qt, pyqtSignal, QRect, QThreadPool, QRunnable, QTimer, QPoint
 from PyQt5.QtGui import QGuiApplication, QPainter, QColor, QPen, QFont, QFontMetrics, QScreen, QBrush
 import sys
 import threading
+from pynput.mouse import Controller as MouseController, Button
 
 class YOLOModelLoader(QRunnable):
     def __init__(self, callback):
@@ -25,6 +26,8 @@ class OverlayWindow(QMainWindow):
         self.initialize_variables()
         self.setup_signals()
         self.preload_ai_model()
+        self.mouse = MouseController()
+        self.current_input = ''
 
     def setup_window_properties(self):
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -98,7 +101,7 @@ class OverlayWindow(QMainWindow):
             filtered_elements = self.filter_overlapping_elements(all_elements)
             
             self.clickable_elements = filtered_elements
-            self.element_labels = [self.generate_label(i) for i in range(len(filtered_elements))]
+            self.element_labels = self.generate_labels(len(filtered_elements))
             self.update_overlay_signal.emit()
 
     def extract_elements_from_result(self, result):
@@ -128,12 +131,24 @@ class OverlayWindow(QMainWindow):
         smaller_elem_area = min(elem1.width() * elem1.height(), elem2.width() * elem2.height())
         return intersect_area / smaller_elem_area > threshold
 
-    def generate_label(self, num):
-        result = []
-        while num >= 0:
-            result.append(chr(num % 26 + ord('a')))
-            num = num // 26 - 1
-        return ''.join(reversed(result))
+    def generate_labels(self, count):
+        labels = []
+        characters = 'abcdefghijklmnopqrstuvwxyz'
+        
+        # Generate single-character labels first
+        for char in characters[:min(count, len(characters))]:
+            labels.append(char)
+        
+        # If we need more labels, start combining characters
+        if count > len(characters):
+            import itertools
+            for length in range(2, 5):  # Limit to 4 characters max
+                for combo in itertools.product(characters, repeat=length):
+                    labels.append(''.join(combo))
+                    if len(labels) == count:
+                        return labels
+        
+        return labels[:count]
 
     def handle_key_press(self, key):
         if self.is_overlay_active:
@@ -141,13 +156,47 @@ class OverlayWindow(QMainWindow):
             self.update()
 
     def update_labels_starting_with(self, key):
-        for i, label in enumerate(self.element_labels):
-            if label.startswith(key):
-                self.element_labels[i] = label[1:] if len(label) > 1 else ''
+        self.current_input += key
+        matching_labels = [label for label in self.element_labels if label.startswith(self.current_input)]
         
+        if not matching_labels:
+            # Reset if there are no matches
+            self.current_input = ''
+            return
+
+        if len(matching_labels) == 1:
+            # Exact match or unique prefix found
+            matched_label = matching_labels[0]
+            if self.current_input == matched_label or len(self.current_input) == len(matched_label):
+                index = self.element_labels.index(matched_label)
+                self.click_element(index)
+                self.clickable_elements.pop(index)
+                self.element_labels.pop(index)
+                self.current_input = ''  # Reset input after clicking
+            else:
+                # Update visible label for the unique match
+                index = self.element_labels.index(matched_label)
+                self.element_labels[index] = matched_label[len(self.current_input):]
+        else:
+            # Update visible labels for partial matches
+            for i, label in enumerate(self.element_labels):
+                if label.startswith(self.current_input):
+                    self.element_labels[i] = label[len(self.current_input):]
+                else:
+                    self.element_labels[i] = ''
+
         # Remove elements with empty labels
         self.clickable_elements = [elem for elem, label in zip(self.clickable_elements, self.element_labels) if label]
         self.element_labels = [label for label in self.element_labels if label]
+
+        self.update()
+
+    def click_element(self, index):
+        element = self.clickable_elements[index]
+        center = element.center()
+        self.mouse.position = (center.x(), center.y())
+        self.mouse.click(Button.left)
+        print(f"Clicked element at {center.x()}, {center.y()}")
 
     def paintEvent(self, event):
         painter = QPainter(self)

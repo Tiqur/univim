@@ -52,6 +52,9 @@ def main():
     hotkeys.stop_listening()
     hotkey_thread.join()
 
+    mouse.stop_listening()
+    mouse_thread.join()
+
     sys.exit(exit_code)
 
 if __name__ == "__main__":
