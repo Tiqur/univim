@@ -302,40 +302,28 @@ class OverlayWindow(QMainWindow):
         self.current_input = ''
         self.update()
 
+
     def update_labels_starting_with(self, input_string):
-        matching_labels = [label for label in self.element_labels if label.startswith(input_string)]
+        matching_labels = [label for label in self.element_labels if label.startswith(input_string.lower())]
         
         if not matching_labels:
-            # Reset if there are no matches
-            self.current_input = ''
+            # If no matches, keep all labels but don't highlight
             return
 
-        if len(matching_labels) == 1:
-            # Exact match found
-            matched_label = matching_labels[0]
-            if input_string == matched_label:
-                index = self.element_labels.index(matched_label)
-                self.click_element(index)
-                self.clickable_elements.pop(index)
-                self.element_labels.pop(index)
-                self.current_input = ''  # Reset input after clicking
+        # Update visible labels for matches
+        for i, label in enumerate(self.element_labels):
+            if label.lower().startswith(input_string.lower()):
+                self.element_labels[i] = label
             else:
-                # Update visible label for the unique match
-                index = self.element_labels.index(matched_label)
-                self.element_labels[index] = matched_label
-        else:
-            # Update visible labels for partial matches
-            for i, label in enumerate(self.element_labels):
-                if label.startswith(input_string):
-                    self.element_labels[i] = label
-                else:
-                    self.element_labels[i] = ''
-        # Remove elements with empty labels
-        self.clickable_elements = [elem for elem, label in zip(self.clickable_elements, self.element_labels) if label]
-        self.element_labels = [label for label in self.element_labels if label]
+                self.element_labels[i] = label  # Keep the label visible, but don't highlight
+
+        # If there's only one match and it's exactly the input, trigger the click
+        if len(matching_labels) == 1 and matching_labels[0].lower() == input_string.lower():
+            index = self.element_labels.index(matching_labels[0])
+            self.click_element(index)
+            self.current_input = ''  # Reset input after clicking
 
         self.update()
-
     def scroll_up(self):
         self.mouse.scroll(0, 2)
 
@@ -400,6 +388,7 @@ class OverlayWindow(QMainWindow):
         self.draw_zoomed_grid(painter)
 
 
+
     def draw_zoomed_grid(self, painter):
         if not self.zoomed_rect:
             return
@@ -438,9 +427,8 @@ class OverlayWindow(QMainWindow):
                 else:
                     continue
 
-                self.draw_element_label(painter, QPoint(int(x), int(y)), label)
-
-
+                if not self.current_input or label.startswith(self.current_input):
+                    self.draw_element_label(painter, QPoint(int(x), int(y)), label)
 
     def draw_main_grid(self, painter):
         pen = QPen(QColor(0, 255, 255))
@@ -463,8 +451,8 @@ class OverlayWindow(QMainWindow):
                 painter.drawRect(QRect(int(x), int(y), int(cell_width), int(cell_height)))
 
                 label = f"{chr(97 + j)}{chr(97 + i)}"
-                self.draw_element_label(painter, QPoint(int(x), int(y)), label)
-
+                if not self.current_input or label.startswith(self.current_input):
+                    self.draw_element_label(painter, QPoint(int(x), int(y)), label)
 
     def draw_sub_grid(self, painter):
         if not self.selected_cell:
@@ -557,7 +545,7 @@ class OverlayWindow(QMainWindow):
         if self.current_input:
             matched_text = label[:len(self.current_input)]
             matched_width = metrics.width(matched_text)
-            painter.fillRect(x, y, matched_width + 2 * padding_x, rect_height, QColor(255, 255, 0, 128))  # Semi-transparent yellow
+            painter.fillRect(x, y, matched_width + 2 * padding_x, rect_height, QColor(0, 255, 0, 128))  # Semi-transparent green
             painter.setPen(QColor(0, 0, 0))  # Black text color
             painter.drawText(text_x, text_y, matched_text)
 
