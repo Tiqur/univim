@@ -34,7 +34,7 @@ class OverlayWindow(QMainWindow):
         self.selected_cell = None
         self.zoom_factor = 2
         self.zoomed_image = None
-        self.zoom_height_percentage = 0.5
+        self.zoom_height_percentage = 0.2
         self.zoomed_rect = None
         self.subgrid_divisions = 6
         self.full_screenshot = None
@@ -370,15 +370,22 @@ class OverlayWindow(QMainWindow):
                 self.draw_zoomed_cell(painter)
 
     def draw_zoomed_cell(self, painter):
-        if not self.zoomed_image:
+        if not self.zoomed_image or not self.selected_cell:
             return
 
         original_aspect_ratio = self.zoomed_image.width() / self.zoomed_image.height()
         zoom_height = self.height() * self.zoom_height_percentage
         zoom_width = zoom_height * original_aspect_ratio
 
-        x = (self.width() - zoom_width) / 2
-        y = (self.height() - zoom_height) / 2
+        # Calculate the position of the selected cell
+        cell_width = self.width() / 26
+        cell_height = self.height() / 26
+        selected_x = self.selected_cell[1] * cell_width
+        selected_y = self.selected_cell[0] * cell_height
+
+        # Calculate the position for the zoomed image
+        x = max(0, min(selected_x - zoom_width / 2, self.width() - zoom_width))
+        y = max(0, min(selected_y - zoom_height / 2, self.height() - zoom_height))
 
         self.zoomed_rect = QRect(int(x), int(y), int(zoom_width), int(zoom_height))
 
@@ -391,6 +398,7 @@ class OverlayWindow(QMainWindow):
         painter.drawRect(self.zoomed_rect)
 
         self.draw_zoomed_grid(painter)
+
 
     def draw_zoomed_grid(self, painter):
         if not self.zoomed_rect:
