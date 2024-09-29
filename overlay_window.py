@@ -197,8 +197,9 @@ class OverlayWindow(QMainWindow):
             elif key == 'backspace':
                 self.current_input = self.current_input[:-1]
                 self.update_labels_starting_with(self.current_input)
-            self.update()
-
+            elif key == 'esc':
+                self.stop_element_detection()
+        self.update()
 
     def select_main_cell(self, cell_id):
         print(f"Selecting main cell: {cell_id}")
@@ -302,12 +303,12 @@ class OverlayWindow(QMainWindow):
         self.current_input = ''
         self.update()
 
-
     def update_labels_starting_with(self, input_string):
-        matching_labels = [label for label in self.element_labels if label.startswith(input_string.lower())]
+        matching_labels = [label for label in self.element_labels if label.lower().startswith(input_string.lower())]
         
         if not matching_labels:
-            # If no matches, keep all labels but don't highlight
+            # If no matches, keep all labels visible
+            self.current_input = ''
             return
 
         # Update visible labels for matches
@@ -315,7 +316,7 @@ class OverlayWindow(QMainWindow):
             if label.lower().startswith(input_string.lower()):
                 self.element_labels[i] = label
             else:
-                self.element_labels[i] = label  # Keep the label visible, but don't highlight
+                self.element_labels[i] = ''  # Hide non-matching labels
 
         # If there's only one match and it's exactly the input, trigger the click
         if len(matching_labels) == 1 and matching_labels[0].lower() == input_string.lower():
@@ -324,6 +325,7 @@ class OverlayWindow(QMainWindow):
             self.current_input = ''  # Reset input after clicking
 
         self.update()
+
     def scroll_up(self):
         self.mouse.scroll(0, 2)
 
@@ -331,12 +333,17 @@ class OverlayWindow(QMainWindow):
         self.mouse.scroll(0, -2)
 
     def click_element(self, index):
-        element = self.clickable_elements[index]
-        center = element.center()
-        self.mouse.position = (center.x(), center.y())
-        self.mouse.click(Button.left)
-        print(f"Clicked element at {center.x()}, {center.y()}")
-
+        if 0 <= index < len(self.clickable_elements):
+            element = self.clickable_elements[index]
+            center = element.center()
+            self.mouse.position = (center.x(), center.y())
+            self.mouse.click(Button.left)
+            print(f"Clicked element at {center.x()}, {center.y()}")
+            
+            # Reset the overlay after clicking
+            self.stop_element_detection()
+        else:
+            print(f"Invalid index: {index}")
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -502,18 +509,18 @@ class OverlayWindow(QMainWindow):
         painter.setPen(pen)
         painter.drawRect(self.rect().adjusted(2, 2, -2, -2))
 
+
     def draw_clickable_elements(self, painter):
-        self.stop_grid_view()
-
         for element, label in zip(self.clickable_elements, self.element_labels):
-            self.draw_element_label(painter, element.topLeft(), label)
+            if label:  # Only draw elements with non-empty labels
+                self.draw_element_label(painter, element.topLeft(), label)
 
-            cyan = QColor(0, 255, 255)
-            painter.setPen(QPen(cyan))
-            cyan.setAlpha(20)
-            painter.setBrush((QBrush(cyan)))
+                cyan = QColor(0, 255, 255)
+                painter.setPen(QPen(cyan))
+                cyan.setAlpha(20)
+                painter.setBrush(QBrush(cyan))
 
-            painter.drawRect(element)
+                painter.drawRect(element)
 
     def draw_element_label(self, painter, position, label):
         if not label:
@@ -548,6 +555,7 @@ class OverlayWindow(QMainWindow):
             painter.fillRect(x, y, matched_width + 2 * padding_x, rect_height, QColor(0, 255, 0, 128))  # Semi-transparent green
             painter.setPen(QColor(0, 0, 0))  # Black text color
             painter.drawText(text_x, text_y, matched_text)
+
 
     def draw_settings_info(self, painter):
         settings_width, settings_height = 105, 35
