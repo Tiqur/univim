@@ -80,6 +80,7 @@ class OverlayWindow(QMainWindow):
         screenshot.save('current_screen.png', 'png')
 
     def start_element_detection(self):
+        self.current_input = ''
         if self.ai_model is None:
             print("AI model is not loaded yet. Please wait.")
             QTimer.singleShot(1000, self.start_element_detection)
