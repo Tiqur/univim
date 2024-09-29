@@ -5,6 +5,7 @@ import sys
 import threading
 from pynput.mouse import Controller as MouseController, Button
 import itertools
+import platform
 
 class YOLOModelLoader(QRunnable):
     def __init__(self, callback):
@@ -41,17 +42,17 @@ class OverlayWindow(QMainWindow):
 
     def setup_window_properties(self):
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        if platform.system() == "Linux":
+            self.setWindowFlags(self.windowFlags() | Qt.X11BypassWindowManagerHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setWindowState(Qt.WindowFullScreen)
-        self.setWindowFlags(self.windowFlags() | Qt.X11BypassWindowManagerHint)
         self.set_fullscreen_geometry()
 
     def set_fullscreen_geometry(self):
-        total_geometry = self.geometry()
         for screen in QGuiApplication.screens():
-            total_geometry = total_geometry.united(screen.geometry())
-        self.setGeometry(total_geometry)
+            self.setGeometry(screen.geometry())
+            break  # Set to primary monitor
 
     def initialize_variables(self):
         self.clickable_elements = []
