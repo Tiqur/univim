@@ -154,7 +154,8 @@ class OverlayWindow(QMainWindow):
 
     def handle_key_press(self, key):
         if self.is_overlay_active:
-            self.update_labels_starting_with(key)
+            self.current_input += key
+            self.update_labels_starting_with(self.current_input)
             self.update()
 
     def toggle_grid_view(self):
@@ -166,9 +167,9 @@ class OverlayWindow(QMainWindow):
         self.is_grid_view_active = False
         self.update()
 
-    def update_labels_starting_with(self, key):
-        self.current_input += key
-        matching_labels = [label for label in self.element_labels if label.startswith(self.current_input)]
+
+    def update_labels_starting_with(self, input_string):
+        matching_labels = [label for label in self.element_labels if label.startswith(input_string)]
         
         if not matching_labels:
             # Reset if there are no matches
@@ -176,9 +177,9 @@ class OverlayWindow(QMainWindow):
             return
 
         if len(matching_labels) == 1:
-            # Exact match or unique prefix found
+            # Exact match found
             matched_label = matching_labels[0]
-            if self.current_input == matched_label or len(self.current_input) == len(matched_label):
+            if input_string == matched_label:
                 index = self.element_labels.index(matched_label)
                 self.click_element(index)
                 self.clickable_elements.pop(index)
@@ -187,15 +188,14 @@ class OverlayWindow(QMainWindow):
             else:
                 # Update visible label for the unique match
                 index = self.element_labels.index(matched_label)
-                self.element_labels[index] = matched_label[len(self.current_input):]
+                self.element_labels[index] = matched_label
         else:
             # Update visible labels for partial matches
             for i, label in enumerate(self.element_labels):
-                if label.startswith(self.current_input):
-                    self.element_labels[i] = label[len(self.current_input):]
+                if label.startswith(input_string):
+                    self.element_labels[i] = label
                 else:
                     self.element_labels[i] = ''
-
         # Remove elements with empty labels
         self.clickable_elements = [elem for elem, label in zip(self.clickable_elements, self.element_labels) if label]
         self.element_labels = [label for label in self.element_labels if label]
@@ -301,13 +301,22 @@ class OverlayWindow(QMainWindow):
         rect_width = text_width + 2 * padding_x
         rect_height = font_height + 2 * padding_y
 
+        # Draw background rectangle
         painter.fillRect(x, y, rect_width, rect_height, QColor(0, 255, 255))
-        painter.setPen(QColor(0, 0, 0))
 
-        text_x = x + (rect_width - text_width) // 2
-        text_y = y + (rect_height + metrics.ascent() - metrics.descent()) // 2
-
+        # Draw text
+        painter.setPen(QColor(0, 0, 0))  # Black text color
+        text_x = x + padding_x
+        text_y = y + rect_height - padding_y - metrics.descent()
         painter.drawText(text_x, text_y, label)
+
+        # Highlight matched part of the label
+        if self.current_input:
+            matched_text = label[:len(self.current_input)]
+            matched_width = metrics.width(matched_text)
+            painter.fillRect(x, y, matched_width + 2 * padding_x, rect_height, QColor(255, 255, 0, 128))  # Semi-transparent yellow
+            painter.setPen(QColor(0, 0, 0))  # Black text color
+            painter.drawText(text_x, text_y, matched_text)
 
     def draw_settings_info(self, painter):
         settings_width, settings_height = 105, 35
