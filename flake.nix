@@ -53,6 +53,8 @@
           pip install PyQt5
           pip install opencv-python
           pip install ultralytics
+
+          pip3 freeze > requirements.txt
         '';
       };
     });
