@@ -236,10 +236,10 @@ class OverlayWindow(QMainWindow):
             return
 
         self.draw_overlay_border(painter)
+        #self.draw_settings_info(painter)
         
         if self.is_overlay_active:
             self.draw_clickable_elements(painter)
-            self.draw_settings_info(painter)
         
         if self.is_grid_view_active:
             self.draw_grid(painter)
@@ -284,6 +284,8 @@ class OverlayWindow(QMainWindow):
         painter.drawRect(self.rect().adjusted(2, 2, -2, -2))
 
     def draw_clickable_elements(self, painter):
+        self.stop_grid_view()
+
         for element, label in zip(self.clickable_elements, self.element_labels):
             self.draw_element_label(painter, element.topLeft(), label)
 
