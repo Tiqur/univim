@@ -6,6 +6,7 @@ from global_mouse import GlobalMouse
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QTimer
 
+
 def main():
     app = QApplication(sys.argv)
 
@@ -21,8 +22,10 @@ def main():
     mouse_thread = threading.Thread(target=mouse.start_listening)
     mouse_thread.start()
 
-    # Connect the key_pressed_signal from hotkeys to overlay
+    # Connect signals
     hotkeys.key_pressed_signal.connect(overlay.key_pressed_signal)
+    hotkeys.grid_view_signal.connect(overlay.toggle_grid_view)
+    hotkeys.stop_grid_view_signal.connect(overlay.stop_grid_view)
 
     def check_events():
         if hotkeys.scroll_up_event.is_set():
@@ -40,12 +43,16 @@ def main():
         
         if hotkeys.stop_event.is_set():
             overlay.stop_element_detection()
+            overlay.stop_grid_view()  # Also stop grid view when ESC is pressed
             hotkeys.set_detection_active(False)
+            hotkeys.is_grid_view_active = False
             hotkeys.stop_event.clear()
         
         if mouse.stop_event.is_set():
             overlay.stop_element_detection()
+            overlay.stop_grid_view()  # Also stop grid view on mouse click
             hotkeys.set_detection_active(False)
+            hotkeys.is_grid_view_active = False
             mouse.stop_event.clear()
 
         if hotkeys.exit_event.is_set():

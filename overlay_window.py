@@ -28,6 +28,7 @@ class OverlayWindow(QMainWindow):
         self.preload_ai_model()
         self.mouse = MouseController()
         self.current_input = ''
+        self.is_grid_view_active = False
 
     def setup_window_properties(self):
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -50,6 +51,7 @@ class OverlayWindow(QMainWindow):
         self.is_overlay_active = False
         self.ai_model = None
         self.thread_pool = QThreadPool()
+        self.is_grid_view_active = False
 
     def setup_signals(self):
         self.update_overlay_signal.connect(self.update)
@@ -155,6 +157,15 @@ class OverlayWindow(QMainWindow):
             self.update_labels_starting_with(key)
             self.update()
 
+    def toggle_grid_view(self):
+        self.is_grid_view_active = not self.is_grid_view_active
+        self.is_overlay_active = False
+        self.update()
+
+    def stop_grid_view(self):
+        self.is_grid_view_active = False
+        self.update()
+
     def update_labels_starting_with(self, key):
         self.current_input += key
         matching_labels = [label for label in self.element_labels if label.startswith(self.current_input)]
@@ -209,13 +220,17 @@ class OverlayWindow(QMainWindow):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), Qt.transparent)
 
-        if not self.is_overlay_active:
+        if not self.is_overlay_active and not self.is_grid_view_active:
             return
 
         self.draw_overlay_border(painter)
-        #self.draw_clickable_elements(painter)
-        #self.draw_settings_info(painter)
-        self.draw_grid(painter)
+        
+        if self.is_overlay_active:
+            self.draw_clickable_elements(painter)
+            self.draw_settings_info(painter)
+        
+        if self.is_grid_view_active:
+            self.draw_grid(painter)
 
     def draw_grid(self, painter):
         pen = QPen(QColor(0, 255, 255))
