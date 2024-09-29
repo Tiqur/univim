@@ -248,12 +248,12 @@ class OverlayWindow(QMainWindow):
         pen = QPen(QColor(0, 255, 255))
         pen.setWidth(2)
         painter.setPen(pen)
-        
-        div = 26 # Cell divisions to make
 
-        # Calculate the width and height of each grid cell
-        cell_width = self.size().width() // div
-        cell_height = self.size().height() // div
+        div = 26  # Cell divisions to make
+
+        # Calculate the width and height of each grid cell using float division
+        cell_width = self.size().width() / div
+        cell_height = self.size().height() / div
 
         # Generate a list of characters from 'a' to 'z'
         alphabet = [chr(i) for i in range(ord('a'), ord('z') + 1)]
@@ -263,19 +263,19 @@ class OverlayWindow(QMainWindow):
                 # Calculate the top-left corner of each rectangle (i, j)
                 x = i * cell_width
                 y = j * cell_height
-
+                
                 # Draw the rectangle
                 cyan = QColor(0, 255, 255)
                 painter.setPen(QPen(cyan))
                 cyan.setAlpha(20)
-                painter.setBrush((QBrush(cyan)))
-                painter.drawRect(QRect(x, y, cell_width, cell_height))
+                painter.setBrush(QBrush(cyan))
+                
+                # Ensure integer values for drawing
+                painter.drawRect(QRect(int(x), int(y), int(cell_width), int(cell_height)))
 
                 # Create a label using characters instead of numbers
                 label = f"{alphabet[i % 26]}{alphabet[j % 26]}"
-                self.draw_element_label(painter, QPoint(x, y), label)
-
-
+                self.draw_element_label(painter, QPoint(int(x), int(y)), label)
 
     def draw_overlay_border(self, painter):
         pen = QPen(QColor(0, 255, 255))
