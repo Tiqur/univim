@@ -1,7 +1,7 @@
 from pynput import keyboard
-from threading import Event
 from PyQt5.QtCore import QObject, pyqtSignal
-
+from threading import Event
+import time
 
 class GlobalHotKeys(QObject):
     key_pressed_signal = pyqtSignal(str)
@@ -17,18 +17,18 @@ class GlobalHotKeys(QObject):
         self.scroll_down_event = Event()
         self.grid_view_event = Event()
         self.listener = None
-        self.alt_pressed = False
         self.is_detection_active = False
         self.is_grid_view_active = False
+        
+        # Variables to track the last pressed time
+        self.last_shift_press_time = 0
+        self.last_ctrl_press_time = 0
+        self.double_press_threshold = 0.3  # Time in seconds for double press detection
 
         self.hotkeys = {
-            keyboard.KeyCode.from_char('j'): self.on_activate_j,
-            keyboard.KeyCode.from_char('k'): self.on_activate_k,
-            keyboard.KeyCode.from_char('f'): self.on_activate_f,
-            keyboard.KeyCode.from_char('g'): self.on_activate_g,
-            keyboard.Key.esc: self.on_activate_esc,
-            keyboard.Key.alt_l: self.on_alt,
-            keyboard.Key.alt_r: self.on_alt
+            keyboard.Key.shift: self.on_shift,
+            keyboard.Key.ctrl: self.on_ctrl,
+            keyboard.Key.esc: self.on_activate_esc
         }
 
     def on_activate_esc(self):
@@ -39,27 +39,30 @@ class GlobalHotKeys(QObject):
         else:
             self.stop_event.set()
 
-    def on_activate_g(self):
-        if self.alt_pressed:
-            print("Alt+G key pressed")
+    def on_shift(self):
+        current_time = time.time()
+        # Check if the time since the last press is within the threshold
+        if current_time - self.last_shift_press_time <= self.double_press_threshold:
+            print("Shift 2nd pressed")
             self.is_grid_view_active = not self.is_grid_view_active
             self.grid_view_signal.emit()
+        else:
+            print("Shift key pressed")
+        
+        # Update the last pressed time
+        self.last_shift_press_time = current_time
 
-    def on_activate_j(self):
-        #self.scroll_down_event.set()
-        print("Scroll down")
-
-    def on_activate_k(self):
-        #self.scroll_up_event.set()
-        print("Scroll up")
-
-    def on_activate_f(self):
-        if self.alt_pressed:
-            print("Alt+F key pressed")
+    def on_ctrl(self):
+        current_time = time.time()
+        # Check if the time since the last press is within the threshold
+        if current_time - self.last_ctrl_press_time <= self.double_press_threshold:
+            print("Ctrl 2nd pressed")
             self.start_event.set()
-
-    def on_alt(self):
-        self.alt_pressed = True
+        else:
+            print("Ctrl key pressed")
+        
+        # Update the last pressed time
+        self.last_ctrl_press_time = current_time
 
     def on_press(self, key):
         print(f"Key pressed: {key}")
@@ -74,8 +77,6 @@ class GlobalHotKeys(QObject):
 
     def on_release(self, key):
         print(f"Key released: {key}")
-        if key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
-            self.alt_pressed = False
 
     def start_listening(self):
         with keyboard.Listener(on_press=self.on_press, on_release=self.on_release) as l:
@@ -92,3 +93,4 @@ class GlobalHotKeys(QObject):
 if __name__ == "__main__":
     global_hotkeys = GlobalHotKeys()
     global_hotkeys.start_listening()
+

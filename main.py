@@ -28,14 +28,6 @@ def main():
     hotkeys.stop_grid_view_signal.connect(overlay.stop_grid_view)
 
     def check_events():
-        if hotkeys.scroll_up_event.is_set():
-            overlay.scroll_up()
-            hotkeys.scroll_up_event.clear()
-
-        if hotkeys.scroll_down_event.is_set():
-            overlay.scroll_down()
-            hotkeys.scroll_down_event.clear()
-
         if hotkeys.start_event.is_set():
             overlay.start_element_detection()
             hotkeys.set_detection_active(True)
