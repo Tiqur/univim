@@ -30,9 +30,14 @@ class OverlayWindow(QMainWindow):
         self.mouse = MouseController()
         self.current_input = ''
         self.is_grid_view_active = False
-        self.grid_mode = 'main'  # 'main' or 'sub'
+        self.grid_mode = 'main'  # 'main' or 'zoomed'
         self.selected_cell = None
-        self.subcell_divisions = 6
+        self.zoom_factor = 2
+        self.zoomed_image = None
+        self.zoom_height_percentage = 0.5
+        self.zoomed_rect = None
+        self.subgrid_divisions = 6
+        self.full_screenshot = None
 
     def setup_window_properties(self):
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -167,16 +172,17 @@ class OverlayWindow(QMainWindow):
 
         return labels[:count]
 
+
     def handle_key_press(self, key):
-        print(f"Key pressed: {key}, Current mode: {self.grid_mode}, Current input: {self.current_input}")  
+        print(f"Key pressed: {key}, Current mode: {self.grid_mode}, Current input: {self.current_input}")
         if self.is_grid_view_active:
-            if key.isalpha():
+            if key.isalpha() or key.isdigit():
                 self.current_input += key.lower()
-                print(f"Updated input: {self.current_input}")  
+                print(f"Updated input: {self.current_input}")
                 if self.grid_mode == 'main':
                     if len(self.current_input) == 2:
                         self.select_main_cell(self.current_input)
-                elif self.grid_mode == 'sub':
+                elif self.grid_mode == 'zoomed':
                     if len(self.current_input) == 1:
                         self.select_subcell(self.current_input)
             elif key == 'backspace':
@@ -193,26 +199,40 @@ class OverlayWindow(QMainWindow):
                 self.update_labels_starting_with(self.current_input)
             self.update()
 
+
     def select_main_cell(self, cell_id):
-        print(f"Selecting main cell: {cell_id}")  
+        print(f"Selecting main cell: {cell_id}")
         if len(cell_id) == 2 and cell_id.isalpha():
             row = ord(cell_id[0]) - ord('a')
             col = ord(cell_id[1]) - ord('a')
             if 0 <= row < 26 and 0 <= col < 26:
                 self.selected_cell = (row, col)
-                self.grid_mode = 'sub'
+                self.grid_mode = 'zoomed'
                 self.current_input = ''
-                print(f"Selected cell: {self.selected_cell}, Switching to sub mode")  
+                self.capture_zoomed_cell()
+                print(f"Selected cell: {self.selected_cell}, Switching to zoomed mode")
             else:
-                print("Invalid cell selection")  
+                print("Invalid cell selection")
         else:
-            print("Invalid cell_id format")  
+            print("Invalid cell_id format")
         self.update()
 
 
+    def capture_zoomed_cell(self):
+        if self.selected_cell and self.full_screenshot:
+            row, col = self.selected_cell
+            cell_width = self.width() / 26
+            cell_height = self.height() / 26
+            
+            x = int(col * cell_width)
+            y = int(row * cell_height)
+            
+            self.zoomed_image = self.full_screenshot.copy(x, y, int(cell_width), int(cell_height))
+
+
+
     def select_subcell(self, subcell_id):
-        if self.selected_cell:
-            main_row, main_col = self.selected_cell
+        if self.selected_cell and self.grid_mode == 'zoomed' and self.zoomed_rect:
             if subcell_id.isalpha():
                 sub_index = ord(subcell_id.lower()) - ord('a')
             elif subcell_id.isdigit():
@@ -220,36 +240,58 @@ class OverlayWindow(QMainWindow):
             else:
                 return  # Invalid input
 
-            if 0 <= sub_index < 36:
-                sub_row = sub_index // self.subcell_divisions
-                sub_col = sub_index % self.subcell_divisions
+            if 0 <= sub_index < self.subgrid_divisions ** 2:
+                sub_row = sub_index // self.subgrid_divisions
+                sub_col = sub_index % self.subgrid_divisions
 
-                cell_width = self.width() / 26
-                cell_height = self.height() / 26
-                subcell_width = cell_width / self.subcell_divisions
-                subcell_height = cell_height / self.subcell_divisions
+                # Calculate the position within the zoomed image
+                cell_width = self.zoomed_rect.width() / self.subgrid_divisions
+                cell_height = self.zoomed_rect.height() / self.subgrid_divisions
                 
-                x = (main_col * cell_width) + (sub_col * subcell_width) + (subcell_width / 2)
-                y = (main_row * cell_height) + (sub_row * subcell_height) + (subcell_height / 2)
-                
-                self.mouse.position = (int(x), int(y))
+                relative_x = (sub_col + 0.5) * cell_width
+                relative_y = (sub_row + 0.5) * cell_height
+
+                # Calculate the position relative to the zoomed area
+                zoomed_x = relative_x / self.zoomed_rect.width()
+                zoomed_y = relative_y / self.zoomed_rect.height()
+
+                # Translate to actual screen coordinates
+                main_row, main_col = self.selected_cell
+                main_cell_width = self.width() / 26
+                main_cell_height = self.height() / 26
+
+                screen_x = (main_col * main_cell_width) + (zoomed_x * main_cell_width)
+                screen_y = (main_row * main_cell_height) + (zoomed_y * main_cell_height)
+
+                # Perform the click
+                self.mouse.position = (int(screen_x), int(screen_y))
                 self.mouse.click(Button.left)
-                print(f"Clicked at {x}, {y}")
+                print(f"Clicked at {screen_x}, {screen_y}")
                 
+                # Reset the view
                 self.is_grid_view_active = False
                 self.grid_mode = 'main'
                 self.selected_cell = None
                 self.current_input = ''
+                self.zoomed_image = None
+                self.zoomed_rect = None
         self.update()
 
 
+    def capture_full_screenshot(self):
+        screen = QApplication.primaryScreen()
+        self.full_screenshot = screen.grabWindow(0)
+
     def toggle_grid_view(self):
+        if not self.is_grid_view_active:
+            self.capture_full_screenshot()
+        
         self.is_grid_view_active = not self.is_grid_view_active
         self.is_overlay_active = False
         self.grid_mode = 'main'
         self.current_input = ''
         self.selected_cell = None
-        print(f"Grid view {'activated' if self.is_grid_view_active else 'deactivated'}")  
+        print(f"Grid view {'activated' if self.is_grid_view_active else 'deactivated'}")
         self.update()
 
     def stop_grid_view(self):
@@ -307,6 +349,7 @@ class OverlayWindow(QMainWindow):
         self.mouse.click(Button.left)
         print(f"Clicked element at {center.x()}, {center.y()}")
 
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -323,8 +366,73 @@ class OverlayWindow(QMainWindow):
         if self.is_grid_view_active:
             if self.grid_mode == 'main':
                 self.draw_main_grid(painter)
-            elif self.grid_mode == 'sub':
-                self.draw_sub_grid(painter)
+            elif self.grid_mode == 'zoomed':
+                self.draw_zoomed_cell(painter)
+
+    def draw_zoomed_cell(self, painter):
+        if not self.zoomed_image:
+            return
+
+        original_aspect_ratio = self.zoomed_image.width() / self.zoomed_image.height()
+        zoom_height = self.height() * self.zoom_height_percentage
+        zoom_width = zoom_height * original_aspect_ratio
+
+        x = (self.width() - zoom_width) / 2
+        y = (self.height() - zoom_height) / 2
+
+        self.zoomed_rect = QRect(int(x), int(y), int(zoom_width), int(zoom_height))
+
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 128))
+        painter.drawPixmap(self.zoomed_rect, self.zoomed_image)
+
+        pen = QPen(QColor(0, 255, 255))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.drawRect(self.zoomed_rect)
+
+        self.draw_zoomed_grid(painter)
+
+    def draw_zoomed_grid(self, painter):
+        if not self.zoomed_rect:
+            return
+
+        cell_width = self.zoomed_rect.width() / self.subgrid_divisions
+        cell_height = self.zoomed_rect.height() / self.subgrid_divisions
+
+        pen = QPen(QColor(0, 255, 255))
+        pen.setWidth(1)
+        painter.setPen(pen)
+
+        for i in range(1, self.subgrid_divisions):
+            x = self.zoomed_rect.left() + i * cell_width
+            painter.drawLine(int(x), self.zoomed_rect.top(), int(x), self.zoomed_rect.bottom())
+
+            y = self.zoomed_rect.top() + i * cell_height
+            painter.drawLine(self.zoomed_rect.left(), int(y), self.zoomed_rect.right(), int(y))
+
+        for i in range(self.subgrid_divisions):
+            for j in range(self.subgrid_divisions):
+                x = self.zoomed_rect.left() + j * cell_width
+                y = self.zoomed_rect.top() + i * cell_height
+                
+                cyan = QColor(0, 255, 255)
+                painter.setPen(QPen(cyan))
+                cyan.setAlpha(20)
+                painter.setBrush(QBrush(cyan))
+                
+                painter.drawRect(QRect(int(x), int(y), int(cell_width), int(cell_height)))
+
+                cell_index = i * self.subgrid_divisions + j
+                if cell_index < 26:
+                    label = chr(97 + cell_index)  # 'a' to 'z'
+                elif cell_index < 36:
+                    label = str(cell_index - 26)  # '0' to '9'
+                else:
+                    continue
+
+                self.draw_element_label(painter, QPoint(int(x), int(y)), label)
+
+
 
     def draw_main_grid(self, painter):
         pen = QPen(QColor(0, 255, 255))
