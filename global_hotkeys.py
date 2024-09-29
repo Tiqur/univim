@@ -44,8 +44,7 @@ class GlobalHotKeys(QObject):
         # Check if the time since the last press is within the threshold
         if current_time - self.last_shift_press_time <= self.double_press_threshold:
             print("Shift 2nd pressed")
-            self.is_grid_view_active = not self.is_grid_view_active
-            self.grid_view_signal.emit()
+            self.start_event.set()
         else:
             print("Shift key pressed")
         
@@ -57,7 +56,8 @@ class GlobalHotKeys(QObject):
         # Check if the time since the last press is within the threshold
         if current_time - self.last_ctrl_press_time <= self.double_press_threshold:
             print("Ctrl 2nd pressed")
-            self.start_event.set()
+            self.is_grid_view_active = not self.is_grid_view_active
+            self.grid_view_signal.emit()
         else:
             print("Ctrl key pressed")
         

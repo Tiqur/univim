@@ -34,7 +34,7 @@ class OverlayWindow(QMainWindow):
         self.selected_cell = None
         self.zoom_factor = 2
         self.zoomed_image = None
-        self.zoom_height_percentage = 0.2
+        self.zoom_height_percentage = 0.15
         self.zoomed_rect = None
         self.subgrid_divisions = 6
         self.full_screenshot = None
