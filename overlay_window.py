@@ -249,13 +249,11 @@ class OverlayWindow(QMainWindow):
         pen.setWidth(2)
         painter.setPen(pen)
         
-        width = 2560
-        height = 1440
-        div = 26
+        div = 26 # Cell divisions to make
 
         # Calculate the width and height of each grid cell
-        cell_width = width // div
-        cell_height = height // div
+        cell_width = self.size().width() // div
+        cell_height = self.size().height() // div
 
         # Generate a list of characters from 'a' to 'z'
         alphabet = [chr(i) for i in range(ord('a'), ord('z') + 1)]
