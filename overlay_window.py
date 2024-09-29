@@ -30,6 +30,9 @@ class OverlayWindow(QMainWindow):
         self.mouse = MouseController()
         self.current_input = ''
         self.is_grid_view_active = False
+        self.grid_mode = 'main'  # 'main' or 'sub'
+        self.selected_cell = None
+        self.subcell_divisions = 6
 
     def setup_window_properties(self):
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -165,20 +168,97 @@ class OverlayWindow(QMainWindow):
         return labels[:count]
 
     def handle_key_press(self, key):
-        if self.is_overlay_active:
-            self.current_input += key
-            self.update_labels_starting_with(self.current_input)
+        print(f"Key pressed: {key}, Current mode: {self.grid_mode}, Current input: {self.current_input}")  
+        if self.is_grid_view_active:
+            if key.isalpha():
+                self.current_input += key.lower()
+                print(f"Updated input: {self.current_input}")  
+                if self.grid_mode == 'main':
+                    if len(self.current_input) == 2:
+                        self.select_main_cell(self.current_input)
+                elif self.grid_mode == 'sub':
+                    if len(self.current_input) == 1:
+                        self.select_subcell(self.current_input)
+            elif key == 'backspace':
+                self.current_input = self.current_input[:-1]
+            elif key == 'esc':
+                self.stop_grid_view()
             self.update()
+        elif self.is_overlay_active:
+            if key.isalpha():
+                self.current_input += key.lower()
+                self.update_labels_starting_with(self.current_input)
+            elif key == 'backspace':
+                self.current_input = self.current_input[:-1]
+                self.update_labels_starting_with(self.current_input)
+            self.update()
+
+    def select_main_cell(self, cell_id):
+        print(f"Selecting main cell: {cell_id}")  
+        if len(cell_id) == 2 and cell_id.isalpha():
+            row = ord(cell_id[0]) - ord('a')
+            col = ord(cell_id[1]) - ord('a')
+            if 0 <= row < 26 and 0 <= col < 26:
+                self.selected_cell = (row, col)
+                self.grid_mode = 'sub'
+                self.current_input = ''
+                print(f"Selected cell: {self.selected_cell}, Switching to sub mode")  
+            else:
+                print("Invalid cell selection")  
+        else:
+            print("Invalid cell_id format")  
+        self.update()
+
+
+    def select_subcell(self, subcell_id):
+        if self.selected_cell:
+            main_row, main_col = self.selected_cell
+            if subcell_id.isalpha():
+                sub_index = ord(subcell_id.lower()) - ord('a')
+            elif subcell_id.isdigit():
+                sub_index = 26 + int(subcell_id)
+            else:
+                return  # Invalid input
+
+            if 0 <= sub_index < 36:
+                sub_row = sub_index // self.subcell_divisions
+                sub_col = sub_index % self.subcell_divisions
+
+                cell_width = self.width() / 26
+                cell_height = self.height() / 26
+                subcell_width = cell_width / self.subcell_divisions
+                subcell_height = cell_height / self.subcell_divisions
+                
+                x = (main_col * cell_width) + (sub_col * subcell_width) + (subcell_width / 2)
+                y = (main_row * cell_height) + (sub_row * subcell_height) + (subcell_height / 2)
+                
+                self.mouse.position = (int(x), int(y))
+                self.mouse.click(Button.left)
+                print(f"Clicked at {x}, {y}")
+                
+                self.is_grid_view_active = False
+                self.grid_mode = 'main'
+                self.selected_cell = None
+                self.current_input = ''
+        self.update()
+
 
     def toggle_grid_view(self):
         self.is_grid_view_active = not self.is_grid_view_active
         self.is_overlay_active = False
+        self.grid_mode = 'main'
+        self.current_input = ''
+        self.selected_cell = None
+        print(f"Grid view {'activated' if self.is_grid_view_active else 'deactivated'}")  
         self.update()
 
     def stop_grid_view(self):
+        print("Stopping grid view")  
         self.is_grid_view_active = False
+        self.grid_mode = 'main'
+        self.selected_cell = None
+        self.current_input = ''
         self.update()
-
 
     def update_labels_starting_with(self, input_string):
         matching_labels = [label for label in self.element_labels if label.startswith(input_string)]
@@ -236,46 +316,81 @@ class OverlayWindow(QMainWindow):
             return
 
         self.draw_overlay_border(painter)
-        #self.draw_settings_info(painter)
         
         if self.is_overlay_active:
             self.draw_clickable_elements(painter)
         
         if self.is_grid_view_active:
-            self.draw_grid(painter)
+            if self.grid_mode == 'main':
+                self.draw_main_grid(painter)
+            elif self.grid_mode == 'sub':
+                self.draw_sub_grid(painter)
 
-    def draw_grid(self, painter):
+    def draw_main_grid(self, painter):
         pen = QPen(QColor(0, 255, 255))
         pen.setWidth(2)
         painter.setPen(pen)
 
-        div = 26  # Cell divisions to make
+        cell_width = self.width() / 26
+        cell_height = self.height() / 26
 
-        # Calculate the width and height of each grid cell using float division
-        cell_width = self.size().width() / div
-        cell_height = self.size().height() / div
-
-        # Generate a list of characters from 'a' to 'z'
-        alphabet = [chr(i) for i in range(ord('a'), ord('z') + 1)]
-
-        for i in range(0, div):
-            for j in range(0, div):
-                # Calculate the top-left corner of each rectangle (i, j)
+        for i in range(26):
+            for j in range(26):
                 x = i * cell_width
                 y = j * cell_height
                 
-                # Draw the rectangle
                 cyan = QColor(0, 255, 255)
                 painter.setPen(QPen(cyan))
                 cyan.setAlpha(20)
                 painter.setBrush(QBrush(cyan))
                 
-                # Ensure integer values for drawing
                 painter.drawRect(QRect(int(x), int(y), int(cell_width), int(cell_height)))
 
-                # Create a label using characters instead of numbers
-                label = f"{alphabet[i % 26]}{alphabet[j % 26]}"
+                label = f"{chr(97 + j)}{chr(97 + i)}"
                 self.draw_element_label(painter, QPoint(int(x), int(y)), label)
+
+
+    def draw_sub_grid(self, painter):
+        if not self.selected_cell:
+            return
+
+        main_row, main_col = self.selected_cell
+        cell_width = self.width() / 26
+        cell_height = self.height() / 26
+
+        painter.setFont(self.label_font)
+        metrics = QFontMetrics(self.label_font)
+        char_width = metrics.horizontalAdvance('W')  # Use 'W' as a reference for max width
+        char_height = metrics.height()
+
+        subcell_width = max(cell_width / self.subcell_divisions, char_width * 1.5)
+        subcell_height = max(cell_height / self.subcell_divisions, char_height * 1.5)
+
+        for i in range(self.subcell_divisions):
+            for j in range(self.subcell_divisions):
+                x = (main_col * cell_width) + (j * subcell_width)
+                y = (main_row * cell_height) + (i * subcell_height)
+                
+                # Semi-transparent background
+                cyan = QColor(0, 255, 255, 40)  # Increased transparency
+                painter.setBrush(QBrush(cyan))
+                painter.setPen(Qt.NoPen)  # No border
+                
+                painter.drawRect(QRect(int(x), int(y), int(subcell_width), int(subcell_height)))
+
+                # Determine label
+                index = i * self.subcell_divisions + j
+                if index < 26:
+                    label = chr(97 + index)  # 'a' to 'z'
+                elif index < 36:
+                    label = str(index - 26)  # '0' to '9'
+                else:
+                    continue  # Skip if we've used all labels
+
+                # Draw label
+                painter.setPen(QColor(0, 0, 0))  # Black text
+                painter.drawText(QRect(int(x), int(y), int(subcell_width), int(subcell_height)), 
+                                 Qt.AlignCenter, label)
 
     def draw_overlay_border(self, painter):
         pen = QPen(QColor(0, 255, 255))

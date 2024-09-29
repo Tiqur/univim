@@ -6,7 +6,6 @@ from global_mouse import GlobalMouse
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QTimer
 
-
 def main():
     app = QApplication(sys.argv)
 
@@ -23,7 +22,7 @@ def main():
     mouse_thread.start()
 
     # Connect signals
-    hotkeys.key_pressed_signal.connect(overlay.key_pressed_signal)
+    hotkeys.key_pressed_signal.connect(overlay.handle_key_press)
     hotkeys.grid_view_signal.connect(overlay.toggle_grid_view)
     hotkeys.stop_grid_view_signal.connect(overlay.stop_grid_view)
 

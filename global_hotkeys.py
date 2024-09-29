@@ -68,12 +68,13 @@ class GlobalHotKeys(QObject):
         print(f"Key pressed: {key}")
         if key in self.hotkeys:
             self.hotkeys[key]()
-        elif self.is_detection_active:
+        elif self.is_detection_active or self.is_grid_view_active:
             try:
                 char = key.char.lower()
+                print(f"Emitting key pressed signal: {char}")
                 self.key_pressed_signal.emit(char)
             except AttributeError:
-                pass  # Ignore special keys
+                pass
 
     def on_release(self, key):
         print(f"Key released: {key}")
