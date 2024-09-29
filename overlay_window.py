@@ -4,6 +4,7 @@ from PyQt5.QtGui import QGuiApplication, QPainter, QColor, QPen, QFont, QFontMet
 import sys
 import threading
 from pynput.mouse import Controller as MouseController, Button
+import itertools
 
 class YOLOModelLoader(QRunnable):
     def __init__(self, callback):
@@ -137,19 +138,29 @@ class OverlayWindow(QMainWindow):
         labels = []
         characters = 'abcdefghijklmnopqrstuvwxyz'
         
-        # Generate single-character labels first
-        for char in characters[:min(count, len(characters))]:
-            labels.append(char)
+        # Step 1: Reserve the last x letters for single-character labels (default to 12)
+        single_char_limit = min(count, 12)
+        single_char_labels = list(characters[single_char_limit:])
+        labels.extend(single_char_labels)
         
-        # If we need more labels, start combining characters
-        if count > len(characters):
-            import itertools
-            for length in range(2, 5):  # Limit to 4 characters max
-                for combo in itertools.product(characters, repeat=length):
+        # Step 2: If more labels are needed, generate multi-character labels dynamically
+        remaining_count = count - len(labels)
+        
+        if remaining_count > 0:
+            current_length = 2  # Start with two-character labels
+            
+            while remaining_count > 0:
+                first_characters = characters[:single_char_limit]  # Use reserved first characters
+                # Dynamically generate labels of current length
+                for combo in itertools.product(first_characters, repeat=current_length):
                     labels.append(''.join(combo))
-                    if len(labels) == count:
+                    if len(labels) == count:  # Stop once we reach the desired count
                         return labels
-        
+                
+                # Increase the length for the next iteration
+                current_length += 1
+                remaining_count = count - len(labels)  # Update the remaining count
+
         return labels[:count]
 
     def handle_key_press(self, key):
