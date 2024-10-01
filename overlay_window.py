@@ -42,11 +42,13 @@ class OverlayWindow(QMainWindow):
 
     def setup_window_properties(self):
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        if platform.system() == "Linux":
-            self.setWindowFlags(self.windowFlags() | Qt.X11BypassWindowManagerHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setWindowState(Qt.WindowFullScreen)
+
+        if platform.system() == "Linux":
+            self.setWindowFlags(self.windowFlags() | Qt.X11BypassWindowManagerHint)
+
         self.set_fullscreen_geometry()
 
     def set_fullscreen_geometry(self):
