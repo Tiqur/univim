@@ -27,7 +27,7 @@ class GlobalHotKeys(QObject):
 
         self.hotkeys = {
             keyboard.Key.shift: self.on_shift,
-            keyboard.Key.ctrl: self.on_ctrl,
+            keyboard.Key.ctrl_l: self.on_ctrl,
             keyboard.Key.esc: self.on_activate_esc
         }
 

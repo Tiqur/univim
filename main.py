@@ -10,8 +10,7 @@ def main():
     app = QApplication(sys.argv)
 
     overlay = OverlayWindow()
-    overlay_thread = threading.Thread(target=overlay.activate_overlay)
-    overlay_thread.start()
+    overlay.activate_overlay()
 
     hotkeys = GlobalHotKeys()
     hotkey_thread = threading.Thread(target=hotkeys.start_listening)
