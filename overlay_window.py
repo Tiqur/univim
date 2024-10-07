@@ -14,7 +14,7 @@ class YOLOModelLoader(QRunnable):
 
     def run(self):
         from ultralytics import YOLO
-        model = YOLO("weights/best.pt")
+        model = YOLO("weights/cloud.pt")
         self.callback(model)
 
 class OverlayWindow(QMainWindow):
@@ -109,7 +109,7 @@ class OverlayWindow(QMainWindow):
         self.update()
 
     def detect_clickable_elements(self):
-        results = self.ai_model("current_screen.png", conf=0.1, max_det=2048, iou=0.4, stream=True)
+        results = self.ai_model("current_screen.png", conf=0.01, max_det=2048, iou=0.4, stream=True)
         
         for result in results:
             all_elements = self.extract_elements_from_result(result)
@@ -143,8 +143,17 @@ class OverlayWindow(QMainWindow):
     def is_significant_overlap(self, elem1, elem2, threshold):
         intersect = elem1.intersected(elem2)
         intersect_area = intersect.width() * intersect.height()
-        smaller_elem_area = min(elem1.width() * elem1.height(), elem2.width() * elem2.height())
+        elem1_area = elem1.width() * elem1.height()
+        elem2_area = elem2.width() * elem2.height()
+
+        # Avoid division by zero by checking if any element has zero area
+        if elem1_area == 0 or elem2_area == 0:
+            return False  # No overlap if one element has zero area
+
+        smaller_elem_area = min(elem1_area, elem2_area)
+        
         return intersect_area / smaller_elem_area > threshold
+
 
     def generate_labels(self, count):
         labels = []
