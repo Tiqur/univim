@@ -6,6 +6,7 @@
 #include <QKeyEvent>
 #include <QPainter>
 #include <vector>
+#include <QPixmap>
 
 class OverlayWindow : public QWidget {
 public:
@@ -58,6 +59,16 @@ public:
         }
     }
 
+    std::vector<QPixmap> captureScreens() {
+        std::vector<QPixmap> screenshots;
+
+        for (QScreen* screen : QGuiApplication::screens()) {
+            QPixmap screenshot = screen->grabWindow(0);
+            screenshots.push_back(screenshot);
+        }
+        return screenshots;
+    }
+
 private:
     std::vector<OverlayWindow*> windows;
 };
@@ -67,13 +78,16 @@ int main(int argc, char* argv[]) {
 
     OverlayManager overlayManager;
 
-    // Add a window for each screen
     for (QScreen* screen : QGuiApplication::screens()) {
         overlayManager.addOverlay(screen);
     }
 
+    std::vector<QPixmap> screenshots = overlayManager.captureScreens();
+    std::cout << "Captured " << screenshots.size() << " screenshots." << std::endl;
+    
     overlayManager.showOverlays();
 
     return app.exec();
 }
+
 
