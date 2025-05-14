@@ -14,7 +14,7 @@ class YOLOModelLoader(QRunnable):
 
     def run(self):
         from ultralytics import YOLO
-        model = YOLO("weights/cloud.pt")
+        model = YOLO("weights/omni.pt")
         self.callback(model)
 
 class OverlayWindow(QMainWindow):
