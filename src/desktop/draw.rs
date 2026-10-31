@@ -4,16 +4,24 @@ use super::session::{Mode, Session};
 use crate::Target;
 use opencv::{core::*, imgproc};
 
-// OpenCV colors are BGR(A). Green keeps the overlay distinct from the captured
-// UI while remaining legible on both light and dark desktops.
+// OpenCV colors are BGR(A). The target outline is muted so the solid neon
+// labels remain the highest-contrast element on the overlay.
+const NEON: Scalar = Scalar::new(20., 255., 40., 255.);
+const BLACK: Scalar = Scalar::new(0., 0., 0., 255.);
 const GREEN: Scalar = Scalar::new(70., 220., 70., 255.);
 const GREEN_FILL: Scalar = Scalar::new(70., 220., 70., 48.);
 const DARK: Scalar = Scalar::new(18., 18., 18., 255.);
-const LABEL: Scalar = Scalar::new(10., 32., 12., 210.);
 const OUTLINE: Scalar = Scalar::new(70., 220., 70., 220.);
-const TEXT_SCALE: f64 = 0.5;
-const TEXT_THICKNESS: i32 = 2;
-const BOLD_THICKNESS: i32 = 3;
+
+const LABEL_FONT: i32 = imgproc::FONT_HERSHEY_SIMPLEX;
+const LABEL_SCALE: f64 = 0.48;
+const LABEL_THICKNESS: i32 = 1;
+const LABEL_BOLD_THICKNESS: i32 = 2;
+const LABEL_PAD_X: i32 = 3;
+const LABEL_PAD_Y: i32 = 2;
+
+const STATUS_SCALE: f64 = 0.45;
+const STATUS_THICKNESS: i32 = 1;
 
 fn canvas(width: u32, height: u32) -> Result<Mat, String> {
     // Bound both dimensions and total storage before handing sizes to OpenCV.
@@ -50,17 +58,10 @@ fn rect(m: &mut Mat, bounds: [i32; 4], color: Scalar, fill: bool) -> opencv::Res
     Ok(())
 }
 
-fn text(
-    m: &mut Mat,
-    value: &str,
-    x: i32,
-    y: i32,
-    badge: bool,
-    highlight: usize,
-) -> opencv::Result<()> {
+fn sanitize(value: &str) -> String {
     // Hershey fonts are ASCII-only. Bound work and replace unsupported glyphs
     // rather than passing arbitrary UTF-8 bytes to OpenCV's text renderer.
-    let value: String = value
+    value
         .chars()
         .take(120)
         .map(|c| {
@@ -70,56 +71,123 @@ fn text(
                 '?'
             }
         })
-        .collect();
+        .collect()
+}
+
+fn measure(value: &str) -> opencv::Result<(i32, i32, i32)> {
     let mut baseline = 0;
     let size = imgproc::get_text_size(
-        &value,
-        imgproc::FONT_HERSHEY_SIMPLEX,
-        TEXT_SCALE,
-        TEXT_THICKNESS,
+        &sanitize(value),
+        LABEL_FONT,
+        LABEL_SCALE,
+        LABEL_THICKNESS,
         &mut baseline,
     )?;
-    // Leave room for the extra half-stroke of the bold prefix.
-    let w = size.width + 10;
-    let h = size.height + baseline + 8;
+    Ok((size.width, size.height, baseline))
+}
+
+fn label_size(value: &str) -> opencv::Result<(i32, i32)> {
+    let (width, height, baseline) = measure(value)?;
+    Ok((width + LABEL_PAD_X * 2, height + baseline + LABEL_PAD_Y * 2))
+}
+
+fn tag(m: &mut Mat, value: &str, x: i32, y: i32, highlight: usize) -> opencv::Result<()> {
+    let value = sanitize(value);
+    let (width, height, baseline) = measure(&value)?;
+    let w = width + LABEL_PAD_X * 2;
+    let h = height + baseline + LABEL_PAD_Y * 2;
     let x = x.clamp(0, (m.cols() - w).max(0));
     let y = y.clamp(0, (m.rows() - h).max(0));
-    rect(m, [x, y, w, h], if badge { LABEL } else { DARK }, true)?;
-    if badge {
-        rect(m, [x, y, w, h], OUTLINE, false)?;
-    }
-    let origin = Point::new(x + 5, y + size.height + 4);
-    let color = GREEN;
+    rect(m, [x, y, w, h], NEON, true)?;
+    let origin = Point::new(x + LABEL_PAD_X, y + height + LABEL_PAD_Y);
     imgproc::put_text(
         m,
         &value,
         origin,
-        imgproc::FONT_HERSHEY_SIMPLEX,
-        TEXT_SCALE,
-        color,
-        TEXT_THICKNESS,
-        imgproc::LINE_8,
+        LABEL_FONT,
+        LABEL_SCALE,
+        BLACK,
+        LABEL_THICKNESS,
+        imgproc::LINE_AA,
         false,
     )?;
     // Redraw the leading characters at the same origin. OpenCV lays out the
     // prefix identically at the start of the full label, so only its strokes
     // thicken without changing the label width.
     let highlight = highlight.min(value.chars().count());
-    if badge && highlight > 0 {
+    if highlight > 0 {
         let prefix: String = value.chars().take(highlight).collect();
         imgproc::put_text(
             m,
             &prefix,
             origin,
-            imgproc::FONT_HERSHEY_SIMPLEX,
-            TEXT_SCALE,
-            color,
-            BOLD_THICKNESS,
-            imgproc::LINE_8,
+            LABEL_FONT,
+            LABEL_SCALE,
+            BLACK,
+            LABEL_BOLD_THICKNESS,
+            imgproc::LINE_AA,
             false,
         )?;
     }
     Ok(())
+}
+
+fn status(m: &mut Mat, value: &str, x: i32, y: i32) -> opencv::Result<()> {
+    let value = sanitize(value);
+    let mut baseline = 0;
+    let size = imgproc::get_text_size(
+        &value,
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        STATUS_SCALE,
+        STATUS_THICKNESS,
+        &mut baseline,
+    )?;
+    let w = size.width + 8;
+    let h = size.height + baseline + 6;
+    let x = x.clamp(0, (m.cols() - w).max(0));
+    let y = y.clamp(0, (m.rows() - h).max(0));
+    rect(m, [x, y, w, h], DARK, true)?;
+    imgproc::put_text(
+        m,
+        &value,
+        Point::new(x + 4, y + size.height + 3),
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        STATUS_SCALE,
+        NEON,
+        STATUS_THICKNESS,
+        imgproc::LINE_AA,
+        false,
+    )
+}
+
+/// Keep labels attached to their targets, but move the tag outside when it
+/// would obscure most of a small target. Prefer outside above, then below,
+/// then to the right and left before falling back to the top-left corner.
+fn place_label(target: [i32; 4], label: (i32, i32), cols: i32, rows: i32) -> (i32, i32) {
+    let [x, y, w, h] = target;
+    let (label_w, label_h) = label;
+    let x = x.clamp(0, (cols - label_w).max(0));
+    // Require a comfortable margin so labels do not sit on small targets.
+    if w >= label_w + 24 && h >= label_h + 24 {
+        return (x, y);
+    }
+    let above = y - label_h - 2;
+    if above >= 0 {
+        return (x, above);
+    }
+    let below = y + h + 2;
+    if below + label_h <= rows {
+        return (x, below);
+    }
+    let right = x + w + 2;
+    if right + label_w <= cols {
+        return (right, y);
+    }
+    let left = x - label_w - 2;
+    if left >= 0 {
+        return (left, y);
+    }
+    (x, y)
 }
 
 fn hints(
@@ -152,7 +220,8 @@ fn hints(
         // The first character is always emphasized. Typed characters stay bold
         // as the prefix grows, making the active filter obvious.
         let highlight = prefix.chars().count().max(1);
-        text(m, &t.hint, x, y, true, highlight)?;
+        let (lx, ly) = place_label([x, y, w, h], label_size(&t.hint)?, m.cols(), m.rows());
+        tag(m, &t.hint, lx, ly, highlight)?;
     }
     Ok(())
 }
@@ -180,9 +249,12 @@ fn grid(m: &mut Mat, bounds: Rect, count: i32, prefix: &str) -> opencv::Result<(
             let w = (col + 1) * bounds.width / count - col * bounds.width / count;
             let h = (row + 1) * bounds.height / count - row * bounds.height / count;
             rect(m, [x, y, w, h], OUTLINE, false)?;
-            if label.starts_with(prefix) && w >= 12 && h >= 16 {
-                let highlight = prefix.chars().count().max(1);
-                text(m, &label, x + 2, y + 2, true, highlight)?;
+            if label.starts_with(prefix) {
+                let (label_w, label_h) = label_size(&label)?;
+                if w >= label_w + 4 && h >= label_h + 4 {
+                    let highlight = prefix.chars().count().max(1);
+                    tag(m, &label, x + 2, y + 2, highlight)?;
+                }
             }
         }
     }
@@ -293,7 +365,7 @@ pub fn render(
             Mode::Hints => "Hints",
             Mode::Grid => "Grid",
         };
-        text(
+        status(
             &mut m,
             &format!(
                 "{mode} [{}]  Escape cancel / Tab drill {} / Backspace",
@@ -302,8 +374,6 @@ pub fn render(
             ),
             8,
             8,
-            false,
-            0,
         )?;
         export(&m)
     };
@@ -349,7 +419,7 @@ mod tests {
         )
         .unwrap();
         rect(&mut m, [-5, -5, 30, 30], OUTLINE, true).unwrap();
-        text(&mut m, "é\n界", i32::MAX, i32::MIN, true, 0).unwrap();
+        tag(&mut m, "é\n界", i32::MAX, i32::MIN, 0).unwrap();
         let mut t = Target::new(i32::MAX, i32::MIN, i32::MAX, i32::MAX, 1., "icon", "test");
         t.hint = "界".into();
         hints(&mut m, &[t], "", 1, 1).unwrap();
@@ -368,9 +438,38 @@ mod tests {
     fn typed_hint_prefix_is_bolder() {
         let mut plain = canvas(80, 40).unwrap();
         let mut bold = canvas(80, 40).unwrap();
-        text(&mut plain, "MGF", 2, 2, true, 1).unwrap();
-        text(&mut bold, "MGF", 2, 2, true, 2).unwrap();
+        tag(&mut plain, "MGF", 2, 2, 1).unwrap();
+        tag(&mut bold, "MGF", 2, 2, 2).unwrap();
         assert_ne!(export(&plain).unwrap(), export(&bold).unwrap());
+    }
+
+    #[test]
+    fn labels_are_black_on_solid_neon() {
+        let mut m = canvas(60, 30).unwrap();
+        tag(&mut m, "M", 2, 2, 1).unwrap();
+        let pixels = export(&m).unwrap();
+        assert!(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p == &[0, 0, 0, 255])
+        );
+        assert!(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[3] == 255 && p[1] > p[0] && p[1] > p[2])
+        );
+    }
+
+    #[test]
+    fn small_targets_place_labels_outside() {
+        let label = (20, 14);
+        assert_eq!(place_label([40, 40, 20, 10], label, 200, 100), (40, 24));
+        assert_eq!(place_label([40, 40, 100, 50], label, 200, 100), (40, 40));
+        assert_eq!(place_label([40, 0, 20, 10], label, 200, 100), (40, 12));
     }
 
     #[test]
