@@ -4,9 +4,16 @@ use super::session::{Mode, Session};
 use crate::Target;
 use opencv::{core::*, imgproc};
 
-const YELLOW: Scalar = Scalar::new(65., 222., 255., 255.);
+// OpenCV colors are BGR(A). Green keeps the overlay distinct from the captured
+// UI while remaining legible on both light and dark desktops.
+const GREEN: Scalar = Scalar::new(70., 220., 70., 255.);
+const GREEN_FILL: Scalar = Scalar::new(70., 220., 70., 48.);
 const DARK: Scalar = Scalar::new(18., 18., 18., 255.);
-const OUTLINE: Scalar = Scalar::new(65., 222., 255., 110.);
+const LABEL: Scalar = Scalar::new(10., 32., 12., 210.);
+const OUTLINE: Scalar = Scalar::new(70., 220., 70., 220.);
+const TEXT_SCALE: f64 = 0.5;
+const TEXT_THICKNESS: i32 = 2;
+const BOLD_THICKNESS: i32 = 3;
 
 fn canvas(width: u32, height: u32) -> Result<Mat, String> {
     // Bound both dimensions and total storage before handing sizes to OpenCV.
@@ -43,7 +50,14 @@ fn rect(m: &mut Mat, bounds: [i32; 4], color: Scalar, fill: bool) -> opencv::Res
     Ok(())
 }
 
-fn text(m: &mut Mat, value: &str, x: i32, y: i32, badge: bool) -> opencv::Result<()> {
+fn text(
+    m: &mut Mat,
+    value: &str,
+    x: i32,
+    y: i32,
+    badge: bool,
+    highlight: usize,
+) -> opencv::Result<()> {
     // Hershey fonts are ASCII-only. Bound work and replace unsupported glyphs
     // rather than passing arbitrary UTF-8 bytes to OpenCV's text renderer.
     let value: String = value
@@ -58,24 +72,54 @@ fn text(m: &mut Mat, value: &str, x: i32, y: i32, badge: bool) -> opencv::Result
         })
         .collect();
     let mut baseline = 0;
-    let size =
-        imgproc::get_text_size(&value, imgproc::FONT_HERSHEY_SIMPLEX, 0.4, 1, &mut baseline)?;
-    let w = size.width + 8;
-    let h = size.height + baseline + 6;
+    let size = imgproc::get_text_size(
+        &value,
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        TEXT_SCALE,
+        TEXT_THICKNESS,
+        &mut baseline,
+    )?;
+    // Leave room for the extra half-stroke of the bold prefix.
+    let w = size.width + 10;
+    let h = size.height + baseline + 8;
     let x = x.clamp(0, (m.cols() - w).max(0));
     let y = y.clamp(0, (m.rows() - h).max(0));
-    rect(m, [x, y, w, h], if badge { YELLOW } else { DARK }, true)?;
+    rect(m, [x, y, w, h], if badge { LABEL } else { DARK }, true)?;
+    if badge {
+        rect(m, [x, y, w, h], OUTLINE, false)?;
+    }
+    let origin = Point::new(x + 5, y + size.height + 4);
+    let color = GREEN;
     imgproc::put_text(
         m,
         &value,
-        Point::new(x + 4, y + size.height + 3),
+        origin,
         imgproc::FONT_HERSHEY_SIMPLEX,
-        0.4,
-        if badge { DARK } else { YELLOW },
-        1,
+        TEXT_SCALE,
+        color,
+        TEXT_THICKNESS,
         imgproc::LINE_8,
         false,
-    )
+    )?;
+    // Redraw the leading characters at the same origin. OpenCV lays out the
+    // prefix identically at the start of the full label, so only its strokes
+    // thicken without changing the label width.
+    let highlight = highlight.min(value.chars().count());
+    if badge && highlight > 0 {
+        let prefix: String = value.chars().take(highlight).collect();
+        imgproc::put_text(
+            m,
+            &prefix,
+            origin,
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            TEXT_SCALE,
+            color,
+            BOLD_THICKNESS,
+            imgproc::LINE_8,
+            false,
+        )?;
+    }
+    Ok(())
 }
 
 fn hints(
@@ -103,8 +147,12 @@ fn hints(
         let y = top.max(0.) as i32;
         let w = right.min(f64::from(m.cols())) as i32 - x;
         let h = bottom.min(f64::from(m.rows())) as i32 - y;
+        rect(m, [x, y, w, h], GREEN_FILL, true)?;
         rect(m, [x, y, w, h], OUTLINE, false)?;
-        text(m, &t.hint, x, y, true)?;
+        // The first character is always emphasized. Typed characters stay bold
+        // as the prefix grows, making the active filter obvious.
+        let highlight = prefix.chars().count().max(1);
+        text(m, &t.hint, x, y, true, highlight)?;
     }
     Ok(())
 }
@@ -133,7 +181,8 @@ fn grid(m: &mut Mat, bounds: Rect, count: i32, prefix: &str) -> opencv::Result<(
             let h = (row + 1) * bounds.height / count - row * bounds.height / count;
             rect(m, [x, y, w, h], OUTLINE, false)?;
             if label.starts_with(prefix) && w >= 12 && h >= 16 {
-                text(m, &label, x + 2, y + 2, true)?;
+                let highlight = prefix.chars().count().max(1);
+                text(m, &label, x + 2, y + 2, true, highlight)?;
             }
         }
     }
@@ -192,7 +241,8 @@ pub fn render(
                     let y = row as i32 * bounds.height / 26;
                     let w = (col as i32 + 1) * bounds.width / 26 - x;
                     let h = (row as i32 + 1) * bounds.height / 26 - y;
-                    rect(&mut m, [x, y, w, h], YELLOW, false)?;
+                    rect(&mut m, [x, y, w, h], GREEN_FILL, true)?;
+                    rect(&mut m, [x, y, w, h], GREEN, false)?;
                     // Integer partitions match the coarse grid, including remainder pixels.
                     let sx =
                         col as i32 * (session.width / 26) + col as i32 * (session.width % 26) / 26;
@@ -253,6 +303,7 @@ pub fn render(
             8,
             8,
             false,
+            0,
         )?;
         export(&m)
     };
@@ -298,7 +349,7 @@ mod tests {
         )
         .unwrap();
         rect(&mut m, [-5, -5, 30, 30], OUTLINE, true).unwrap();
-        text(&mut m, "é\n界", i32::MAX, i32::MIN, true).unwrap();
+        text(&mut m, "é\n界", i32::MAX, i32::MIN, true, 0).unwrap();
         let mut t = Target::new(i32::MAX, i32::MIN, i32::MAX, i32::MAX, 1., "icon", "test");
         t.hint = "界".into();
         hints(&mut m, &[t], "", 1, 1).unwrap();
@@ -310,6 +361,27 @@ mod tests {
                 .iter()
                 .all(|p| p[..3].iter().all(|&v| v <= p[3]))
         );
-        assert!(bytes.as_chunks::<4>().0.iter().any(|p| p[3] == 110));
+        assert!(bytes.as_chunks::<4>().0.iter().any(|p| p[3] == 220));
+    }
+
+    #[test]
+    fn typed_hint_prefix_is_bolder() {
+        let mut plain = canvas(80, 40).unwrap();
+        let mut bold = canvas(80, 40).unwrap();
+        text(&mut plain, "MGF", 2, 2, true, 1).unwrap();
+        text(&mut bold, "MGF", 2, 2, true, 2).unwrap();
+        assert_ne!(export(&plain).unwrap(), export(&bold).unwrap());
+    }
+
+    #[test]
+    fn hint_boxes_use_a_translucent_green_fill() {
+        let mut m = canvas(120, 80).unwrap();
+        let mut t = Target::new(20, 20, 60, 30, 1., "icon", "test");
+        t.hint = "AB".into();
+        hints(&mut m, &[t], "", 120, 80).unwrap();
+        let pixels = export(&m).unwrap();
+        let fill = &pixels[((47 * 120) + 70) * 4..][..4];
+        assert!(fill[1] > fill[0] && fill[1] > fill[2]);
+        assert_eq!(fill[3], GREEN_FILL[3] as u8);
     }
 }
