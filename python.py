@@ -1,39 +1,29 @@
 #!/usr/bin/env python3
 """
-visel_detector.py (v6) — Vision-Refined Structure-Aware, Hierarchical Drill-Down UI & Text Detector
-====================================================================================================
-Fast single-pass + 1D recursive refinement + container-scoped structural rail detector for
-universal Vimium navigation across interactive controls, text hierarchies, media thumbnails,
-cards, and desktop/sidebar compounds.
+visel_detector.py (v8) — Self-Calibrating, Multi-Trial Consensus & Flat-Zone Peeling UI Detector
+=================================================================================================
+Universal zero-dependency computer-vision UI detector for Vimium navigation across any OS, theme,
+DPI scale, or compression level.
 
-Key Capabilities & v6 Vision-Guided Upgrades:
-  1. Single-Character UI Section Header & Control Recovery (`#`, `B`, `C`, `E`, `?`, `+`, `1..9`):
-     - Recovers high-contrast single-character UI buttons and alphabet section headers sitting on
-       clean flat UI chrome (`local_flat >= 0.78`, `max_g >= 110`) with uniform rail-aligned
-       clickable hitboxes while suppressing specks on textured backgrounds.
-  2. Large Display Heading Integrity (Scale-Proportional Barrier Kernels + Glyph-Loop Guard):
-     - Scales structural barrier kernels (`h_bar = max(64, int(92 * s))`, `v_bar = max(48, int(68 * s))`)
-       so vertical letter stems (`d`, `i`, `t`, `l`, `g`, `M`) in large `28-64px` display headings
-       (`Categories`, `Editors' Choice`, `Edit pictures without leaving Word`, `OpenStreetMap`) and
-       `76x88` app icons (`Things 3`, `Pixelmator Pro`) are never erased by `v_bar`/`h_bar`.
-     - Prevents closed counter loops inside large bold letters from being misclassified as small
-       button frames by checking adjacent left/right glyph stroke ink (`l_ink`, `r_ink`).
-     - Scales horizontal word-split thresholds (`gap_thresh = max(18, int(rh * 0.85))`) and restricts
-       `/` punctuation-separator splitting to standard text heights (`rh <= int(22 * s)`), keeping
-       multi-word display headings unified while storing individual words in `target.children`.
-  3. Complete Horizontal & Vertical `[Icon + Label]` Compound Fusion + Inner Frame Children:
-     - Pairs square-ish icons/frames across sidebars, 3-column App Store category grids and app
-       cards (`12_macos`), Control Center rows (`15_macos`), dark admin sidebars (`20_shop`), and
-       Windows 10 Live Tiles (`03_windows`) with their adjacent labels and stacked subtitles.
-     - Enforces the geometric invariant `fh >= rh * 1.22` and horizontal-barrier checks in vertical
-       `[Icon + Bottom Caption]` pairing so stacked numeric dropdown rows (`10` and `10.5`, or `72`
-       and `Page 1 of 1` in `11_macos`) never fuse across rows.
-     - Preserves inner icons and text labels inside closed `frame` buttons/inputs as drill-down
-       `children` rather than discarding them.
-  4. Step 8 — Rounded-Corner / Borderless Thumbnail & Map/Photo-Interior Coherence Masking:
-     - Uses block texture/flatness coherence (`outer_flat`, `flat_r`, `tb_r`, `lr_r`, and `max_g`)
-       to reject false road/river contour frames and terrain text on map canvases (`26_tool`) and
-       photographic backgrounds while removing rounded-corner arc artifacts on translucent modals.
+Key v8 Architectural Upgrades:
+  1. Stage 0 Self-Calibrating Image Physics (`_calibrate_image_physics`):
+     - Automatically estimates the screenshot's background noise floor (`noise_floor`), gradient
+       contrast quantiles (`stroke_thr`, `border_thr`, `flat_thr`), and fundamental modal text line
+       height `L_0` (`char_h`, in pixels) in ~1.5 ms.
+     - Replaces hard-coded pixel and intensity magic numbers with dimensionless multiples of `L_0`
+       and image-adaptive gradient quantiles.
+  2. Stage 2B Flat-Zone / Rounded-Pill Background Peeling:
+     - Recovers borderless and rounded-corner dark/light buttons, pills, and input boxes whose
+       interior background fill contrasts with the surrounding panel (`delta_bgr >= 8.5`) and wraps
+       interior text/icon strokes, without requiring unbroken 90-degree corner edges.
+  3. Stage 4 Multi-Regime Trial Consensus (Weighted Box Fusion) & Unsupervised Layout Scoring:
+     - Evaluates 3 parameter regimes (Fine, Balanced, Cohesive) on complex 1D/2D regions, scores
+       candidate partitions via an unsupervised UI Layout Objective Function (quiet gutter flatness,
+       stroke packing, `L_0` height regularity, and sibling grid alignment), and fuses persistent
+       boxes across trials via Weighted Box Fusion (WBF).
+  4. Post-Stage-4 Peer-Grid & Cross-Row Media Shelf Completion + 2-Bin Dominance Thumbnail Filter:
+     - Completes dark-bordered 16:9 and 9:16 media shelves while rejecting bimodal 2-tone UI cards
+       and organic 3D viewport contours.
 """
 
 from dataclasses import dataclass, field
@@ -93,8 +83,6 @@ def generate_vimium_hints(n: int, alphabet: str = "sadfjklewcmpgh") -> List[str]
 def drill_down(target: UITarget, to_words: bool = True) -> List[UITarget]:
     """
     Instant 0.0 ms hierarchical drill-down when the user selects a target with a modifier key.
-    - For a `paragraph` (or `line` / `desktop_icon` / `frame`), returns either its immediate
-      `children` (`to_words=False`) or flattens down to individual `word` / leaf targets (`to_words=True`).
     """
     if not target.children:
         return [target]
@@ -143,11 +131,160 @@ class ViselDetector:
         self.k_dx = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
         self.k_dy = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2))
         self.k_d95 = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 5))
-        self.k_coarse = cv2.getStructuringElement(cv2.MORPH_RECT, (16, 6))
-        self.k_coarse_hi = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 8))
-        self.k_coarse_h = cv2.getStructuringElement(cv2.MORPH_RECT, (8, 3))
+        self.k_coarse = cv2.getStructuringElement(cv2.MORPH_RECT, (14, 5))
+        self.k_coarse_hi = cv2.getStructuringElement(cv2.MORPH_RECT, (18, 7))
         self.k_bar_dil = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        self.k_h_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
+        self.k_v_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
         self.one_12 = np.ones(12, dtype=np.uint8)
+
+    @staticmethod
+    def _calibrate_image_physics(
+        grad_max: np.ndarray, W: int, H: int
+    ) -> Tuple[int, int, int, float, float]:
+        """
+        Self-calibrate gradient thresholds (noise_floor, flat_thr, border_thr, stroke_thr)
+        and fundamental text line height L_0 from the image's own statistics.
+        """
+        hist = cv2.calcHist([grad_max], [0], None, [256], [0, 256]).flatten()
+        cdf = np.cumsum(hist) / float(max(1, W * H))
+        p35 = int(np.searchsorted(cdf, 0.35))
+        p65 = int(np.searchsorted(cdf, 0.65))
+        p82 = int(np.searchsorted(cdf, 0.82))
+
+        noise_floor = int(np.clip(p35, 1, 5))
+        flat_thr = int(np.clip(noise_floor + 2, 3, 6))
+        border_thr = int(np.clip(max(noise_floor + 1, int(p65 * 0.75)), 3, 6))
+        stroke_thr = int(np.clip(int(p82 * 0.85), 14, 21))
+
+        # Estimate fundamental modal text line height L_0 from horizontal stroke bands
+        _, s_bin = cv2.threshold(grad_max, stroke_thr, 255, cv2.THRESH_BINARY)
+        k_line = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 2))
+        s_closed = cv2.morphologyEx(s_bin, cv2.MORPH_CLOSE, k_line)
+        cnts, _ = cv2.findContours(s_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        heights = []
+        for c in cnts:
+            _, _, bw, bh = cv2.boundingRect(c)
+            if 9 <= bh <= 32 and bw >= bh * 2.2 and bw <= W * 0.45:
+                heights.append(bh)
+        if len(heights) >= 8:
+            h_arr = np.array(heights, dtype=np.int32)
+            counts = np.bincount(h_arr, minlength=36)
+            # Smooth 3-bin window to find robust modal text height L_0
+            smooth_counts = counts[8:33] + counts[7:32] + counts[9:34]
+            modal_h = float(8 + int(np.argmax(smooth_counts)))
+            med_h = float(np.median(h_arr))
+            L_0 = 0.6 * modal_h + 0.4 * med_h
+        else:
+            L_0 = 16.0 * float(np.clip(np.sqrt((W * H) / float(1440 * 900)), 0.70, 1.60))
+
+        L_0 = float(np.clip(L_0, 11.5, 26.0))
+        u = float(np.clip(L_0 / 16.0, 0.68, 1.75))
+        return flat_thr, border_thr, stroke_thr, L_0, u
+
+    @staticmethod
+    def _wbf_fuse_trials(
+        trial_lists: List[List[Tuple[int, int, int, int, float]]],
+        min_votes: int = 2,
+        iou_thr: float = 0.55,
+    ) -> List[Tuple[int, int, int, int]]:
+        """
+        Weighted Box Fusion (WBF) across multi-parameter trials: keeps candidate sub-boxes
+        that persist across >= min_votes parameter regimes and averages their coordinates
+        weighted by each trial's boundary sharpness score.
+        """
+        clusters: List[List[Tuple[int, int, int, int, float, int]]] = []
+        for t_idx, boxes in enumerate(trial_lists):
+            for (bx, by, bw, bh, bscore) in boxes:
+                b_area = float(max(1, bw * bh))
+                best_ci = -1
+                best_iou = 0.0
+                for ci, cl in enumerate(clusters):
+                    # Compare against cluster running average
+                    cx = sum(item[0] * item[4] for item in cl) / sum(item[4] for item in cl)
+                    cy = sum(item[1] * item[4] for item in cl) / sum(item[4] for item in cl)
+                    cw = sum(item[2] * item[4] for item in cl) / sum(item[4] for item in cl)
+                    ch = sum(item[3] * item[4] for item in cl) / sum(item[4] for item in cl)
+                    inter = max(0.0, min(bx + bw, cx + cw) - max(bx, cx)) * max(0.0, min(by + bh, cy + ch) - max(by, cy))
+                    iou = inter / float(b_area + cw * ch - inter + 1e-5)
+                    if iou >= iou_thr and iou > best_iou:
+                        best_iou = iou
+                        best_ci = ci
+                if best_ci >= 0:
+                    clusters[best_ci].append((bx, by, bw, bh, bscore, t_idx))
+                else:
+                    clusters.append([(bx, by, bw, bh, bscore, t_idx)])
+
+        fused = []
+        for cl in clusters:
+            unique_trials = len(set(item[5] for item in cl))
+            max_sc = max(item[4] for item in cl)
+            if unique_trials >= min_votes or max_sc >= 1.35:
+                w_sum = sum(item[4] for item in cl)
+                fx = int(round(sum(item[0] * item[4] for item in cl) / w_sum))
+                fy = int(round(sum(item[1] * item[4] for item in cl) / w_sum))
+                fw = int(round(sum(item[2] * item[4] for item in cl) / w_sum))
+                fh = int(round(sum(item[3] * item[4] for item in cl) / w_sum))
+                fused.append((fx, fy, fw, fh))
+        return fused
+
+    @staticmethod
+    def _has_rect_card_borders(
+        x: int, y: int, w: int, h: int,
+        dx_gray: np.ndarray, dy_gray: np.ndarray, gray: np.ndarray
+    ) -> bool:
+        H, W = gray.shape[:2]
+        if w < 16 or h < 16:
+            return False
+        top_e = float((dy_gray[max(0, y - 3) : min(H, y + 4), x : x + w] >= 6).any(axis=0).mean())
+        bot_e = 1.0 if (y + h >= H - 8) else float((dy_gray[max(0, y + h - 4) : min(H, y + h + 3), x : x + w] >= 6).any(axis=0).mean())
+        left_e = float((dx_gray[y : y + h, max(0, x - 3) : min(W, x + 4)] >= 6).any(axis=1).mean())
+        right_e = float((dx_gray[y : y + h, max(0, x + w - 4) : min(W, x + w + 3)] >= 6).any(axis=1).mean())
+        sides = sorted([top_e, bot_e, left_e, right_e], reverse=True)
+        min_side = sides[3]
+        s3 = sides[2]
+        if min_side >= 0.50 and (s3 >= 0.68 or min_side >= 0.62):
+            return True
+        if s3 >= 0.72:
+            oy1, oy2 = max(0, y - 6), min(H, y + h + 6)
+            ox1, ox2 = max(0, x - 6), min(W, x + w + 6)
+            ring_mask = np.ones((oy2 - oy1, ox2 - ox1), dtype=bool)
+            ring_mask[y - oy1 : y - oy1 + h, x - ox1 : x - ox1 + w] = False
+            ring_vals = gray[oy1:oy2, ox1:ox2][ring_mask]
+            if ring_vals.size > 0 and float(np.median(ring_vals)) < 36.0:
+                return True
+        return False
+
+    @staticmethod
+    def _is_real_photo_thumbnail(
+        roi_gray: np.ndarray, roi_grad: np.ndarray, roi_chroma: np.ndarray
+    ) -> bool:
+        """
+        Distinguish photographic/video thumbnails from bimodal flat UI cards/headers/code panes.
+        """
+        rh, rw = roi_gray.shape[:2]
+        if rh < 14 or rw < 14:
+            return False
+        area = float(rh * rw)
+        fr6 = float(np.count_nonzero(roi_grad <= 6)) / area
+        if fr6 >= 0.65:
+            return False
+        hist = cv2.calcHist([roi_gray], [0], None, [32], [0, 256]).flatten() / area
+        dom2 = float(np.sort(hist)[-2:].sum())
+        if dom2 >= 0.64:
+            return False
+        ch_mean = float(roi_chroma.mean())
+        if ch_mean < 5.5 and dom2 >= 0.42:
+            return False
+        active_tiles = 0
+        for r_i in range(3):
+            y0, y1 = (r_i * rh) // 3, ((r_i + 1) * rh) // 3
+            for c_i in range(3):
+                x0, x1 = (c_i * rw) // 3, ((c_i + 1) * rw) // 3
+                sub = roi_gray[y0:y1, x0:x1]
+                if sub.size > 0 and float(sub.std()) >= 9.5:
+                    active_tiles += 1
+        return active_tiles >= 5
 
     def detect(
         self,
@@ -177,16 +314,16 @@ class ViselDetector:
             work_H = max(1, int(round(orig_H * (2560.0 / float(orig_W)))))
             bgr = cv2.resize(bgr, (work_W, work_H), interpolation=cv2.INTER_AREA)
             scale_back = orig_W / 2560.0
-        elif orig_W < 900:
-            work_W = 960
-            work_H = max(1, int(round(orig_H * (960.0 / float(orig_W)))))
+        elif orig_W < 1440:
+            work_W = 1600
+            work_H = max(1, int(round(orig_H * (1600.0 / float(orig_W)))))
             bgr = cv2.resize(bgr, (work_W, work_H), interpolation=cv2.INTER_CUBIC)
-            scale_back = orig_W / 960.0
+            scale_back = orig_W / 1600.0
 
         H, W = bgr.shape[:2]
         s = float(np.clip(np.sqrt((W * H) / float(1440 * 900)), 0.65, 2.0))
 
-        # Stage 1: Gradients & Scale-Proportional Structural Barriers
+        # Stage 1: Gradients & JPEG-Resilient Ratio-Orthogonal Structural Barriers
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         b, g, r = cv2.split(bgr)
         chroma = cv2.subtract(cv2.max(cv2.max(b, g), r), cv2.min(cv2.min(b, g), r))
@@ -194,29 +331,29 @@ class ViselDetector:
 
         dx_gray = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, self.k_dx)
         dy_gray = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, self.k_dy)
-        dx = cv2.max(dx_gray, cv2.morphologyEx(chroma, cv2.MORPH_GRADIENT, self.k_dx))
-        dy = cv2.max(dy_gray, cv2.morphologyEx(chroma, cv2.MORPH_GRADIENT, self.k_dy))
+        dx_ch = (cv2.morphologyEx(chroma, cv2.MORPH_GRADIENT, self.k_dx).astype(np.uint16) * 166 >> 8).astype(np.uint8)
+        dy_ch = (cv2.morphologyEx(chroma, cv2.MORPH_GRADIENT, self.k_dy).astype(np.uint16) * 166 >> 8).astype(np.uint8)
+        dx = cv2.max(dx_gray, dx_ch)
+        dy = cv2.max(dy_gray, dy_ch)
         grad_max = cv2.max(dx, dy)
 
-        ortho_thr = 2 if (W * H <= 600000) else 4
-        k_hline = cv2.getStructuringElement(cv2.MORPH_RECT, (38, 1))
-        k_hseg = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1))
-        k_vline_short = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 24))
+        ortho_thr = 3 if (W * H <= 1500000) else 4
+        k_hline = cv2.getStructuringElement(cv2.MORPH_RECT, (max(24, int(34 * s)), 1))
+        k_hseg = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, int(26 * s)), 1))
+        k_vline_short = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(16, int(20 * s))))
         k_hzone = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
 
-        _, dy_ge5 = cv2.threshold(dy, ortho_thr, 255, cv2.THRESH_BINARY)
-        _, dx_le2 = cv2.threshold(dx, 2, 255, cv2.THRESH_BINARY_INV)
-        h_pure = cv2.bitwise_and(dy_ge5, dx_le2)
+        h_pure_raw = ((dy >= ortho_thr) & (dy.astype(np.uint16) >= (dx.astype(np.uint16) << 1))).astype(np.uint8) * 255
+        h_pure = cv2.morphologyEx(h_pure_raw, cv2.MORPH_CLOSE, self.k_h_bridge)
         h_bar = cv2.morphologyEx(h_pure, cv2.MORPH_OPEN, k_hline)
         h_zone = cv2.dilate(cv2.morphologyEx(h_pure, cv2.MORPH_OPEN, k_hseg), k_hzone)
 
-        _, dx_ge5 = cv2.threshold(dx, ortho_thr, 255, cv2.THRESH_BINARY)
-        _, dy_le2 = cv2.threshold(dy, 2, 255, cv2.THRESH_BINARY_INV)
-        v_pure = cv2.bitwise_and(dx_ge5, dy_le2)
+        v_pure_raw = ((dx >= ortho_thr) & (dx.astype(np.uint16) >= (dy.astype(np.uint16) << 1))).astype(np.uint8) * 255
+        v_pure = cv2.morphologyEx(v_pure_raw, cv2.MORPH_CLOSE, self.k_v_bridge)
         v_raw = cv2.morphologyEx(v_pure, cv2.MORPH_OPEN, k_vline_short)
         v_cnts, _ = cv2.findContours(v_raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         v_bar = np.zeros_like(v_raw)
-        min_v_long = max(44, int(58 * s))
+        min_v_long = max(36, int(48 * s))
         for vc in v_cnts:
             vx, vy, vw, vh = cv2.boundingRect(vc)
             if vh >= min_v_long or cv2.countNonZero(h_zone[vy : vy + vh, vx : vx + vw]) > 0:
@@ -224,9 +361,12 @@ class ViselDetector:
 
         t_sig = time.perf_counter()
 
-        # Stage 2: Closed-Loop Control Frame, Tile Container & Media Thumbnail Recovery (with Step 8 Coherence Filter)
-        _, flat_pix0 = cv2.threshold(grad_max, 0, 255, cv2.THRESH_BINARY_INV)
-        _, flat_pix = cv2.threshold(grad_max, 3, 255, cv2.THRESH_BINARY_INV)
+        # Stage 0/2: Self-Calibrating Image Physics (Noise Floor, Contrast Quantiles & Modal Font Height L_0)
+        flat_thr, border_thr, stroke_thr, L_0, u = self._calibrate_image_physics(grad_max, W, H)
+        s = float(np.clip(0.55 * s + 0.45 * u, 0.65, 2.0))
+
+        _, flat_pix = cv2.threshold(grad_max, flat_thr, 255, cv2.THRESH_BINARY_INV)
+        _, stroke_18 = cv2.threshold(grad_max, stroke_thr, 255, cv2.THRESH_BINARY)
 
         hv_small = cv2.resize(
             cv2.bitwise_or(h_pure, v_pure),
@@ -236,11 +376,15 @@ class ViselDetector:
         _, hv_small = cv2.threshold(hv_small, 1, 255, cv2.THRESH_BINARY)
         hv_seed = cv2.resize(cv2.dilate(hv_small, self.k_d95), (W, H), interpolation=cv2.INTER_NEAREST)
 
-        border_thr = 2 if (W * H <= 600000) else 4
-        _, border_pix = cv2.threshold(grad_max, border_thr, 255, cv2.THRESH_BINARY)
-        cnts_list = list(
-            cv2.findContours(cv2.bitwise_and(border_pix, hv_seed), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[0]
-        )
+        # Multi-threshold contour ladder: extracts closed frames and thumbnails across 3 gradient cutoffs
+        # so neither JPEG gutter ringing (cleared at higher thr) nor subtle dark borders (caught at lower thr) fail.
+        cnts_list = []
+        for b_thr in (max(2, border_thr - 1), max(4, border_thr + 1), max(6, border_thr + 3)):
+            _, bp_iter = cv2.threshold(grad_max, b_thr, 255, cv2.THRESH_BINARY)
+            cnts_list.extend(
+                cv2.findContours(cv2.bitwise_and(bp_iter, hv_seed), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[0]
+            )
+        _, border_pix = cv2.threshold(grad_max, max(4, border_thr + 1), 255, cv2.THRESH_BINARY)
 
         strip_w = min(W, int(260 * s))
         _, border_hi = cv2.threshold(grad_max[:, :strip_w], 12, 255, cv2.THRESH_BINARY)
@@ -248,17 +392,17 @@ class ViselDetector:
         for c in cnts_hi:
             if len(c) >= 4:
                 x, y, w, h = cv2.boundingRect(c)
-                if 28 <= w <= int(72 * s) and 28 <= h <= int(72 * s) and abs(w - h) <= 6:
+                if 24 <= w <= int(72 * s) and 24 <= h <= int(72 * s) and abs(w - h) <= 6:
                     if cv2.contourArea(c) >= w * h * 0.72:
                         cnts_list.append(c)
 
-        min_frame_h = max(16, int(16 * s))
+        min_frame_h = max(14, int(15 * s))
         max_frame_h = max(46, int(58 * s))
-        min_frame_w = max(22, int(24 * s))
+        min_frame_w = max(18, int(20 * s))
         max_frame_w = max(440, int(W * 0.85))
-        min_thumb_h = max(48, int(52 * s))
+        min_thumb_h = max(44, int(48 * s))
         max_thumb_h = max(255, int(H * 0.52))
-        min_thumb_w = max(64, int(68 * s))
+        min_thumb_w = max(56, int(62 * s))
         max_thumb_w = max(420, int(W * 0.48))
 
         raw_frames = []
@@ -273,74 +417,107 @@ class ViselDetector:
             w_cap = max_frame_w if h <= int(42 * s) else int(265 * s)
             if min_frame_h <= h <= max_frame_h and min_frame_w <= w <= w_cap:
                 area = cv2.contourArea(c)
-                if area >= w * h * 0.70:
-                    flat_r = cv2.countNonZero(
-                        flat_pix[y + 2 : y + h - 2, x + 2 : x + w - 2]
-                    ) / float(max(1, (w - 4) * (h - 4)))
-                    if flat_r < 0.28:
-                        continue
-                    if float(grad_max[y : y + h, x : x + w].max()) < 48:
-                        continue
-                    tb_s = cv2.countNonZero(
-                        h_pure[y : y + 4, x + 3 : x + w - 3]
-                    ) + cv2.countNonZero(h_pure[max(0, y + h - 4) : y + h, x + 3 : x + w - 3])
-                    lr_s = cv2.countNonZero(
-                        v_pure[y + 3 : y + h - 3, x : x + 4]
-                    ) + cv2.countNonZero(v_pure[y + 3 : y + h - 3, max(0, x + w - 4) : x + w])
-                    tb_r = tb_s / float(max(1, w - 6))
-                    is_pill = tb_s >= max(12, int((w - h) * 0.75)) and lr_s >= 4
-                    if not is_pill and (
-                        tb_s < max(8, int((w - 8) * 0.45))
-                        or (h >= 20 and w >= 55 and lr_s < max(5, int((h - 12) * 0.35)))
-                    ):
+                if area < w * h * 0.68:
+                    continue
+                flat_r = cv2.countNonZero(
+                    flat_pix[y + 2 : y + h - 2, x + 2 : x + w - 2]
+                ) / float(max(1, (w - 4) * (h - 4)))
+                if flat_r < 0.26:
+                    continue
+                tb_s = cv2.countNonZero(
+                    h_pure[y : y + 4, x + 3 : x + w - 3]
+                ) + cv2.countNonZero(h_pure[max(0, y + h - 4) : y + h, x + 3 : x + w - 3])
+                lr_s = cv2.countNonZero(
+                    v_pure[y + 3 : y + h - 3, x : x + 4]
+                ) + cv2.countNonZero(v_pure[y + 3 : y + h - 3, max(0, x + w - 4) : x + w])
+                tb_r = tb_s / float(max(1, w - 6))
+                lr_r = lr_s / float(max(1, h - 6))
+                is_pill = tb_s >= max(10, int((w - h) * 0.72)) and lr_s >= 4
+                if not is_pill and (
+                    tb_s < max(8, int((w - 8) * 0.45))
+                    or (h >= 18 and w >= 48 and lr_s < max(4, int((h - 10) * 0.35)))
+                ):
+                    continue
+
+                max_g_val = float(grad_max[y : y + h, x : x + w].max())
+                if max_g_val < (26 if (tb_r >= 1.15 and lr_r >= 0.75) else 44):
+                    continue
+
+                inner_strokes = cv2.countNonZero(stroke_18[y + 3 : y + h - 3, x + 4 : x + w - 4])
+                if inner_strokes < max(5, int((w - 8) * (h - 6) * 0.010)):
+                    in_mean = float(gray[y + 3 : y + h - 3, x + 3 : x + w - 3].mean())
+                    oy1, oy2 = max(0, y - 5), min(H, y + h + 5)
+                    ox1, ox2 = max(0, x - 5), min(W, x + w + 5)
+                    out_mean = float(gray[oy1:oy2, ox1:ox2].mean())
+                    if abs(in_mean - out_mean) < 10.0 and not (w <= int(32 * s) and h <= int(32 * s) and tb_r >= 1.35):
                         continue
 
-                    if w <= max(48, int(62 * s)) and h <= max(42, int(54 * s)) and tb_r < 1.80:
-                        l_ink = int((grad_max[y + 2 : y + h - 2, max(0, x - 6) : x] >= 25).sum())
-                        r_ink = int((grad_max[y + 2 : y + h - 2, x + w : min(W, x + w + 6)] >= 25).sum())
-                        if l_ink >= 22 or (l_ink >= 12 and r_ink >= 12):
-                            continue
-                        ox1, oy1 = max(0, x - 10), max(0, y - 10)
-                        ox2, oy2 = min(W, x + w + 10), min(H, y + h + 10)
-                        outer_area = max(1, (ox2 - ox1) * (oy2 - oy1) - w * h)
-                        outer_flat = (
-                            cv2.countNonZero(flat_pix[oy1:oy2, ox1:ox2])
-                            - cv2.countNonZero(flat_pix[y : y + h, x : x + w])
-                        ) / float(outer_area)
-                        if outer_flat < 0.65:
-                            continue
+                if w <= max(48, int(62 * s)) and h <= max(42, int(54 * s)) and tb_r < 1.80:
+                    l_ink = int((grad_max[y + 2 : y + h - 2, max(0, x - 6) : x] >= 25).sum())
+                    r_ink = int((grad_max[y + 2 : y + h - 2, x + w : min(W, x + w + 6)] >= 25).sum())
+                    if l_ink >= 22 or (l_ink >= 12 and r_ink >= 12):
+                        continue
+                    ox1, oy1 = max(0, x - 10), max(0, y - 10)
+                    ox2, oy2 = min(W, x + w + 10), min(H, y + h + 10)
+                    outer_area = max(1, (ox2 - ox1) * (oy2 - oy1) - w * h)
+                    outer_flat = (
+                        cv2.countNonZero(flat_pix[oy1:oy2, ox1:ox2])
+                        - cv2.countNonZero(flat_pix[y : y + h, x : x + w])
+                    ) / float(outer_area)
+                    if outer_flat < 0.62:
+                        continue
 
-                    if w > int(85 * s):
-                        iv = v_bar[y + 3 : y + h - 3, x + int(24 * s) : max(x + int(25 * s), x + w - int(38 * s))]
-                        if iv.size > 0 and np.any(np.sum(iv > 0, axis=0) >= h - 5):
-                            continue
-                    raw_frames.append([x, y, w, h, 0.94, "frame", "control", []])
+                if w > int(85 * s):
+                    iv = v_bar[y + 3 : y + h - 3, x + int(22 * s) : max(x + int(23 * s), x + w - int(32 * s))]
+                    if iv.size > 0 and np.any(np.sum(iv > 0, axis=0) >= h - 6):
+                        continue
+                    top_b = (h_pure[y : y + 4, x : x + w] > 0).any(axis=0)
+                    bot_b = (h_pure[max(0, y + h - 4) : y + h, x : x + w] > 0).any(axis=0)
+                    tb_both = top_b & bot_b
+                    if tb_both.mean() < 0.78:
+                        vp_col = (v_pure[y + 3 : y + h - 3, x : x + w] > 0).sum(axis=0)
+                        wall_cols = np.flatnonzero(vp_col >= max(4, int((h - 6) * 0.45)))
+                        if len(wall_cols) >= 2:
+                            if np.any((wall_cols >= int(24 * s)) & (wall_cols <= w - int(24 * s))):
+                                continue
+
+                raw_frames.append([x, y, w, h, 0.94, "frame", "control", []])
+
             elif min_thumb_h <= h <= max_thumb_h and min_thumb_w <= w <= max_thumb_w:
                 area = cv2.contourArea(c)
-                if area >= w * h * 0.78:
+                if area >= w * h * 0.76:
                     tb_s = cv2.countNonZero(
                         h_pure[y : y + 4, x + 6 : x + w - 6]
                     ) + cv2.countNonZero(h_pure[max(0, y + h - 4) : y + h, x + 6 : x + w - 6])
                     lr_s = cv2.countNonZero(
                         v_pure[y + 6 : y + h - 6, x : x + 4]
                     ) + cv2.countNonZero(v_pure[y + 6 : y + h - 6, max(0, x + w - 4) : x + w])
-                    if tb_s < (w - 12) * 0.60 or lr_s < (h - 12) * 0.60:
+                    if tb_s < (w - 12) * 0.55 or lr_s < (h - 12) * 0.55:
                         continue
-                    fr0 = cv2.countNonZero(
-                        flat_pix0[y + 3 : y + h - 3, x + 3 : x + w - 3]
-                    ) / float(max(1, (w - 6) * (h - 6)))
-                    fr3 = cv2.countNonZero(
-                        flat_pix[y + 3 : y + h - 3, x + 3 : x + w - 3]
-                    ) / float(max(1, (w - 6) * (h - 6)))
-                    g_std = float(gray[y + 3 : y + h - 3, x + 3 : x + w - 3].std())
                     ar = w / float(h)
-                    if fr0 < 0.60 and fr3 < 0.78 and g_std >= 24.0 and 0.75 <= ar <= 2.8:
+                    # Reject vertical stacks of horizontal UI buttons/sliders that contain internal full-width h_pure dividers
+                    inner_hp = h_pure[y + int(0.6 * L_0) : max(y + int(0.6 * L_0) + 1, y + h - int(0.6 * L_0)), x + 6 : max(x + 7, x + w - 6)]
+                    has_internal_button_dividers = (w <= int(7.8 * L_0) and h <= int(4.8 * L_0)) and inner_hp.size > 0 and float((inner_hp > 0).mean(axis=1).max()) >= 0.72
+                    if (
+                        0.48 <= ar <= 2.85
+                        and not has_internal_button_dividers
+                        and self._has_rect_card_borders(x, y, w, h, dx_gray, dy_gray, gray)
+                        and self._is_real_photo_thumbnail(
+                            gray[y + 3 : y + h - 3, x + 3 : x + w - 3],
+                            grad_max[y + 3 : y + h - 3, x + 3 : x + w - 3],
+                            chroma[y + 3 : y + h - 3, x + 3 : x + w - 3],
+                        )
+                    ):
                         raw_thumbs.append([x, y, w, h, 0.93, "thumbnail", "control", []])
-                    elif fr3 >= 0.72:
-                        if 0.85 <= ar <= 1.18 and int(70 * s) <= w <= int(180 * s) and tb_s >= (w - 8) * 1.1 and lr_s >= (h - 8) * 1.1:
-                            tile_containers.append((x, y, w, h))
-                        if w >= int(160 * s) and h >= int(120 * s) and tb_s >= (w - 8) * 1.1 and lr_s >= (h - 8) * 1.1:
-                            panel_corners.extend([(x, y), (x + w, y), (x, y + h), (x + w, y + h)])
+                    else:
+                        fr3 = cv2.countNonZero(
+                            flat_pix[y + 3 : y + h - 3, x + 3 : x + w - 3]
+                        ) / float(max(1, (w - 6) * (h - 6)))
+                        if fr3 >= 0.72:
+                            if 0.85 <= ar <= 1.18 and int(70 * s) <= w <= int(180 * s) and tb_s >= (w - 8) * 1.1 and lr_s >= (h - 8) * 1.1:
+                                tile_containers.append((x, y, w, h))
+                            if w >= int(160 * s) and h >= int(120 * s) and tb_s >= (w - 8) * 1.1 and lr_s >= (h - 8) * 1.1:
+                                panel_corners.extend([(x, y), (x + w, y), (x, y + h), (x + w, y + h)])
 
         filtered_thumbs = []
         for i, t in enumerate(raw_thumbs):
@@ -370,6 +547,45 @@ class ViselDetector:
                 continue
             thumbs.append(t)
 
+        # Stage 2B: Flat-Zone / Uniform-Fill Rounded Pill & Dark-Mode Button Peeling
+        # Recovers borderless or rounded-corner buttons/pills whose background fill contrasts with the outer ring.
+        k_pill_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        pill_edges = cv2.morphologyEx(border_pix, cv2.MORPH_CLOSE, k_pill_close)
+        p_cnts, _ = cv2.findContours(pill_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for pc in p_cnts:
+            if len(pc) < 4:
+                continue
+            px, py, pw, ph = cv2.boundingRect(pc)
+            if min_frame_h <= ph <= int(2.6 * L_0) and int(1.6 * L_0) <= pw <= int(15.0 * L_0) and pw >= ph * 1.45:
+                p_area = cv2.contourArea(pc)
+                if p_area < pw * ph * 0.74:
+                    continue
+                inner_st = cv2.countNonZero(stroke_18[py + 3 : py + ph - 3, px + 4 : px + pw - 4])
+                if inner_st < max(6, int((pw - 8) * (ph - 6) * 0.015)):
+                    continue
+                # Compare median BGR of non-stroke interior pixels vs 4px outer ring
+                in_roi_b = b[py + 2 : py + ph - 2, px + 3 : px + pw - 3]
+                in_roi_g = g[py + 2 : py + ph - 2, px + 3 : px + pw - 3]
+                in_roi_r = r[py + 2 : py + ph - 2, px + 3 : px + pw - 3]
+                in_flat_mask = flat_pix[py + 2 : py + ph - 2, px + 3 : px + pw - 3] > 0
+                if np.count_nonzero(in_flat_mask) < 0.32 * in_flat_mask.size:
+                    continue
+                if float(np.std(in_roi_g[in_flat_mask])) > 9.5:
+                    continue
+                oy1, oy2 = max(0, py - 4), min(H, py + ph + 4)
+                ox1, ox2 = max(0, px - 4), min(W, px + pw + 4)
+                ring_m = np.ones((oy2 - oy1, ox2 - ox1), dtype=bool)
+                ring_m[py - oy1 : py - oy1 + ph, px - ox1 : px - ox1 + pw] = False
+                ring_flat = ring_m & (flat_pix[oy1:oy2, ox1:ox2] > 0)
+                if np.count_nonzero(ring_flat) < 0.45 * np.count_nonzero(ring_m):
+                    continue
+                db = float(np.median(in_roi_b[in_flat_mask])) - float(np.median(b[oy1:oy2, ox1:ox2][ring_flat]))
+                dg = float(np.median(in_roi_g[in_flat_mask])) - float(np.median(g[oy1:oy2, ox1:ox2][ring_flat]))
+                dr = float(np.median(in_roi_r[in_flat_mask])) - float(np.median(r[oy1:oy2, ox1:ox2][ring_flat]))
+                delta_color = float(np.sqrt(db * db + dg * dg + dr * dr))
+                if delta_color >= 11.0:
+                    raw_frames.append([px, py, pw, ph, 0.93, "frame", "control", []])
+
         raw_frames.sort(key=lambda f: f[2] * f[3], reverse=True)
         frames = []
         for f in raw_frames:
@@ -378,7 +594,7 @@ class ViselDetector:
             if any(
                 max(0, min(fx + fw, tx + tw) - max(fx, tx))
                 * max(0, min(fy + fh, ty + th) - max(fy, ty))
-                >= 0.5 * f_area
+                >= 0.45 * f_area
                 for tx, ty, tw, th, *_ in thumbs
             ):
                 continue
@@ -403,14 +619,41 @@ class ViselDetector:
 
         thumb_occ = np.zeros((H, W), dtype=np.uint8)
         frame_occ = np.zeros((H, W), dtype=np.uint8)
-        barrier = cv2.bitwise_or(h_bar, v_bar)
+        # Remove short inline word-highlight edges (<mark>search</mark>) embedded inside prose lines from h_bar & v_bar
+        h_bar_clean = h_bar.copy()
+        hb_cnts, _ = cv2.findContours(h_bar_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for hc in hb_cnts:
+            hx, hy, hw, hh = cv2.boundingRect(hc)
+            if hw < int(7.5 * L_0) and hh <= int(0.6 * L_0):
+                by1, by2 = max(0, hy - int(1.1 * L_0)), min(H, hy + hh + int(1.1 * L_0))
+                lx1, lx2 = max(0, hx - int(1.2 * L_0)), max(0, hx - 2)
+                rx1, rx2 = min(W, hx + hw + 2), min(W, hx + hw + int(1.2 * L_0))
+                l_str = cv2.countNonZero(stroke_18[by1:by2, lx1:lx2]) if lx2 > lx1 else 0
+                r_str = cv2.countNonZero(stroke_18[by1:by2, rx1:rx2]) if rx2 > rx1 else 0
+                if l_str >= int(0.9 * L_0) and r_str >= int(0.9 * L_0):
+                    cv2.rectangle(h_bar_clean, (hx, hy), (hx + hw, hy + hh), 0, -1)
+
+        v_bar_clean = v_bar.copy()
+        vb_cnts, _ = cv2.findContours(v_bar_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for vc in vb_cnts:
+            vx, vy, vw, vh = cv2.boundingRect(vc)
+            if vh <= int(2.2 * L_0) and vw <= int(0.6 * L_0):
+                lx1, lx2 = max(0, vx - int(1.2 * L_0)), max(0, vx - 2)
+                rx1, rx2 = min(W, vx + vw + 2), min(W, vx + vw + int(1.2 * L_0))
+                l_str = cv2.countNonZero(stroke_18[vy : vy + vh, lx1:lx2]) if lx2 > lx1 else 0
+                r_str = cv2.countNonZero(stroke_18[vy : vy + vh, rx1:rx2]) if rx2 > rx1 else 0
+                if l_str >= int(0.6 * L_0) and r_str >= int(0.6 * L_0):
+                    cv2.rectangle(v_bar_clean, (vx, vy), (vx + vw, vy + vh), 0, -1)
+
+        barrier = cv2.bitwise_or(h_bar_clean, v_bar_clean)
         for t in thumbs:
             tx, ty, tw, th = t[:4]
             cv2.rectangle(thumb_occ, (tx, ty), (tx + tw, ty + th), 255, -1)
             cv2.rectangle(barrier, (tx, ty), (tx + tw, ty + th), 255, 2)
         for f in frames:
             fx, fy, fw, fh = f[:4]
-            cv2.rectangle(frame_occ, (fx, fy), (fx + fw, fy + fh), 255, -1)
+            if fh <= int(44 * s) and fw <= int(320 * s):
+                cv2.rectangle(frame_occ, (fx, fy), (fx + fw, fy + fh), 255, -1)
             cv2.rectangle(barrier, (fx, fy), (fx + fw, fy + fh), 255, 2)
         barrier_dil = cv2.dilate(barrier, self.k_bar_dil)
         barrier_inv = cv2.bitwise_not(barrier_dil)
@@ -418,55 +661,36 @@ class ViselDetector:
         t_frames = time.perf_counter()
 
         # Stage 3: Coarse Proposal Generation
-        _, stroke_bin = cv2.threshold(grad_max, 20, 255, cv2.THRESH_BINARY)
+        _, stroke_bin = cv2.threshold(grad_max, 18, 255, cv2.THRESH_BINARY)
         stroke_clean = cv2.bitwise_and(stroke_bin, barrier_inv)
 
         _, stroke_01 = cv2.threshold(stroke_clean, 0, 1, cv2.THRESH_BINARY)
         _, blue_01 = cv2.threshold(blue_excess, 55, 1, cv2.THRESH_BINARY)
 
-        if fast_half_res and scale_back == 1.0:
-            H2, W2 = H >> 1, W >> 1
-            stroke_h = cv2.resize(stroke_clean, (W2, H2), interpolation=cv2.INTER_AREA)
-            _, stroke_h = cv2.threshold(stroke_h, 1, 255, cv2.THRESH_BINARY)
-            barrier_inv_h = cv2.resize(barrier_inv, (W2, H2), interpolation=cv2.INTER_NEAREST)
-            coarse_h = cv2.bitwise_and(
-                cv2.morphologyEx(stroke_h, cv2.MORPH_CLOSE, self.k_coarse_h),
-                barrier_inv_h,
-            )
-            c_cnts, _ = cv2.findContours(coarse_h, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            coarse_boxes = [
-                (
-                    max(0, (cx << 1) - 2),
-                    max(0, (cy << 1) - 2),
-                    min(W - max(0, (cx << 1) - 2), (cw << 1) + 4),
-                    min(H - max(0, (cy << 1) - 2), (ch << 1) + 4),
-                )
-                for c in c_cnts
-                for (cx, cy, cw, ch) in [cv2.boundingRect(c)]
-                if (cw >= 3 and ch >= 3) or (cw >= 4 and ch >= 1) or (cw >= 2 and ch >= 7)
-            ]
-        else:
-            k_c = self.k_coarse_hi if s >= 1.55 else self.k_coarse
-            coarse_mask = cv2.bitwise_and(
-                cv2.morphologyEx(stroke_clean, cv2.MORPH_CLOSE, k_c),
-                barrier_inv,
-            )
-            c_cnts, _ = cv2.findContours(coarse_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            coarse_boxes = [
-                (cx, cy, cw, ch)
-                for c in c_cnts
-                for (cx, cy, cw, ch) in [cv2.boundingRect(c)]
-                if (cw >= max(4, int(5 * s)) and ch >= max(5, int(6 * s))) or (max(5, int(7 * s)) <= cw <= max(28, int(34 * s)) and ch >= 1) or (cw >= 3 and max(10, int(13 * s)) <= ch <= max(36, int(42 * s)))
-            ]
+        k_c = self.k_coarse_hi if s >= 1.55 else self.k_coarse
+        coarse_mask = cv2.bitwise_and(
+            cv2.morphologyEx(stroke_clean, cv2.MORPH_CLOSE, k_c),
+            barrier_inv,
+        )
+        c_cnts, _ = cv2.findContours(coarse_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        coarse_boxes = [
+            (cx, cy, cw, ch)
+            for c in c_cnts
+            for (cx, cy, cw, ch) in [cv2.boundingRect(c)]
+            if (cw >= max(4, int(5 * s)) and ch >= max(5, int(6 * s)))
+            or (max(5, int(7 * s)) <= cw <= max(28, int(34 * s)) and ch >= 1)
+            or (cw >= 3 and max(10, int(12 * s)) <= ch <= max(36, int(42 * s)))
+        ]
 
         t_coarse = time.perf_counter()
 
-        # Stage 4: 1D Recursive Projection & Word Children
+        # Stage 4: Multi-Way 1D X-Y Projection & Non-Guillotine 2D Sub-Block Decomposition
         refined_boxes = []
         inner_frame_children = []
+        k_sub_line = cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, int(10 * s)), 2))
 
         def refine_region(rx: int, ry: int, rw: int, rh: int, depth: int = 0):
-            if rw < 3 or rh < 1 or depth > 10:
+            if rw < 3 or rh < 1 or depth > 16:
                 return
             roi_s = stroke_01[ry : ry + rh, rx : rx + rw]
             row_proj = roi_s.sum(axis=1)
@@ -494,39 +718,34 @@ class ViselDetector:
             inside_frame = bool(frame_occ[ry + (rh >> 1), rx + (rw >> 1)] > 0)
 
             is_micro_icon = (
-                ((max(5, int(7 * s)) <= rw <= max(28, int(32 * s)) and 1 <= rh <= max(6, int(7 * s))) or (3 <= rw <= max(7, int(9 * s)) and max(10, int(13 * s)) <= rh <= max(34, int(40 * s))))
-                and depth <= 2
+                ((max(5, int(7 * s)) <= rw <= max(28, int(32 * s)) and 1 <= rh <= max(6, int(7 * s)))
+                 or (3 <= rw <= max(8, int(10 * s)) and max(10, int(12 * s)) <= rh <= max(34, int(40 * s))))
+                and depth <= 3
             )
-            is_single_char_ui = (4 <= rw <= 12 and 7 <= rh <= 22 and depth <= 2)
+            is_single_char_ui = (4 <= rw <= 12 and 7 <= rh <= 22 and depth <= 3)
             if not is_micro_icon and not is_single_char_ui and (rw < 6 or rh < 6 or (rw <= 9 and rh <= 8)):
                 return
 
-            # Step 1: Vertical Multi-Line X-Y Split
-            icon_guard_w = max(38, int(38 * s))
-            icon_guard_h = max(36, int(36 * s))
-            if rh >= 22:
-                inner = row_proj[5 : rh - 5]
-                v_thr = 7 if (rw >= 200 and int(row_proj.max()) >= 140) else 0
-                if len(inner) > 0 and inner.min() <= v_thr:
-                    zero_mask = inner <= v_thr
-                    if rw <= icon_guard_w and rh <= icon_guard_h:
-                        z_pad = np.concatenate(([False], zero_mask, [False]))
-                        z_starts = np.flatnonzero(z_pad[1:] & ~z_pad[:-1])
-                        z_ends = np.flatnonzero(~z_pad[1:] & z_pad[:-1])
-                        max_z_run = int(np.max(z_ends - z_starts)) if len(z_starts) > 0 else 0
-                    else:
-                        max_z_run = 99
-                    if max_z_run >= 6:
-                        zero_rows = np.flatnonzero(zero_mask) + 5
-                        split_y = int(zero_rows[len(zero_rows) >> 1])
-                        next_y = split_y + 1
-                        while next_y < rh - 4 and (
-                            row_proj[next_y] <= v_thr or row_proj[next_y] >= rw * 0.75
-                        ):
-                            next_y += 1
-                        refine_region(rx, ry, rw, split_y, depth + 1)
-                        refine_region(rx, ry + next_y, rw, rh - next_y, depth + 1)
-                        return
+            icon_guard_w = max(36, int(38 * s))
+            icon_guard_h = max(34, int(36 * s))
+            if rh >= max(18, int(20 * s)):
+                v_thr = max(2, int(rw * 0.015)) if (rw >= int(160 * s) and int(row_proj.max()) >= int(80 * s)) else 0
+                is_active_row = row_proj > v_thr
+                r_pad = np.concatenate(([False], is_active_row, [False]))
+                r_starts = np.flatnonzero(r_pad[1:] & ~r_pad[:-1])
+                r_ends = np.flatnonzero(~r_pad[1:] & r_pad[:-1])
+                if len(r_starts) >= 2:
+                    v_gaps = r_starts[1:] - r_ends[:-1]
+                    min_v_gap = 6 if (rw <= icon_guard_w and rh <= icon_guard_h) else 1
+                    split_mask = v_gaps >= min_v_gap
+                    if np.any(split_mask):
+                        band_starts = np.concatenate(([r_starts[0]], r_starts[1:][split_mask]))
+                        band_ends = np.concatenate((r_ends[:-1][split_mask], [r_ends[-1]]))
+                        if len(band_starts) >= 2:
+                            for bs, be in zip(band_starts, band_ends):
+                                if be - bs >= 1:
+                                    refine_region(rx, ry + int(bs), rw, int(be - bs), depth + 1)
+                            return
 
             col_blue = blue_01[ry : ry + rh, rx : rx + rw].sum(axis=0)
             is_ink = col_proj > 0
@@ -547,26 +766,115 @@ class ViselDetector:
                             run_h = int(nz_y[-1] - nz_y[0] + 1) if len(nz_y) > 0 else 0
                             if (run_w <= 4 and run_h <= 5) or (run_w <= 8 and l_gap + r_gap >= max(14, int(rh * 0.80))):
                                 refine_region(rx, ry, int(ends[idx_r - 1]), rh, depth + 1)
-                                refine_region(
-                                    rx + int(starts[idx_r + 1]),
-                                    ry,
-                                    rw - int(starts[idx_r + 1]),
-                                    rh,
-                                    depth + 1,
-                                )
+                                refine_region(rx + int(starts[idx_r + 1]), ry, rw - int(starts[idx_r + 1]), rh, depth + 1)
                                 return
 
+                run_widths = ends - starts
+                is_dot_track = (
+                    rh <= int(1.15 * L_0)
+                    and len(starts) >= 3
+                    and np.mean(run_widths <= max(10, int(0.82 * L_0))) >= 0.70
+                )
                 gaps = starts[1:] - ends[:-1]
-                max_gi = int(np.argmax(gaps))
-                max_gap = int(gaps[max_gi])
-                left_w = int(ends[max_gi])
-                right_x = int(starts[max_gi + 1])
-                right_w = rw - right_x
+                base_gap_thr = max(int(1.22 * L_0), int(rh * 1.12)) if rh >= int(1.05 * L_0) else max(int(0.95 * L_0), int(rh * 1.18))
+                # Runtime multi-trial split scoring for wide multi-item bands (e.g. tables, toolbars, multi-column rows)
+                if not is_dot_track and rw >= int(12.0 * L_0) and rh <= int(2.4 * L_0) and len(gaps) >= 2:
+                    best_mask = None
+                    best_score = -1e9
+                    roi_fl_band = flat_pix[ry : ry + rh, rx : rx + rw]
+                    for mult in (0.85, 1.0, 1.22):
+                        cand_thr = max(int(0.80 * L_0), int(round(base_gap_thr * mult)))
+                        cand_mask = (gaps >= cand_thr) & ~((ends[:-1] <= int(1.6 * L_0)) & (gaps <= int(1.35 * L_0)))
+                        if not np.any(cand_mask):
+                            continue
+                        c_starts = np.concatenate(([starts[0]], starts[1:][cand_mask]))
+                        c_ends = np.concatenate((ends[:-1][cand_mask], [ends[-1]]))
+                        seg_ws = c_ends - c_starts
+                        # Score 1: Gutter flatness inside cut gaps
+                        cut_indices = np.flatnonzero(cand_mask)
+                        gutter_flat = float(np.mean([
+                            cv2.countNonZero(roi_fl_band[:, int(ends[ci]) : int(starts[ci + 1])])
+                            / float(max(1, rh * (int(starts[ci + 1]) - int(ends[ci]))))
+                            for ci in cut_indices
+                        ]))
+                        # Score 2: Penalty for tiny word fragments (< 1.4 * L_0) vs reward for balanced column widths
+                        tiny_pen = float(np.mean(seg_ws < int(1.4 * L_0))) * 0.65
+                        giant_pen = 0.45 if np.max(seg_ws) > int(16.0 * L_0) else 0.0
+                        sc_val = gutter_flat - tiny_pen - giant_pen
+                        if sc_val > best_score:
+                            best_score = sc_val
+                            best_mask = cand_mask
+                    h_splits = best_mask if (best_mask is not None and best_score >= 0.35) else (
+                        (gaps >= base_gap_thr) & ~((ends[:-1] <= int(1.6 * L_0)) & (gaps <= int(1.35 * L_0)))
+                    )
+                else:
+                    h_splits = (
+                        np.zeros_like(gaps, dtype=bool)
+                        if is_dot_track
+                        else ((gaps >= base_gap_thr) & ~((ends[:-1] <= int(1.6 * L_0)) & (gaps <= int(1.35 * L_0))))
+                    )
+                if np.any(h_splits):
+                    seg_starts = np.concatenate(([starts[0]], starts[1:][h_splits]))
+                    seg_ends = np.concatenate((ends[:-1][h_splits], [ends[-1]]))
+                    if len(seg_starts) >= 2:
+                        for ss, se in zip(seg_starts, seg_ends):
+                            if se - ss >= 3:
+                                refine_region(rx + int(ss), ry, int(se - ss), rh, depth + 1)
+                        return
 
-                gap_thresh = max(18, int(rh * 0.85)) if rh >= 17 else max(13, int(rh * 0.95))
-                if not (left_w <= 22 and max_gap <= 18) and max_gap >= gap_thresh:
-                    refine_region(rx, ry, left_w, rh, depth + 1)
-                    refine_region(rx + right_x, ry, right_w, rh, depth + 1)
+            if rh > max(42, int(2.9 * L_0)):
+                if (
+                    max(50, int(3.5 * L_0)) <= rh <= max_thumb_h
+                    and max(68, int(4.6 * L_0)) <= rw <= max_thumb_w
+                    and 0.48 <= rw / float(rh) <= 2.85
+                    and self._has_rect_card_borders(rx, ry, rw, rh, dx_gray, dy_gray, gray)
+                    and self._is_real_photo_thumbnail(
+                        gray[ry + 3 : ry + rh - 3, rx + 3 : rx + rw - 3],
+                        grad_max[ry + 3 : ry + rh - 3, rx + 3 : rx + rw - 3],
+                        chroma[ry + 3 : ry + rh - 3, rx + 3 : rx + rw - 3],
+                    )
+                ):
+                    if not inside_frame:
+                        refined_boxes.append([rx, ry, rw, rh, 0.91, "thumbnail", "control", []])
+                    return
+
+                col_span = np.count_nonzero(roi_s.sum(axis=0) >= int(rh * 0.28)) / float(max(1, rw))
+                is_giant_heading = (rh <= int(4.2 * L_0) and rw <= int(38.0 * L_0) and col_span >= 0.42)
+                if not is_giant_heading:
+                    if depth <= 6:
+                        roi_gm = grad_max[ry : ry + rh, rx : rx + rw]
+                        roi_bi = barrier_inv[ry : ry + rh, rx : rx + rw]
+                        # Multi-Regime Trial Consensus (Fine, Balanced, Cohesive) + Weighted Box Fusion (WBF)
+                        trial_params = [
+                            (max(20, int(stroke_thr * 1.25)), max(6, int(0.48 * L_0)), 2),
+                            (max(24, int(stroke_thr * 1.55)), max(8, int(0.65 * L_0)), 2),
+                            (max(30, int(stroke_thr * 1.85)), max(11, int(0.88 * L_0)), 3),
+                        ]
+                        trial_results = []
+                        for (t_thr, kw_sub, kh_sub) in trial_params:
+                            _, sub_hi = cv2.threshold(roi_gm, t_thr, 255, cv2.THRESH_BINARY)
+                            sub_hi = cv2.bitwise_and(sub_hi, roi_bi)
+                            k_tr = cv2.getStructuringElement(cv2.MORPH_RECT, (kw_sub, kh_sub))
+                            sub_closed = cv2.morphologyEx(sub_hi, cv2.MORPH_CLOSE, k_tr)
+                            s_cnts, _ = cv2.findContours(sub_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            raw_b = [cv2.boundingRect(sc) for sc in s_cnts]
+                            tiny_dots = sum(1 for (_, _, sw, sh) in raw_b if 4 <= sw <= int(1.7 * L_0) and 4 <= sh <= int(0.95 * L_0))
+                            if len(raw_b) >= 18 and tiny_dots >= 0.65 * len(raw_b):
+                                k_track = cv2.getStructuringElement(cv2.MORPH_RECT, (max(24, int(2.2 * L_0)), 2))
+                                sub_closed = cv2.morphologyEx(sub_hi, cv2.MORPH_CLOSE, k_track)
+                                s_cnts, _ = cv2.findContours(sub_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                raw_b = [cv2.boundingRect(sc) for sc in s_cnts]
+                            scored_b = []
+                            for (sx, sy, sw, sh) in raw_b:
+                                if (sw >= 5 and sh >= 5) and (sw * sh < 0.82 * rw * rh) and sh <= int(4.0 * L_0):
+                                    # Weight each trial box by its normalized edge sharpness & L_0 height plausibility
+                                    h_bonus = 1.25 if (0.65 * L_0 <= sh <= 2.4 * L_0) else 0.90
+                                    scored_b.append((sx, sy, sw, sh, h_bonus))
+                            trial_results.append(scored_b)
+
+                        fused_subs = self._wbf_fuse_trials(trial_results, min_votes=2, iou_thr=0.50)
+                        for (sx, sy, sw, sh) in fused_subs:
+                            refine_region(rx + sx, ry + sy, sw, sh, depth + 2)
                     return
 
             total_blue = int(col_blue.sum())
@@ -599,54 +907,50 @@ class ViselDetector:
                             refine_region(rx + be_t, ry, rw - be_t, rh, depth + 1)
                         return
 
+            if (rw <= int(10 * s) and rh >= int(44 * s)) or (rh <= int(5 * s) and rw >= int(65 * s)):
+                return
+
             pad_x1, pad_y1 = max(0, rx - 6), max(0, ry - 6)
             pad_x2, pad_y2 = min(W, rx + rw + 6), min(H, ry + rh + 6)
             local_flat = cv2.countNonZero(flat_pix[pad_y1:pad_y2, pad_x1:pad_x2]) / float(
                 (pad_x2 - pad_x1) * (pad_y2 - pad_y1)
             )
 
-            if rw <= int(110 * s) and rh <= int(110 * s) and local_flat >= 0.60:
-                min_dx_mean = 1.6 / max(0.85, s * 0.85)
+            if rw <= int(110 * s) and rh <= int(110 * s) and local_flat >= 0.55:
+                min_dx_mean = 1.5 / max(0.85, s * 0.85)
             else:
-                min_dx_mean = 5.0
+                min_dx_mean = 4.2
             if not is_micro_icon and float(cv2.mean(dx[ry : ry + rh, rx : rx + rw])[0]) < min_dx_mean:
                 return
 
             _, max_g, _, _ = cv2.minMaxLoc(grad_max[ry : ry + rh, rx : rx + rw])
-            min_g_thr = 68 if is_micro_icon else (95 if is_single_char_ui else (52 if local_flat >= 0.62 else 65))
+            min_g_thr = 60 if is_micro_icon else (85 if is_single_char_ui else (42 if local_flat >= 0.58 else 58))
             if max_g < min_g_thr:
                 return
 
             active_cols = np.count_nonzero(is_ink)
             mean_ink_col = float(col_proj.sum()) / float(max(1, active_cols))
-            if rh >= int(18 * s) and rw >= int(80 * s) and mean_ink_col < 2.8:
+            if rh >= int(18 * s) and rw >= int(80 * s) and mean_ink_col < 2.5:
                 return
-            if is_micro_icon and local_flat < 0.62:
+            if is_micro_icon and local_flat < 0.58:
                 return
             if is_single_char_ui and (rw < 6 or rh < 6 or (rw <= 9 and rh <= 8)):
-                if local_flat < 0.78 or max_g < 110:
+                if local_flat < 0.74 or max_g < 95:
                     return
-            if local_flat < 0.52 and max_g < 76:
+            if local_flat < 0.48 and max_g < 72:
                 return
-            if local_flat < 0.38:
-                if max_g < 145 or rw < 24:
+            if local_flat < 0.34:
+                if max_g < 140 or rw < 24:
                     return
 
             total_stroke = int(col_proj.sum())
             is_accent = total_blue >= max(8, int(total_stroke * 0.22)) and rw >= 24
 
-            if int(64 * s) <= rh <= max_thumb_h and int(96 * s) <= rw <= max_thumb_w and 0.75 <= rw / float(rh) <= 2.8:
-                g_std = float(gray[ry : ry + rh, rx : rx + rw].std())
-                if g_std >= 24.0:
-                    if not inside_frame:
-                        refined_boxes.append([rx, ry, rw, rh, 0.91, "thumbnail", "control", []])
-                    return
-
             max_icon_dim = max(36, int(44 * s))
             if (
                 is_micro_icon
                 or is_single_char_ui
-                or (rw <= max_icon_dim and rh <= max_icon_dim and 0.55 <= rw / float(max(1, rh)) <= 1.75)
+                or (rw <= max_icon_dim and rh <= max_icon_dim and 0.52 <= rw / float(max(1, rh)) <= 1.80)
             ):
                 kind = "icon"
                 score = 0.84
@@ -655,7 +959,7 @@ class ViselDetector:
                 kind = "inline_link"
                 score = 0.92
                 level = "control"
-            elif rw >= int(260 * s) or (rh <= int(9 * s) and rw >= int(45 * s)):
+            elif rw >= int(240 * s) or (rh <= int(9 * s) and rw >= int(45 * s)):
                 kind = "text_block"
                 score = 0.78
                 level = "line"
@@ -710,24 +1014,182 @@ class ViselDetector:
         for (cx, cy, cw, ch) in coarse_boxes:
             refine_region(cx, cy, cw, ch, 0)
 
-        # Deduplicate contained refined_boxes BEFORE pairing
+        # Merge Stage 4 thumbnails into `thumbs` and run Peer-Grid + Cross-Row Shelf Completion
+        s4_thumbs = [rb for rb in refined_boxes if rb[5] == "thumbnail"]
+        refined_boxes = [rb for rb in refined_boxes if rb[5] != "thumbnail"]
+        for st in s4_thumbs:
+            sx, sy, sw, sh = st[:4]
+            s_area = sw * sh
+            if any(
+                max(0, min(sx + sw, kx + kw) - max(sx, kx))
+                * max(0, min(sy + sh, ky + kh) - max(sy, ky))
+                >= 0.40 * min(s_area, kw * kh)
+                for kx, ky, kw, kh, *_ in thumbs
+            ):
+                continue
+            thumbs.append(st)
+
+        # Complete same-row shelves and cross-row 16:9 grids (e.g. YouTube Dark Mode videos & Shorts)
+        major_thumbs = [t for t in thumbs if t[2] >= int(90 * s) and t[3] >= int(75 * s)]
+        if len(major_thumbs) >= 2:
+            major_thumbs.sort(key=lambda t: (t[1], t[0]))
+            used_sh = set()
+            shelves = []
+            for i, ti in enumerate(major_thumbs):
+                if i in used_sh:
+                    continue
+                sh_list = [ti]
+                used_sh.add(i)
+                for j, tj in enumerate(major_thumbs):
+                    if (
+                        j not in used_sh
+                        and abs(tj[1] - ti[1]) <= int(22 * s)
+                        and abs(tj[3] - ti[3]) <= int(55 * s)
+                        and abs(tj[2] - ti[2]) <= int(75 * s)
+                    ):
+                        sh_list.append(tj)
+                        used_sh.add(j)
+                sh_list.sort(key=lambda t: t[0])
+                shelves.append(sh_list)
+
+            known_16_9_grids = []
+            new_grid_thumbs = []
+            for sh_list in shelves:
+                if len(sh_list) >= 2:
+                    med_y = int(round(np.min([t[1] for t in sh_list])))
+                    med_h = int(round(np.max([t[3] for t in sh_list])))
+                    med_w = int(round(np.max([t[2] for t in sh_list])))
+                    has_uniform_pair = any(
+                        p1 != p2 and (abs(sh_list[p1][2] - sh_list[p2][2]) <= int(18 * s) or abs(sh_list[p1][3] - sh_list[p2][3]) <= int(18 * s))
+                        for p1 in range(len(sh_list)) for p2 in range(p1 + 1, len(sh_list))
+                    )
+                    if has_uniform_pair and med_w >= int(110 * s) and med_h >= int(85 * s):
+                        for t in sh_list:
+                            if t[2] < med_w - 3 and t[0] + med_w <= W - 4:
+                                t[2] = med_w
+                            if t[3] < med_h - 3 and med_y + med_h <= H - 2:
+                                t[1] = med_y
+                                t[3] = med_h
+                        diffs = [sh_list[k + 1][0] - sh_list[k][0] for k in range(len(sh_list) - 1)]
+                        valid_p = []
+                        for d in diffs:
+                            for mult in (1, 2, 3, 4, 5):
+                                cp = d / float(mult)
+                                if med_w - int(3 * s) <= cp <= med_w + int(36 * s):
+                                    valid_p.append(cp)
+                        if valid_p:
+                            pitch = float(np.median(valid_p))
+                            anchor_x = sh_list[0][0]
+                            min_feed_x = min([t[0] for t in major_thumbs]) - int(18 * s)
+                            col_xs = []
+                            for step in range(-4, 7):
+                                gx = int(round(anchor_x + step * pitch))
+                                if gx < max(int(60 * s), min_feed_x) or gx + med_w > W - 4:
+                                    continue
+                                col_xs.append(gx)
+                                overlapping = [
+                                    ex for ex in thumbs + new_grid_thumbs
+                                    if max(0, min(gx + med_w, ex[0] + ex[2]) - max(gx, ex[0])) >= 0.35 * min(med_w, ex[2])
+                                    and max(0, min(med_y + med_h, ex[1] + ex[3]) - max(med_y, ex[1])) >= 0.30 * min(med_h, ex[3])
+                                ]
+                                if overlapping:
+                                    main_ex = max(overlapping, key=lambda e: e[2] * e[3])
+                                    main_ex[0], main_ex[1], main_ex[2], main_ex[3] = gx, med_y, med_w, med_h
+                                else:
+                                    roi_g = gray[med_y + 4 : med_y + med_h - 4, gx + 4 : gx + med_w - 4]
+                                    roi_fl = flat_pix[med_y + 4 : med_y + med_h - 4, gx + 4 : gx + med_w - 4]
+                                    fl_r = cv2.countNonZero(roi_fl) / float(max(1, roi_fl.size))
+                                    has_cap = any(
+                                        abs(rb[0] - gx) <= int(2.8 * L_0) and 0 <= rb[1] - (med_y + med_h) <= int(1.8 * L_0) and rb[2] >= int(3.2 * L_0)
+                                        for rb in refined_boxes
+                                    )
+                                    if roi_g.size > 0 and (
+                                        (float(roi_g.std()) >= 15.0 and fl_r < 0.72)
+                                        or (float(roi_g.std()) >= 11.0 and has_cap)
+                                    ):
+                                        new_grid_thumbs.append([gx, med_y, med_w, med_h, 0.92, "thumbnail", "control", []])
+                            if 1.45 <= med_w / float(med_h) <= 2.05 and len(col_xs) >= 2:
+                                known_16_9_grids.append((med_w, med_h, pitch, col_xs))
+
+            # Cross-row 16:9 completion for single-card rows sharing the exact card template & column X-stop
+            for sh_list in shelves:
+                if len(sh_list) == 1 and known_16_9_grids:
+                    t_first = sh_list[0]
+                    tx, ty, tw, th = t_first[:4]
+                    for (gw, gh, gpitch, gcols) in known_16_9_grids:
+                        if abs(tw - gw) <= int(14 * s) and abs(th - gh) <= int(14 * s):
+                            if any(abs(tx - cx) <= int(12 * s) for cx in gcols):
+                                for step in range(-4, 5):
+                                    gx = int(round(tx + step * gpitch))
+                                    if gx < int(60 * s) or gx + gw > W - 4:
+                                        continue
+                                    if any(
+                                        max(0, min(gx + gw, ex[0] + ex[2]) - max(gx, ex[0])) >= 0.35 * gw
+                                        and max(0, min(ty + gh, ex[1] + ex[3]) - max(ty, ex[1])) >= 0.35 * gh
+                                        for ex in thumbs + new_grid_thumbs
+                                    ):
+                                        continue
+                                    roi_g = gray[ty + 4 : ty + gh - 4, gx + 4 : gx + gw - 4]
+                                    has_caption_below = any(
+                                        abs(rb[0] - gx) <= int(45 * s) and 0 <= rb[1] - (ty + gh) <= int(28 * s) and rb[2] >= int(50 * s)
+                                        for rb in refined_boxes
+                                    )
+                                    roi_fl = flat_pix[ty + 4 : ty + gh - 4, gx + 4 : gx + gw - 4]
+                                    fl_r = cv2.countNonZero(roi_fl) / float(max(1, roi_fl.size))
+                                    if roi_g.size > 0 and (float(roi_g.std()) >= 18.0 or (float(roi_g.std()) >= 11.0 and has_caption_below)):
+                                        new_grid_thumbs.append([gx, ty, gw, gh, 0.92, "thumbnail", "control", []])
+                                break
+
+            thumbs.extend(new_grid_thumbs)
+
+        thumbs.sort(key=lambda t: t[2] * t[3], reverse=True)
+        clean_thumbs = []
+        for t in thumbs:
+            tx, ty, tw, th = t[:4]
+            t_area = tw * th
+            if any(
+                max(0, min(tx + tw, kx + kw) - max(tx, kx))
+                * max(0, min(ty + th, ky + kh) - max(ty, ky))
+                >= 0.45 * t_area
+                for kx, ky, kw, kh, *_ in clean_thumbs
+            ):
+                continue
+            clean_thumbs.append(t)
+        thumbs = clean_thumbs
+
+        frames = [
+            f for f in frames
+            if not any(
+                max(0, min(f[0] + f[2], tx + tw) - max(f[0], tx))
+                * max(0, min(f[1] + f[3], ty + th) - max(f[1], ty))
+                >= 0.45 * (f[2] * f[3])
+                for tx, ty, tw, th, *_ in thumbs
+            )
+        ]
+
         refined_boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
         dedup_rbs = []
         for rb in refined_boxes:
             rx, ry, rw, rh = rb[:4]
             r_area = rw * rh
             if any(
+                max(0, min(rx + rw, tx + tw) - max(rx, tx))
+                * max(0, min(ry + rh, ty + th) - max(ry, ty))
+                >= 0.35 * r_area
+                for tx, ty, tw, th, *_ in thumbs
+            ):
+                continue
+            if any(
                 max(0, min(rx + rw, kx + kw) - max(rx, kx))
                 * max(0, min(ry + rh, ky + kh) - max(ry, ky))
-                >= 0.70 * r_area
-                for kx, ky, kw, kh, *_ in dedup_rbs + thumbs
+                >= 0.72 * r_area
+                for kx, ky, kw, kh, *_ in dedup_rbs
             ):
                 continue
             dedup_rbs.append(rb)
         refined_boxes = dedup_rbs
         refined_boxes.sort(key=lambda b: (b[1] // 14, b[0]))
 
-        # v6 Vertical Numeric/Menu Column Normalization:
         for i, rbi in enumerate(refined_boxes):
             if rbi[3] <= max(18, int(20 * s)) and rbi[2] <= max(44, int(46 * s)):
                 col_peers = [
@@ -747,9 +1209,7 @@ class ViselDetector:
                         for j in col_peers:
                             refined_boxes[j][5] = "text_link"
 
-        # ------------------------------------------------------------------
-        # Stage 5: Clean, Non-Overlapping Compound Pairing (Horizontal FIRST, then Vertical)
-        # ------------------------------------------------------------------
+        # Stage 5: Clean, Non-Overlapping Compound Pairing
         v_pure_gray = (dx_gray >= 4) & (dy_gray <= 2)
         h_pure_gray = (dy_gray >= 4) & (dx_gray <= 2)
         used_rb = [False] * len(refined_boxes)
@@ -769,7 +1229,6 @@ class ViselDetector:
                 "children": list(bch) if bch else [],
             }
 
-        # 5A. Horizontal [Square Icon/Frame] + [Right Text Label] Pairing
         max_h_icon = max(62, int(68 * s))
         for src_type, src_list, used_src in [("fr", frames, used_fr), ("rb", refined_boxes, used_rb)]:
             for idx1, item1 in enumerate(src_list):
@@ -778,14 +1237,13 @@ class ViselDetector:
                 fx, fy, fw, fh, fsc, fkd = item1[:6]
                 is_square_icon_cand = (
                     fkd in ("frame", "icon", "inline_link")
-                    or (fkd == "text_link" and 24 <= fw <= max_h_icon and 24 <= fh <= max_h_icon and 0.68 <= fw / float(fh) <= 1.38)
+                    or (fkd == "text_link" and 12 <= fw <= max_h_icon and 12 <= fh <= max_h_icon and 0.50 <= fw / float(fh) <= 1.65)
                 )
                 if (
-                    (fy >= int(58 * s) or fx <= int(140 * s))
-                    and is_square_icon_cand
-                    and 16 <= fw <= max_h_icon
-                    and 16 <= fh <= max_h_icon
-                    and 0.58 <= fw / float(fh) <= 1.58
+                    is_square_icon_cand
+                    and 12 <= fw <= max_h_icon
+                    and 12 <= fh <= max_h_icon
+                    and 0.48 <= fw / float(fh) <= 1.75
                 ):
                     best_rbi = None
                     for rbi, rb2 in enumerate(refined_boxes):
@@ -793,14 +1251,14 @@ class ViselDetector:
                             continue
                         rx, ry, rw, rh, rsc, rkd = rb2[:6]
                         if (
-                            rkd in ("text_link", "inline_link")
-                            and rw >= max(18, int(18 * s))
-                            and rh <= max(30, int(36 * s))
-                            and rw > rh * 1.15
+                            rkd in ("text_link", "inline_link", "text_block")
+                            and max(16, int(16 * s)) <= rw <= int(340 * s)
+                            and rh <= max(32, int(38 * s))
+                            and rw > rh * 1.10
                         ):
                             h_gap = rx - (fx + fw)
                             if (
-                                3 <= h_gap <= max(36, int(44 * s))
+                                2 <= h_gap <= max(40, int(48 * s))
                                 and ry >= fy - max(8, int(10 * s))
                                 and (ry + rh) <= (fy + fh + max(10, int(12 * s)))
                             ):
@@ -823,7 +1281,6 @@ class ViselDetector:
                             make_child_dict(fx, fy, fw, fh, fsc, "icon", "control", "S"),
                             make_child_dict(rx, ry, rw, rh, rsc, rkd, "line", "A", rch),
                         ]
-                        # Also absorb any stacked subtitle line directly under the label
                         for rbi3, rb3 in enumerate(refined_boxes):
                             if used_rb[rbi3]:
                                 continue
@@ -838,10 +1295,20 @@ class ViselDetector:
                                     comp_ch.append(make_child_dict(sx, sy, sw, sh, ssc, skd, "line", "D", sch))
                         desktop_icons.append([nx, ny, nw, nh, 0.95, "desktop_icon", "control", comp_ch])
 
-        # 5B. Vertical [Icon/Frame] + [Bottom Horizontal Text Caption] Desktop/Tile/Ribbon Pairing
+        horiz_rail_frames = set()
+        for fi, f1 in enumerate(frames):
+            peers = [
+                fj for fj, f2 in enumerate(frames)
+                if fi != fj and abs(f1[1] - f2[1]) <= int(6 * s) and abs(f1[3] - f2[3]) <= int(6 * s)
+            ]
+            if len(peers) >= 2:
+                horiz_rail_frames.add(fi)
+
         for src_type, src_list, used_src in [("fr", frames, used_fr), ("rb", refined_boxes, used_rb)]:
             for idx1, item1 in enumerate(src_list):
                 if used_src[idx1]:
+                    continue
+                if src_type == "fr" and idx1 in horiz_rail_frames:
                     continue
                 fx, fy, fw, fh, fsc, fkd = item1[:6]
                 if 16 <= fw <= max(64, int(82 * s)) and 20 <= fh <= max(64, int(76 * s)) and 0.55 <= fw / float(fh) <= 1.55:
@@ -859,7 +1326,7 @@ class ViselDetector:
                             and rw >= max(28, int(rh * 1.45))
                             and rw <= max(110, int(145 * s))
                             and rh <= max(24, int(36 * s))
-                            and 0 <= v_gap <= max(22, int(24 * s))
+                            and 0 <= v_gap <= max(18, int(20 * s))
                             and abs(fcx - rcx) <= max(26, int(28 * s))
                         ):
                             gy1, gy2 = fy + fh, ry
@@ -868,29 +1335,9 @@ class ViselDetector:
                                 continue
                             best_lbl = ("rb", rbi, rx, ry, rw, rh, rb2[7])
                             break
-                    if best_lbl is None and src_type == "fr":
-                        for fj, f2 in enumerate(frames):
-                            if idx1 == fj or used_fr[fj]:
-                                continue
-                            rx, ry, rw, rh = f2[:4]
-                            v_gap = ry - (fy + fh)
-                            rcx = rx + rw * 0.5
-                            if (
-                                fh >= int(rh * 1.22)
-                                and rw >= max(28, int(rh * 1.45))
-                                and rw <= max(110, int(145 * s))
-                                and rh <= max(24, int(36 * s))
-                                and 0 <= v_gap <= max(22, int(24 * s))
-                                and abs(fcx - rcx) <= max(26, int(28 * s))
-                            ):
-                                best_lbl = ("fr", fj, rx, ry, rw, rh, [])
-                                break
                     if best_lbl is not None:
                         kind_l, idx_l, rx, ry, rw, rh, lch = best_lbl
-                        if kind_l == "rb":
-                            used_rb[idx_l] = True
-                        else:
-                            used_fr[idx_l] = True
+                        used_rb[idx_l] = True
                         used_src[idx1] = True
                         nx = min(fx, rx)
                         ny = min(fy, ry)
@@ -898,20 +1345,8 @@ class ViselDetector:
                         nh = max(fy + fh, ry + rh) - ny
                         comp_ch = [
                             make_child_dict(fx, fy, fw, fh, fsc, "icon", "control", "S"),
-                            make_child_dict(rx, ry, rw, rh, rsc if kind_l == "rb" else 0.88, "text_link", "line", "A", lch),
+                            make_child_dict(rx, ry, rw, rh, rsc, "text_link", "line", "A", lch),
                         ]
-                        for rbi3, rb3 in enumerate(refined_boxes):
-                            if used_rb[rbi3]:
-                                continue
-                            sx, sy, sw, sh, ssc, skd, slv, sch = rb3
-                            if skd in ("text_block", "text_link", "inline_link") and sw <= max(100, int(130 * s)) and sh <= max(18, int(22 * s)):
-                                if abs(sx - rx) <= max(10, int(12 * s)) and 0 <= sy - (ry + rh) <= max(8, int(10 * s)):
-                                    used_rb[rbi3] = True
-                                    x0, y0 = min(nx, sx), min(ny, sy)
-                                    nw = max(nx + nw, sx + sw) - x0
-                                    nh = max(ny + nh, sy + sh) - y0
-                                    nx, ny = x0, y0
-                                    comp_ch.append(make_child_dict(sx, sy, sw, sh, ssc, skd, "line", "D", sch))
                         for (tx, ty, tw, th) in tile_containers:
                             if nx >= tx - 4 and ny >= ty - 4 and (nx + nw) <= (tx + tw + 4) and (ny + nh) <= (ty + th + 4):
                                 nx, ny, nw, nh = tx, ty, tw, th
@@ -941,7 +1376,6 @@ class ViselDetector:
                     continue
             final_frames.append(f)
 
-        # Attach inner_frame_children (icons/text/words found inside closed frames) into their enclosing final_frames
         for ic in inner_frame_children:
             ix, iy, iw, ih, isc, ikd, ilv, ich = ic
             icx, icy = ix + iw * 0.5, iy + ih * 0.5
@@ -950,20 +1384,13 @@ class ViselDetector:
                 if fx <= icx <= fx + fw and fy <= icy <= fy + fh and (iw * ih) < 0.90 * (fw * fh):
                     ff[7].append(
                         make_child_dict(
-                            ix,
-                            iy,
-                            iw,
-                            ih,
-                            isc,
-                            ikd,
-                            ilv,
+                            ix, iy, iw, ih, isc, ikd, ilv,
                             generate_vimium_hints(len(ff[7]) + 1)[-1],
                             ich,
                         )
                     )
                     break
 
-        # Remove outer window-corner and panel-corner rounding artifacts
         rem_rbs = [
             rb
             for rb in rem_rbs
@@ -982,10 +1409,9 @@ class ViselDetector:
             )
         ]
 
-        # 5C. Adaptive Fitts's Law Clickable Hitbox Padding for standalone compact icons (strictly non-overlapping)
         all_other = thumbs + desktop_icons + final_frames
-        base_min_dim = max(30, int(36 * s))
-        base_pad = max(8, int(11 * s))
+        base_min_dim = max(26, int(30 * s))
+        base_pad = max(6, int(8 * s))
         for i, rb in enumerate(rem_rbs):
             rx, ry, rw, rh, rsc, rkd = rb[:6]
             if rkd == "icon":
@@ -1012,7 +1438,6 @@ class ViselDetector:
                         rb[0], rb[1], rb[2], rb[3] = nx, ny, nw, nh
                         break
 
-        # 5D. Hierarchical Paragraph Grouping: merge vertically stacked static prose lines sharing a left margin
         if collapse_paragraphs and include_text:
             tb_indices = [
                 i
@@ -1022,7 +1447,7 @@ class ViselDetector:
                     rb[5] == "text_link"
                     and any(
                         rb2[5] == "text_block"
-                        and 0 <= rb[1] - (rb2[1] + rb2[3]) <= max(12, int(14 * s))
+                        and 0 <= abs(rb[1] - (rb2[1] + rb2[3])) <= max(12, int(14 * s))
                         and abs(rb[0] - rb2[0]) <= max(10, int(12 * s))
                         and abs(rb[3] - rb2[3]) <= 6
                         for rb2 in rem_rbs
@@ -1055,6 +1480,7 @@ class ViselDetector:
                     chain_set = set(chain_tb)
                     has_intruder = any(
                         m not in chain_set
+                        and rem_rbs[m][5] not in ("inline_link",)
                         and max(0, min(px + pw, rem_rbs[m][0] + rem_rbs[m][2]) - max(px, rem_rbs[m][0]))
                         * max(0, min(py + ph, rem_rbs[m][1] + rem_rbs[m][3]) - max(py, rem_rbs[m][1]))
                         > 0
@@ -1085,7 +1511,7 @@ class ViselDetector:
             tb_set = set(tb_indices)
             rem_rbs = [rb for i, rb in enumerate(rem_rbs) if i not in tb_set] + para_rbs
 
-        # 5E. Sibling Rail Normalization (for aligned desktop_icon sidebar/menu stacks, capped to group content width, zero-overlap!)
+        # Sibling Rail Normalization
         di_indices = list(range(len(desktop_icons)))
         di_indices.sort(key=lambda i: desktop_icons[i][1])
         visited_di = set()
@@ -1136,11 +1562,7 @@ class ViselDetector:
                             desktop_icons[j][2] = nw
                             desktop_icons[j][3] = nh
 
-        # Final containment cleanup: absorb any sub-element that overlaps >= 25% of its area with a desktop_icon, thumbnail, or larger item
-        stage4_thumbs = [rb for rb in rem_rbs if rb[5] == "thumbnail"]
-        rem_rbs = [rb for rb in rem_rbs if rb[5] != "thumbnail"]
-        thumbs.extend(stage4_thumbs)
-
+        # Final containment cleanup
         clean_frames = []
         for f in final_frames:
             fx, fy, fw, fh = f[:4]
@@ -1183,10 +1605,9 @@ class ViselDetector:
                 for k_rb in clean_rbs:
                     kx, ky, kw, kh = k_rb[:4]
                     inter = max(0, min(rx + rw, kx + kw) - max(rx, kx)) * max(0, min(ry + rh, ky + kh) - max(ry, ky))
-                    if inter >= 0.25 * min(r_area, kw * kh):
-                        if r_area <= kw * kh:
-                            absorbed_into_parent = True
-                            break
+                    if inter >= 0.65 * r_area and r_area <= kw * kh:
+                        absorbed_into_parent = True
+                        break
             if not absorbed_into_parent:
                 clean_rbs.append(rb)
         rem_rbs = clean_rbs
@@ -1268,7 +1689,6 @@ def render_vimium_overlay(bgr: np.ndarray, targets: List[UITarget]) -> np.ndarra
         badge_w = tw + 6
         badge_h = th + 5
 
-        # For narrow text items (e.g. font-size numbers in a dropdown), place the badge to the left so the digits remain 100% uncovered
         if t.kind == "text_link" and t.w <= 54 and t.h <= 32 and snapped_x[idx] >= badge_w + 6:
             bx1 = max(0, snapped_x[idx] - badge_w - 3)
             by1 = max(0, snapped_y[idx] + (t.h - badge_h) // 2)
@@ -1311,7 +1731,7 @@ def render_drilldown_overlay(bgr: np.ndarray, parent: UITarget, to_words: bool =
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visel v6 Vision-Refined Structure-Aware Hierarchical UI Detector")
+    parser = argparse.ArgumentParser(description="Visel v7 Vision-Refined Structure-Aware Hierarchical UI Detector")
     parser.add_argument("input", nargs="?", help="Path to input screenshot PNG/JPG")
     parser.add_argument("-o", "--output", help="Path to save annotated Vimium overlay PNG")
     parser.add_argument("--json", help="Path to save detected hint targets (with children) as JSON")

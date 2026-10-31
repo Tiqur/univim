@@ -97,14 +97,13 @@ pub fn compose(
             let aspect = icon.w as f64 / icon.h as f64;
             let square = matches!(icon.kind.as_str(), "frame" | "icon" | "inline_link")
                 || (icon.kind == "text_link"
-                    && (24..=max_h_icon).contains(&icon.w)
-                    && (24..=max_h_icon).contains(&icon.h)
-                    && (0.68..=1.38).contains(&aspect));
-            if !(icon.y >= scaled(58.) || icon.x <= scaled(140.))
-                || !square
-                || !(16..=max_h_icon).contains(&icon.w)
-                || !(16..=max_h_icon).contains(&icon.h)
-                || !(0.58..=1.58).contains(&aspect)
+                    && (12..=max_h_icon).contains(&icon.w)
+                    && (12..=max_h_icon).contains(&icon.h)
+                    && (0.50..=1.65).contains(&aspect));
+            if !square
+                || !(12..=max_h_icon).contains(&icon.w)
+                || !(12..=max_h_icon).contains(&icon.h)
+                || !(0.48..=1.75).contains(&aspect)
             {
                 continue;
             }
@@ -113,11 +112,12 @@ pub fn compose(
                 if used_rb[rbi] || (!from_frame && idx == rbi) {
                     continue;
                 }
-                if matches!(rb.kind.as_str(), "text_link" | "inline_link")
-                    && rb.w >= 18.max(scaled(18.))
-                    && rb.h <= 30.max(scaled(36.))
-                    && rb.w as f64 > rb.h as f64 * 1.15
-                    && (3..=36.max(scaled(44.))).contains(&(rb.x - icon.right()))
+                if matches!(rb.kind.as_str(), "text_link" | "inline_link" | "text_block")
+                    && rb.w >= 16.max(scaled(16.))
+                    && rb.w <= scaled(340.)
+                    && rb.h <= 32.max(scaled(38.))
+                    && rb.w as f64 > rb.h as f64 * 1.10
+                    && (2..=40.max(scaled(48.))).contains(&(rb.x - icon.right()))
                     && rb.y >= icon.y - 8.max(scaled(10.))
                     && rb.bottom() <= icon.bottom() + 10.max(scaled(12.))
                 {
@@ -186,7 +186,23 @@ pub fn compose(
         }
     }
 
-    // 5B: vertical captions, followed by optional subtitles and enclosing tile expansion.
+    // Frames that already form a horizontal rail are columns, not icon cards;
+    // skip them during vertical caption pairing.
+    let mut horiz_rail_frames = vec![false; frames.len()];
+    for fi in 0..frames.len() {
+        let peers = (0..frames.len())
+            .filter(|&fj| {
+                fi != fj
+                    && (frames[fi].y - frames[fj].y).abs() <= scaled(6.)
+                    && (frames[fi].h - frames[fj].h).abs() <= scaled(6.)
+            })
+            .count();
+        if peers >= 2 {
+            horiz_rail_frames[fi] = true;
+        }
+    }
+
+    // 5B: vertical captions and enclosing tile expansion.
     for from_frame in [true, false] {
         let len = if from_frame {
             frames.len()
@@ -199,6 +215,9 @@ pub fn compose(
             } else {
                 used_rb[idx]
             } {
+                continue;
+            }
+            if from_frame && horiz_rail_frames[idx] {
                 continue;
             }
             let icon = if from_frame {
@@ -217,7 +236,7 @@ pub fn compose(
                     && label.w >= 28.max((label.h as f64 * 1.45) as i32)
                     && label.w <= 110.max(scaled(145.))
                     && label.h <= 24.max(scaled(36.))
-                    && (0..=22.max(scaled(24.))).contains(&(label.y - icon.bottom()))
+                    && (0..=18.max(scaled(20.))).contains(&(label.y - icon.bottom()))
                     && ((icon.x as f64 + icon.w as f64 * 0.5)
                         - (label.x as f64 + label.w as f64 * 0.5))
                         .abs()
@@ -241,32 +260,13 @@ pub fn compose(
                     {
                         continue;
                     }
-                    best = Some((false, rbi));
+                    best = Some(rbi);
                     break;
                 }
             }
-            if best.is_none() && from_frame {
-                for (fi, frame) in frames.iter().enumerate() {
-                    if fi == idx || used_fr[fi] {
-                        continue;
-                    }
-                    if caption_fits(frame) {
-                        best = Some((true, fi));
-                        break;
-                    }
-                }
-            }
-            if let Some((label_frame, li)) = best {
-                let label = if label_frame {
-                    &frames[li]
-                } else {
-                    &refined_boxes[li]
-                };
-                if label_frame {
-                    used_fr[li] = true
-                } else {
-                    used_rb[li] = true
-                }
+            if let Some(li) = best {
+                let label = &refined_boxes[li];
+                used_rb[li] = true;
                 if from_frame {
                     used_fr[idx] = true
                 } else {
@@ -285,33 +285,11 @@ pub fn compose(
                 let mut icon_child = icon.clone();
                 icon_child.children.clear();
                 let mut label_child = label.clone();
-                label_child.score = if label_frame { 0.88 } else { rsc };
-                if label_frame {
-                    label_child.children.clear();
-                }
+                label_child.score = rsc;
                 compound.children = vec![
                     make_child(&icon_child, "icon", "control", "S"),
                     make_child(&label_child, "text_link", "line", "A"),
                 ];
-                for (i, subtitle) in refined_boxes.iter().enumerate() {
-                    if used_rb[i] {
-                        continue;
-                    }
-                    if matches!(
-                        subtitle.kind.as_str(),
-                        "text_block" | "text_link" | "inline_link"
-                    ) && subtitle.w <= 100.max(scaled(130.))
-                        && subtitle.h <= 18.max(scaled(22.))
-                        && (subtitle.x - label.x).abs() <= 10.max(scaled(12.))
-                        && (0..=8.max(scaled(10.))).contains(&(subtitle.y - label.bottom()))
-                    {
-                        used_rb[i] = true;
-                        union(&mut compound, subtitle);
-                        compound
-                            .children
-                            .push(make_child(subtitle, &subtitle.kind, "line", "D"));
-                    }
-                }
                 for &(tx, ty, tw, th) in &state.tile_containers {
                     if compound.x >= tx - 4
                         && compound.y >= ty - 4
@@ -387,8 +365,8 @@ pub fn compose(
     });
 
     // 5C: sequential padding observes all previously padded refined boxes.
-    let base_min_dim = 30.max(scaled(36.));
-    let base_pad = 8.max(scaled(11.));
+    let base_min_dim = 26.max(scaled(30.));
+    let base_pad = 6.max(scaled(8.));
     for i in 0..rem_rbs.len() {
         if rem_rbs[i].kind != "icon" {
             continue;
@@ -478,11 +456,9 @@ pub fn compose(
             for &i in &chain {
                 union(&mut paragraph, &rem_rbs[i]);
             }
-            if rem_rbs
-                .iter()
-                .enumerate()
-                .any(|(i, rb)| !chain.contains(&i) && overlap(&paragraph, rb) > 0)
-            {
+            if rem_rbs.iter().enumerate().any(|(i, rb)| {
+                !chain.contains(&i) && rb.kind != "inline_link" && overlap(&paragraph, rb) > 0
+            }) {
                 paragraphs.extend(chain.iter().map(|&i| rem_rbs[i].clone()));
                 continue;
             }
@@ -589,8 +565,6 @@ pub fn compose(
     }
 
     // Containment cleanup runs before score filtering, and can mutate parent children.
-    thumbs.extend(rem_rbs.iter().filter(|rb| rb.kind == "thumbnail").cloned());
-    rem_rbs.retain(|rb| rb.kind != "thumbnail");
     final_frames.retain(|frame| {
         !thumbs
             .iter()
@@ -620,8 +594,7 @@ pub fn compose(
         }
         if !absorbed {
             absorbed = clean_rbs.iter().any(|kept| {
-                overlap(&rb, kept) as f64 >= 0.25 * area.min(kept.area()) as f64
-                    && area <= kept.area()
+                overlap(&rb, kept) as f64 >= 0.65 * area as f64 && area <= kept.w * kept.h
             });
         }
         if !absorbed {

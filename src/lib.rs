@@ -171,6 +171,14 @@ pub fn contours(a: &Mat, mode: i32) -> opencv::Result<Vector<Vector<Point>>> {
     )?;
     Ok(out)
 }
+pub fn bounding_boxes(a: &Mat) -> opencv::Result<Vec<(i32, i32, i32, i32)>> {
+    let mut out = Vec::new();
+    for c in contours(a, imgproc::RETR_EXTERNAL)? {
+        let bb = imgproc::bounding_rect(&c)?;
+        out.push((bb.x, bb.y, bb.width, bb.height));
+    }
+    Ok(out)
+}
 // Keep the reference's x/y/width/height arguments while drawing inclusive endpoints.
 #[allow(clippy::too_many_arguments)]
 pub fn rect(
@@ -227,6 +235,29 @@ pub fn std_roi(m: &Mat, x: i32, y: i32, w: i32, h: i32) -> opencv::Result<f64> {
     )?;
     Ok(std[0])
 }
+pub fn mean_roi(m: &Mat, x: i32, y: i32, w: i32, h: i32) -> opencv::Result<f64> {
+    let x1 = x.clamp(0, m.cols());
+    let y1 = y.clamp(0, m.rows());
+    let x2 = (x + w).clamp(0, m.cols());
+    let y2 = (y + h).clamp(0, m.rows());
+    if x2 <= x1 || y2 <= y1 {
+        return Ok(f64::NAN);
+    }
+    Ok(opencv::core::mean(
+        &Mat::roi(m, Rect::new(x1, y1, x2 - x1, y2 - y1))?,
+        &no_array(),
+    )?[0])
+}
+pub fn median_u8(v: &[u8]) -> f64 {
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2] as f64
+    } else {
+        (v[n / 2 - 1] as f64 + v[n / 2] as f64) / 2.
+    }
+}
 pub fn median(v: &[i32]) -> f64 {
     let mut v = v.to_vec();
     v.sort();
@@ -257,8 +288,8 @@ impl Default for Options {
 }
 pub fn detect(bgr: &Mat, options: Options) -> opencv::Result<(Vec<Target>, Value)> {
     let start = Instant::now();
-    let state = signals::prepare(bgr, options)?;
-    let (refined, inner) = refine::refine(&state, options)?;
+    let mut state = signals::prepare(bgr, options)?;
+    let (refined, inner) = refine::refine(&mut state, options)?;
     let targets = compose::compose(&state, refined, inner, options)?;
     let total = start.elapsed().as_secs_f64() * 1000.;
     Ok((

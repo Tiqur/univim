@@ -154,6 +154,58 @@ def fixtures(quick):
         for col in range(20):
             text(dense, "Menu", 14 + col * 71, 30 + row * 58, 0.43)
     yield "dense-hints", dense
+    # Borderless rounded pills exercise Stage 2B fill-contrast peeling, including
+    # pill-width limits, stroke minima, interior flatness and ring flatness.
+    pills = np.full((900, 1440, 3), 246, np.uint8)
+
+    def pill(x, y, w, h, color, ink, label):
+        radius = 4
+        cv2.rectangle(pills, (x + radius, y), (x + w - radius, y + h), color, -1)
+        cv2.rectangle(pills, (x, y + radius), (x + w, y + h - radius), color, -1)
+        for cx, cy in ((x + radius, y + radius), (x + w - radius, y + radius),
+                       (x + radius, y + h - radius), (x + w - radius, y + h - radius)):
+            cv2.circle(pills, (cx, cy), radius, color, -1)
+        text(pills, label, x + 12, y + h // 2 + 5, 0.52, ink, 2)
+
+    # Ink keeps nearly the fill's green level so Stage 2B's interior green
+    # standard deviation stays low while B/R carry the glyph edge contrast.
+    pill(90, 120, 190, 36, (190, 110, 40), (30, 104, 30), "Continue")
+    pill(330, 124, 150, 34, (50, 140, 70), (10, 134, 10), "Apply")
+    pill(540, 118, 220, 38, (180, 70, 140), (180, 64, 10), "Open all settings")
+    # An ellipse has no pure horizontal/vertical contour seed for Stage 2A, so
+    # only Stage 2B's border-pixel closing can recover it as a filled control.
+    cv2.ellipse(pills, (195, 250), (95, 18), 0, 0, 360, (60, 130, 190), -1)
+    text(pills, "Ellipse action", 120, 256, 0.52, (60, 124, 20), 2)
+    yield "rounded-pills", pills
+    # Two media rows exercise peer-shelf width/height normalization, gap filling
+    # and cross-row 16:9 completion from a single-card row. Textured candidates
+    # have no card border so only shelf completion may retain them.
+    shelf = np.full((900, 1440, 3), 245, np.uint8)
+
+    def texture(x, y, w, h):
+        patch = cv2.GaussianBlur(rng.integers(0, 256, (h, w, 3), dtype=np.uint8), (5, 5), 0)
+        mask = np.zeros((h, w), np.uint8)
+        cv2.ellipse(mask, (w // 2, h // 2), (w // 3, h // 3), 0, 0, 360, 255, -1)
+        roi = shelf[y:y + h, x:x + w]
+        roi[mask > 0] = patch[mask > 0]
+
+    def card(x, y, w, h, label):
+        patch = cv2.GaussianBlur(rng.integers(0, 256, (h - 4, w - 4, 3), dtype=np.uint8), (5, 5), 0)
+        shelf[y + 2:y + h - 2, x + 2:x + w - 2] = patch
+        cv2.rectangle(shelf, (x, y), (x + w, y + h), (20, 20, 20), 2)
+        text(shelf, label, x, y + h + 26, 0.55)
+
+    card(80, 100, 220, 142, "First video")
+    card(340, 100, 240, 142, "Second video")
+    card(600, 100, 230, 142, "Third video")
+    texture(860, 100, 240, 142)
+    texture(1120, 100, 240, 142)
+    text(shelf, "Fourth video", 860, 268, 0.55)
+    text(shelf, "Fifth video", 1120, 268, 0.55)
+    card(80, 400, 240, 135, "Single-card row")
+    texture(340, 400, 240, 135)
+    texture(600, 400, 240, 135)
+    yield "media-shelf", shelf
 
 
 @dataclass(frozen=True)
