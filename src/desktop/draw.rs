@@ -8,6 +8,7 @@ use opencv::{core::*, imgproc};
 // labels remain the highest-contrast element on the overlay.
 const NEON: Scalar = Scalar::new(20., 255., 40., 255.);
 const BLACK: Scalar = Scalar::new(0., 0., 0., 255.);
+const MUTED: Scalar = Scalar::new(48., 48., 48., 255.);
 const GREEN: Scalar = Scalar::new(70., 220., 70., 255.);
 const GREEN_FILL: Scalar = Scalar::new(70., 220., 70., 48.);
 const DARK: Scalar = Scalar::new(18., 18., 18., 255.);
@@ -16,7 +17,6 @@ const OUTLINE: Scalar = Scalar::new(70., 220., 70., 220.);
 const LABEL_FONT: i32 = imgproc::FONT_HERSHEY_SIMPLEX;
 const LABEL_SCALE: f64 = 0.48;
 const LABEL_THICKNESS: i32 = 1;
-const LABEL_BOLD_THICKNESS: i32 = 2;
 const LABEL_PAD_X: i32 = 3;
 const LABEL_PAD_Y: i32 = 2;
 
@@ -100,21 +100,21 @@ fn tag(m: &mut Mat, value: &str, x: i32, y: i32, highlight: usize) -> opencv::Re
     let y = y.clamp(0, (m.rows() - h).max(0));
     rect(m, [x, y, w, h], NEON, true)?;
     let origin = Point::new(x + LABEL_PAD_X, y + height + LABEL_PAD_Y);
+    let highlight = highlight.min(value.chars().count());
+    let color = if highlight == 0 { BLACK } else { MUTED };
     imgproc::put_text(
         m,
         &value,
         origin,
         LABEL_FONT,
         LABEL_SCALE,
-        BLACK,
+        color,
         LABEL_THICKNESS,
         imgproc::LINE_AA,
         false,
     )?;
-    // Redraw the leading characters at the same origin. OpenCV lays out the
-    // prefix identically at the start of the full label, so only its strokes
-    // thicken without changing the label width.
-    let highlight = highlight.min(value.chars().count());
+    // Emphasis uses color rather than a thicker stroke, which stays legible at
+    // small sizes. The prefix is laid out at the same origin as the full label.
     if highlight > 0 {
         let prefix: String = value.chars().take(highlight).collect();
         imgproc::put_text(
@@ -124,7 +124,7 @@ fn tag(m: &mut Mat, value: &str, x: i32, y: i32, highlight: usize) -> opencv::Re
             LABEL_FONT,
             LABEL_SCALE,
             BLACK,
-            LABEL_BOLD_THICKNESS,
+            LABEL_THICKNESS,
             imgproc::LINE_AA,
             false,
         )?;
@@ -217,9 +217,9 @@ fn hints(
         let h = bottom.min(f64::from(m.rows())) as i32 - y;
         rect(m, [x, y, w, h], GREEN_FILL, true)?;
         rect(m, [x, y, w, h], OUTLINE, false)?;
-        // The first character is always emphasized. Typed characters stay bold
-        // as the prefix grows, making the active filter obvious.
-        let highlight = prefix.chars().count().max(1);
+        // Only typed characters are emphasized. With no prefix the whole tag
+        // is black, so the first letter is not special until it is actually used.
+        let highlight = prefix.chars().count();
         let (lx, ly) = place_label([x, y, w, h], label_size(&t.hint)?, m.cols(), m.rows());
         tag(m, &t.hint, lx, ly, highlight)?;
     }
@@ -252,8 +252,7 @@ fn grid(m: &mut Mat, bounds: Rect, count: i32, prefix: &str) -> opencv::Result<(
             if label.starts_with(prefix) {
                 let (label_w, label_h) = label_size(&label)?;
                 if w >= label_w + 4 && h >= label_h + 4 {
-                    let highlight = prefix.chars().count().max(1);
-                    tag(m, &label, x + 2, y + 2, highlight)?;
+                    tag(m, &label, x + 2, y + 2, prefix.chars().count())?;
                 }
             }
         }
@@ -435,25 +434,25 @@ mod tests {
     }
 
     #[test]
-    fn typed_hint_prefix_is_bolder() {
+    fn typed_hint_prefix_is_emphasized() {
         let mut plain = canvas(80, 40).unwrap();
-        let mut bold = canvas(80, 40).unwrap();
-        tag(&mut plain, "MGF", 2, 2, 1).unwrap();
-        tag(&mut bold, "MGF", 2, 2, 2).unwrap();
-        assert_ne!(export(&plain).unwrap(), export(&bold).unwrap());
+        let mut typed = canvas(80, 40).unwrap();
+        tag(&mut plain, "MGF", 2, 2, 0).unwrap();
+        tag(&mut typed, "MGF", 2, 2, 1).unwrap();
+        assert_ne!(export(&plain).unwrap(), export(&typed).unwrap());
     }
 
     #[test]
     fn labels_are_black_on_solid_neon() {
         let mut m = canvas(60, 30).unwrap();
-        tag(&mut m, "M", 2, 2, 1).unwrap();
+        tag(&mut m, "M", 2, 2, 0).unwrap();
         let pixels = export(&m).unwrap();
         assert!(
             pixels
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .any(|p| p == &[0, 0, 0, 255])
+                .any(|p| p[0] < 32 && p[1] < 32 && p[2] < 32)
         );
         assert!(
             pixels
