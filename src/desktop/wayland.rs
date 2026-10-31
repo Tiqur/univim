@@ -12,7 +12,7 @@ use std::{
 
 use super::{
     Config,
-    geometry::FrameGeometry,
+    geometry::{FrameGeometry, Output},
     hyprland,
     session::{GestureKey, Input, Mode, Outcome, Session, TapTracker},
 };
@@ -142,6 +142,130 @@ pub fn check() -> Result<Value, String> {
         .collect::<Vec<_>>();
     Ok(json!({"protocols":protocols,"outputs":outputs,
         "gesture_limitation":"Anonymous compositor shortcuts cannot observe arbitrary intervening chords; configure nonconsuming modifier-only press/release bindings."}))
+}
+
+/// One-shot native capture for numbered diagnostic snapshots. No surface or
+/// input object is created; the frame is decoded upright into owned BGR memory.
+pub struct Captured {
+    pub image: Mat,
+    pub targets: Vec<crate::Target>,
+    pub output: Output,
+    pub timings: Value,
+}
+
+pub fn capture(output_name: Option<&str>, options: crate::Options) -> Result<Captured, String> {
+    let conn = Connection::connect_to_env().map_err(error)?;
+    let (globals, mut queue) = registry_queue_init::<State>(&conn).map_err(error)?;
+    let qh = queue.handle();
+    let mut state = State::new(&globals, &qh)?;
+    state.capture_manager = Some(globals.bind(&qh, 3..=3, ()).map_err(error)?);
+    queue.roundtrip(&mut state).map_err(error)?;
+
+    let output = hyprland::selected_output(output_name)?;
+    let (logical_w, logical_h) = output.logical_size()?;
+    if !logical_w.is_finite()
+        || !logical_h.is_finite()
+        || logical_w < 1.
+        || logical_h < 1.
+        || logical_w > 32768.
+        || logical_h > 32768.
+    {
+        return Err("invalid output logical size".into());
+    }
+    let wl_output = state
+        .outputs
+        .outputs()
+        .find(|candidate| {
+            state
+                .outputs
+                .info(candidate)
+                .is_some_and(|info| info.name.as_deref() == Some(output.name.as_str()))
+        })
+        .ok_or("selected output is absent from Wayland registry")?;
+    state.output = Some(wl_output.clone());
+    state.geometry = Some(FrameGeometry {
+        output: output.clone(),
+        pixel_width: 1,
+        pixel_height: 1,
+    });
+    state.size = (logical_w.round() as u32, logical_h.round() as u32);
+    let manager = state
+        .capture_manager
+        .as_ref()
+        .ok_or("screencopy unavailable")?;
+    state.capture = Some(Capture {
+        frame: manager.capture_output(0, &wl_output, &qh, ()),
+        pool: None,
+        buffer: None,
+        format: None,
+        width: 0,
+        height: 0,
+        stride: 0,
+        inverted: false,
+        started: Instant::now(),
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        queue.dispatch_pending(&mut state).map_err(error)?;
+        if let Some(failure) = state.failure.take() {
+            return Err(failure);
+        }
+        if state.captured.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("snapshot capture timed out".into());
+        }
+        let blocked = match conn.flush() {
+            Ok(()) => false,
+            Err(wayland_client::backend::WaylandError::Io(ref e))
+                if e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                true
+            }
+            Err(e) => return Err(error(e)),
+        };
+        let Some(guard) = queue.prepare_read() else {
+            continue;
+        };
+        let mut flags = PollFlags::POLLIN;
+        if blocked {
+            flags |= PollFlags::POLLOUT;
+        }
+        let mut fds = [PollFd::new(conn.as_fd(), flags)];
+        poll(&mut fds, Some(250u16)).map_err(error)?;
+        let revents = fds[0].revents().unwrap_or(PollFlags::empty());
+        if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+            drop(guard);
+            return Err("Wayland connection closed during snapshot".into());
+        }
+        if revents.contains(PollFlags::POLLIN) {
+            match guard.read() {
+                Ok(_) => {}
+                Err(wayland_client::backend::WaylandError::Io(ref e))
+                    if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(error(e)),
+            }
+        } else {
+            drop(guard);
+        }
+    }
+
+    let image = state.captured.take().ok_or("snapshot produced no image")?;
+    if let Some(geometry) = state.geometry.as_mut() {
+        geometry.pixel_width = image.cols();
+        geometry.pixel_height = image.rows();
+        let output = geometry.output.clone();
+        let (targets, timings) = crate::detect(&image, options).map_err(error)?;
+        return Ok(Captured {
+            image,
+            targets,
+            output,
+            timings,
+        });
+    }
+    Err("snapshot geometry is missing".into())
 }
 
 struct Capture {
@@ -610,7 +734,7 @@ pub fn run(config: Config, control: UnixDatagram) -> Result<(), String> {
                             }
                             "status" => {
                                 if let Some(path) = address.as_pathname() {
-                                    let reply = json!({"active":state.mode.is_some(),"locked":state.locked,"loading":!state.finishing && (state.capture.is_some()||(state.mode.is_some()&&state.session.is_none())),"no_click":config.no_click,
+                                    let reply = json!({"active":state.mode.is_some(),"locked":state.locked,"loading":!state.finishing && (state.capture.is_some()||(state.mode.is_some()&&state.session.is_none())),"no_click":config.no_click,"flat":config.flat,
                                         "mode":state.mode.map(|m| match m { Mode::Hints => "hints", Mode::Grid => "grid" }),
                                         "output":state.geometry.as_ref().map(|g| &g.output.name),
                                         "session_count":state.session_count,"finishing":state.finishing,
@@ -810,6 +934,11 @@ pub fn run(config: Config, control: UnixDatagram) -> Result<(), String> {
             {
                 match result.result {
                     Ok((image, targets)) => {
+                        let targets = if config.flat {
+                            crate::flatten_leaves(&targets).map_err(error)?
+                        } else {
+                            targets
+                        };
                         state.session = Some(Session::hints(image.cols(), image.rows(), targets));
                         state.background = Some(image);
                         state.dirty = true;

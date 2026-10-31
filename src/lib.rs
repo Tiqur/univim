@@ -301,6 +301,28 @@ pub fn drill_down(target: &Target, to_words: bool) -> Result<Vec<Target>, serde_
     }
     Ok(out)
 }
+
+/// Recursively replace composite targets with their leaf descendants. This is
+/// used by `--flat` hints: parents are not shown, only clickable leaves.
+pub fn flatten_leaves(targets: &[Target]) -> Result<Vec<Target>, serde_json::Error> {
+    fn visit(node: &Target, leaves: &mut Vec<Target>) -> Result<(), serde_json::Error> {
+        if node.children.is_empty() {
+            leaves.push(node.clone());
+            return Ok(());
+        }
+        for child in &node.children {
+            let child: Target = serde_json::from_value(child.clone())?;
+            visit(&child, leaves)?;
+        }
+        Ok(())
+    }
+
+    let mut leaves = vec![];
+    for target in targets {
+        visit(target, &mut leaves)?;
+    }
+    Ok(leaves)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +390,22 @@ mod tests {
             parent.children = vec![value];
             assert!(drill_down(&parent, true).is_err());
         }
+    }
+
+    #[test]
+    fn flatten_leaves_removes_all_composite_parents() {
+        let mut parent = Target::new(0, 0, 100, 100, 0.9, "frame", "control");
+        parent.children = vec![
+            json!({"x":1,"y":2,"w":30,"h":20,"score":0.85,"kind":"line","level":"line","hint":"A","children":[
+                {"x":2,"y":3,"w":10,"h":8,"score":0.85,"kind":"word","level":"word","hint":"B"}
+            ]}),
+            json!({"x":3,"y":4,"w":12,"h":9,"score":0.85,"kind":"word","level":"word","hint":"C"}),
+        ];
+        let leaves = flatten_leaves(&[parent]).unwrap();
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(leaves[0].x, 2);
+        assert_eq!(leaves[1].x, 3);
+        assert!(leaves.iter().all(|target| target.children.is_empty()));
     }
 
     #[test]

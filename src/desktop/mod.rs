@@ -3,6 +3,7 @@ pub mod draw;
 pub mod geometry;
 pub mod hyprland;
 pub mod session;
+pub mod snapshot;
 pub mod wayland;
 
 use std::time::Duration;
@@ -11,5 +12,6 @@ pub struct Config {
     pub output: Option<String>,
     pub options: crate::Options,
     pub no_click: bool,
+    pub flat: bool,
     pub timeout: Duration,
 }

@@ -13,7 +13,7 @@ mod linux {
     };
     use univim::{
         Options,
-        desktop::{Config, hyprland, wayland},
+        desktop::{Config, hyprland, snapshot, wayland},
     };
 
     #[derive(Parser)]
@@ -39,8 +39,28 @@ mod linux {
             /// Display normally, but never inject clicks.
             #[arg(long)]
             no_click: bool,
+            /// Show only flattened leaf targets; do not expose parents for drill-down.
+            #[arg(long)]
+            flat: bool,
             #[arg(long,default_value_t=30,value_parser=clap::value_parser!(u64).range(1..=3600))]
             timeout: u64,
+        },
+        /// Capture one monitor and save numbered raw, annotated and JSON artifacts.
+        #[command(alias = "screenshot", alias = "capture")]
+        Snapshot {
+            #[arg(long)]
+            output: Option<String>,
+            #[arg(long, default_value = "captures")]
+            dir: PathBuf,
+            #[arg(long)]
+            turbo: bool,
+            #[arg(long)]
+            interactive_only: bool,
+            /// Save and render only flattened leaf targets; no parent boxes or drills.
+            #[arg(long)]
+            flat: bool,
+            #[arg(long, default_value_t = 0.45, allow_hyphen_values = true)]
+            min_score: f64,
         },
         Hints,
         Grid,
@@ -128,6 +148,7 @@ mod linux {
                 turbo,
                 interactive_only,
                 no_click,
+                flat,
                 timeout,
             } => {
                 opencv::core::set_num_threads(1)?;
@@ -143,11 +164,55 @@ mod linux {
                             ..Options::default()
                         },
                         no_click,
+                        flat,
                         timeout: Duration::from_secs(timeout),
                     },
                     socket,
                 )
                 .map_err(std::io::Error::other)?;
+            }
+            Command::Snapshot {
+                output,
+                dir,
+                turbo,
+                interactive_only,
+                flat,
+                min_score,
+            } => {
+                opencv::core::set_num_threads(1)?;
+                let options = Options {
+                    min_score,
+                    include_text: !interactive_only,
+                    turbo,
+                    ..Options::default()
+                };
+                let captured =
+                    wayland::capture(output.as_deref(), options).map_err(std::io::Error::other)?;
+                let targets = if flat {
+                    univim::flatten_leaves(&captured.targets).map_err(std::io::Error::other)?
+                } else {
+                    captured.targets.clone()
+                };
+                let rendered = univim::render::hierarchy_overlay(&captured.image, &targets)
+                    .map_err(std::io::Error::other)?;
+                let saved = snapshot::save(
+                    &captured.image,
+                    &rendered,
+                    &targets,
+                    &captured.output,
+                    &captured.timings,
+                    options,
+                    &dir,
+                )
+                .map_err(std::io::Error::other)?;
+                println!(
+                    "Saved snapshot #{}: {} | {} | {}",
+                    saved.number,
+                    saved.screenshot.display(),
+                    saved.rendered.display(),
+                    saved.json.display()
+                );
+                println!("{} nodes, {} drill-down groups", saved.nodes, saved.drills);
             }
             command => {
                 let directory = directory()?;

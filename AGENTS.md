@@ -14,8 +14,9 @@ Python subprocess or embedded interpreter.
 - `src/main.rs`: CLI and warmed detection-only benchmarks.
 - `src/bin/univim-desktop.rs`: Linux desktop service CLI and private control IPC.
 - `src/desktop/`: native Wayland capture/input/overlay runtime, Hyprland discovery,
-  coordinate geometry, software drawing and pure selection/gesture state.
+  coordinate geometry, software drawing, numbered snapshots and pure selection/gesture state.
 - `tests/parity.py`: deterministic fixtures, exact differential tests, benchmarks.
+- `tests/desktop_smoke.py`: opt-in live no-click overlay/cancellation smoke test.
 
 ## Engineering Conventions
 
@@ -71,8 +72,15 @@ Document anonymous global shortcut gestures as best-effort: they cannot reject
 arbitrary intervening chord keys. Hotkey configuration is opt-in output from
 `bindings`, never an automatic edit to the user's configuration. Drill mode
 expands immediate children only; retain parent navigation and cancellation.
+`--flat` is a separate flattening option: recursively replace composites with
+leaves and omit parent hints, boxes and drill groups. Do not confuse it with the
+default immediate-child drill behavior.
 Do not run live capture, overlay, hotkey or click tests without explicit approval.
 Use CLI help and pure unit tests for noninteractive desktop verification.
+`univim-desktop snapshot` writes numbered raw and hierarchy-annotated images plus
+JSON with the complete `targets`, `flat` node list and per-parent `drills`.
+Generated `captures/` and other snapshots are ignored artifacts: never commit
+them, print their contents, or weaken the existing Git safety rules for them.
 The flake is Linux-only because Cargo's Wayland dependencies are unconditional;
 a cfg-gated desktop entry point alone does not make macOS builds supported.
 

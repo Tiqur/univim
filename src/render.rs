@@ -153,3 +153,127 @@ pub fn drilldown_overlay(bgr: &Mat, parent: &Target, to_words: bool) -> opencv::
         .map_err(|error| opencv::Error::new(opencv::core::StsBadArg, error.to_string()))?;
     overlay(&dimmed, &children)
 }
+
+/// Draw every detected node, including nested drill-down children, using
+/// depth-based colors and unique path labels. This is intended for visual
+/// debugging and vision-model inspection, not for the interactive overlay.
+pub fn hierarchy_overlay(bgr: &Mat, targets: &[Target]) -> Result<Mat, String> {
+    fn color(depth: usize) -> Scalar {
+        const COLORS: [(u8, u8, u8); 6] = [
+            (0, 0, 255),   // depth 0: red
+            (0, 200, 0),   // depth 1: green
+            (255, 0, 0),   // depth 2: blue
+            (0, 255, 255), // depth 3: yellow
+            (255, 0, 255), // depth 4: magenta
+            (255, 255, 0), // depth 5: cyan
+        ];
+        let (b, g, r) = COLORS[depth % COLORS.len()];
+        Scalar::new(b as f64, g as f64, r as f64, 0.)
+    }
+
+    fn draw(
+        canvas: &mut Mat,
+        node: &Target,
+        path: &mut Vec<String>,
+        depth: usize,
+    ) -> Result<(), String> {
+        let label_path = path.join("/");
+        let label = format!("D{depth} {label_path} {}", node.kind);
+        let label: String = label.chars().take(96).collect();
+        let mut baseline = 0;
+        let size = imgproc::get_text_size(
+            &label,
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.34,
+            1,
+            &mut baseline,
+        )
+        .map_err(|e| e.to_string())?;
+        let (tw, th) = (size.width, size.height);
+        let bx = node.x.max(0);
+        let by = (node.y - th - 8).max(0);
+        let right = (canvas.cols() - 1).min(bx + tw + 8);
+        let bottom = (canvas.rows() - 1).min(by + th + 6);
+        if right > bx && bottom > by {
+            rect(
+                canvas,
+                bx - 1,
+                by - 1,
+                right - bx + 2,
+                bottom - by + 2,
+                Scalar::all(10.),
+                -1,
+                imgproc::LINE_8,
+            )
+            .map_err(|e| e.to_string())?;
+            rect(
+                canvas,
+                bx,
+                by,
+                right - bx,
+                bottom - by,
+                color(depth),
+                -1,
+                imgproc::LINE_8,
+            )
+            .map_err(|e| e.to_string())?;
+            let text_color = if depth == 0 {
+                Scalar::all(255.)
+            } else {
+                Scalar::all(10.)
+            };
+            imgproc::put_text(
+                canvas,
+                &label,
+                Point::new(bx + 3, bottom - 3),
+                imgproc::FONT_HERSHEY_SIMPLEX,
+                0.34,
+                text_color,
+                1,
+                imgproc::LINE_AA,
+                false,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let thickness = match depth {
+            0 => 3,
+            1 => 2,
+            _ => 1,
+        };
+        rect(
+            canvas,
+            node.x,
+            node.y,
+            node.w,
+            node.h,
+            color(depth),
+            thickness,
+            imgproc::LINE_AA,
+        )
+        .map_err(|e| e.to_string())?;
+
+        for (index, child) in node.children.iter().enumerate() {
+            let child: Target = serde_json::from_value(child.clone())
+                .map_err(|e| format!("invalid child target: {e}"))?;
+            path.push(if child.hint.is_empty() {
+                format!("#{index}")
+            } else {
+                child.hint.clone()
+            });
+            draw(canvas, &child, path, depth + 1)?;
+            path.pop();
+        }
+        Ok(())
+    }
+
+    let mut canvas = bgr.try_clone().map_err(|e| e.to_string())?;
+    for target in targets {
+        let mut path = vec![if target.hint.is_empty() {
+            "?".to_string()
+        } else {
+            target.hint.clone()
+        }];
+        draw(&mut canvas, target, &mut path, 0)?;
+    }
+    Ok(canvas)
+}

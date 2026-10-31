@@ -63,17 +63,38 @@ univim-desktop status
 univim-desktop cancel
 univim-desktop grid
 univim-desktop quit
+# One-shot numbered diagnostic capture; does not need the service:
+univim-desktop snapshot --dir captures
 ```
+
+`snapshot` captures the focused monitor unless `--output NAME` is supplied and
+writes three artifacts with the same numeric stem:
+
+- `N.png`: raw screenshot.
+- `N.annotated.png`: every parent and descendant target boxed, colored by
+  hierarchy depth, with `D<depth> <path> <kind>` labels.
+- `N.json`: the complete ordered hierarchy in `targets`, every node in `flat`,
+  and immediate/word drill-down results for every parent in `drills`, together
+  with output metadata, options and detector timings.
+
+`--turbo`, `--interactive-only` and `--min-score` apply to snapshots. Add
+`--flat` to replace every composite target with its leaf descendants: only
+leaf boxes are rendered and `targets`/`flat` contain leaves, with no parent
+targets or `drills`. Capture files contain screen contents and are written with
+private permissions. The default `captures/` directory is ignored by Git; avoid
+adding it or committing captured screenshots.
 
 `check` reports capabilities and discovered outputs without capturing or injecting
 input. `serve [--output NAME] [--turbo] [--interactive-only] [--no-click]
-[--timeout 30]` runs the service. Output discovery is dynamic: each activation
+[--flat] [--timeout 30]` runs the service. Output discovery is dynamic: each activation
 uses the currently focused monitor unless `--output NAME` selects a connector.
 Monitor position, scale and transform come from runtime metadata, not a fixed
 layout. Unavailable outputs fail rather than falling back to another monitor.
 `--turbo` and `--interactive-only` configure detection. `--no-click` allows
 selection without injecting clicks; it still captures and takes overlay keyboard
-focus during an active session. The session timeout defaults to 30 seconds
+focus during an active session. `--flat` flattens all composite targets to
+their leaf descendants before hints, so parent hints and drill-down are absent.
+The session timeout defaults to 30 seconds
 (accepted range 1-3600). `cancel` dismisses selection; `quit` stops the service.
 `status` reports JSON including activity, mode, output and overlay state.
 
