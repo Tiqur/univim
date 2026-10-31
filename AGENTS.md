@@ -15,6 +15,9 @@ Python subprocess or embedded interpreter.
 - `src/bin/univim-desktop.rs`: Linux desktop service CLI and private control IPC.
 - `src/desktop/`: native Wayland capture/input/overlay runtime, Hyprland discovery,
   coordinate geometry, software drawing, numbered snapshots and pure selection/gesture state.
+- `nix/home-manager.nix`: exported Home Manager module for the session service and
+  optional Hyprland bindings.
+- `nix/tests/home-manager.nix`: evaluation and generated-configuration checks.
 - `tests/parity.py`: deterministic fixtures, exact differential tests, benchmarks.
 - `tests/desktop_smoke.py`: opt-in live no-click overlay/cancellation smoke test.
 
@@ -69,8 +72,10 @@ Keep capture in memory, with no screenshot subprocesses/files and no idle mapped
 surface. Discover outputs dynamically, default to the focused monitor, and keep
 capture pixels, logical overlay coordinates and pointer coordinates distinct.
 Document anonymous global shortcut gestures as best-effort: they cannot reject
-arbitrary intervening chord keys. Hotkey configuration is opt-in output from
-`bindings`, never an automatic edit to the user's configuration. Drill mode
+arbitrary intervening chord keys. Hotkey configuration is opt-in: the CLI only
+prints suggested bindings, and the Home Manager module adds them only when
+`keybindings.enable` or `keybindings.modifierGestures` is requested. Never edit a
+user's external configuration automatically. Drill mode
 expands immediate children only; retain parent navigation and cancellation.
 `--flat` is a separate flattening option: recursively replace composites with
 leaves and omit parent hints, boxes and drill groups. Do not confuse it with the
@@ -83,6 +88,10 @@ Generated `captures/` and other snapshots are ignored artifacts: never commit
 them, print their contents, or weaken the existing Git safety rules for them.
 The flake is Linux-only because Cargo's Wayland dependencies are unconditional;
 a cfg-gated desktop entry point alone does not make macOS builds supported.
+The Home Manager module uses `hyprland-session.target` when native Home Manager
+Hyprland systemd integration is enabled, otherwise `graphical-session.target`.
+Do not hardcode UWSM or assume a compositor from the absence of Home Manager's
+integration; `sessionTarget` is the explicit override.
 
 Run commands inside the pinned environment so Python and Rust share OpenCV:
 
@@ -101,7 +110,9 @@ Both shell and package use the flake's filtered source, excluding build artifact
 The initial `path:.` snapshot can still copy ignored files before filtering;
 prefer Git-backed flake evaluation once new files are tracked. Do not stage files
 merely to speed up Nix without permission.
-Run `nix build` when changing packaging. Do not claim full real-world equivalence
+Run `nix build` when changing packaging. Run `nix flake check` when changing the
+Home Manager module; its checks evaluate the service unit and generated Hyprland
+configuration without starting a session. Do not claim full real-world equivalence
 from synthetic fixtures alone. Add any supplied real screenshots to the
 differential workflow, subject to privacy and licensing. Never weaken exact
 comparisons or add tolerances to make a failed port pass.

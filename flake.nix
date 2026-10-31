@@ -2,25 +2,60 @@
   description = "UniVim: native Rust UI detector and Hyprland desktop navigation";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.home-manager = {
+    url = "github:nix-community/home-manager";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      home-manager,
+    }:
     let
       # Wayland dependencies are unconditional in Cargo.toml, even for the CLI.
-      systems = [ "x86_64-linux" "aarch64-linux" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
       source = nixpkgs.lib.cleanSourceWith {
         src = ./.;
-        filter = path: type:
-          let name = builtins.baseNameOf path;
-          in !(builtins.elem name [ "target" "result" ".git" "__pycache__" ])
-            && nixpkgs.lib.cleanSourceFilter path type;
+        filter =
+          path: type:
+          let
+            name = builtins.baseNameOf path;
+          in
+          !(builtins.elem name [
+            "target"
+            "result"
+            ".git"
+            "__pycache__"
+          ])
+          && nixpkgs.lib.cleanSourceFilter path type;
       };
-    in {
+    in
+    {
+      homeManagerModules.default = import ./nix/home-manager.nix { inherit self; };
+
+      checks = forAllSystems (pkgs: {
+        home-manager = import ./nix/tests/home-manager.nix {
+          inherit (pkgs) lib;
+          inherit home-manager pkgs;
+          univimModule = self.homeManagerModules.default;
+          univimPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
+      });
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           src = source;
           packages = [
-            (pkgs.python3.withPackages (ps: [ ps.opencv4 ps.numpy ]))
+            (pkgs.python3.withPackages (ps: [
+              ps.opencv4
+              ps.numpy
+            ]))
             pkgs.rustc
             pkgs.cargo
             pkgs.rustfmt
@@ -52,8 +87,15 @@
           src = source;
           cargoLock.lockFile = source + "/Cargo.lock";
 
-          nativeBuildInputs = [ pkgs.pkg-config pkgs.clang ];
-          buildInputs = [ pkgs.opencv4 pkgs.wayland pkgs.libxkbcommon ];
+          nativeBuildInputs = [
+            pkgs.pkg-config
+            pkgs.clang
+          ];
+          buildInputs = [
+            pkgs.opencv4
+            pkgs.wayland
+            pkgs.libxkbcommon
+          ];
 
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           PKG_CONFIG_PATH = "${pkgs.opencv4.cxxdev}/lib/pkgconfig";
