@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = ROOT / "target" / "parity"
 SEED = 20261030
 WIDTHS = (640, 899, 900, 1440, 1600, 1601, 1920, 2560, 2561, 2880)
+STAGES = ("signal", "frames", "coarse", "recursive", "total")
 
 
 def load_reference():
@@ -48,6 +49,11 @@ def load_reference():
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+
+
+def timing_summary(samples):
+    return {"median_ms": statistics.median(samples), "mean_ms": statistics.mean(samples),
+            "min_ms": min(samples), "max_ms": max(samples), "samples_ms": samples}
 
 
 def save_image(path, image):
@@ -352,13 +358,18 @@ class Harness:
                 for _ in range(warmup):
                     detector.detect(image)
                 samples = []
+                stage_samples = {stage: [] for stage in STAGES}
                 for _ in range(runs):
                     start = time.perf_counter_ns()
-                    targets, _ = detector.detect(image)
+                    targets, timings = detector.detect(image)
                     samples.append((time.perf_counter_ns() - start) / 1e6)
+                    for stage in STAGES:
+                        stage_samples[stage].append(timings[f"{stage}_ms"])
                 python = {"median_ms": statistics.median(samples), "mean_ms": statistics.mean(samples),
                           "min_ms": min(samples), "max_ms": max(samples), "samples_ms": samples,
-                          "targets": len(targets)}
+                          "targets": len(targets),
+                          "stages": {stage: timing_summary(values)
+                                     for stage, values in stage_samples.items()}}
                 directory = ARTIFACTS / name / f"benchmark-{'turbo' if turbo else 'normal'}"
                 directory.mkdir(parents=True, exist_ok=True)
                 output = directory / "benchmark.json"
@@ -383,17 +394,36 @@ class Harness:
                             raise ValueError(f"inconsistent benchmark {field}: {rust[field]} vs {value}")
                     if rust["targets"] != len(targets):
                         raise ValueError(f"benchmark target count Python={len(targets)}, Rust={rust['targets']}")
+                    stage_speedup = {}
+                    for stage in STAGES:
+                        try:
+                            values = rust["stages"][stage]["samples_ms"]
+                        except (KeyError, TypeError) as error:
+                            raise ValueError(f"benchmark missing stage {stage}") from error
+                        if len(values) != runs or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in values):
+                            raise ValueError(f"invalid {stage} benchmark samples or sample count")
+                        summary = timing_summary(values)
+                        for field in ("median_ms", "mean_ms", "min_ms", "max_ms"):
+                            if not math.isclose(rust["stages"][stage][field], summary[field],
+                                                rel_tol=1e-9, abs_tol=1e-9):
+                                raise ValueError(f"inconsistent {stage} benchmark {field}")
+                        py_median = python["stages"][stage]["median_ms"]
+                        stage_speedup[stage] = py_median / summary["median_ms"] if summary["median_ms"] else None
                     entry["rust"] = rust
                     entry["median_speedup"] = python["median_ms"] / rust["median_ms"] if rust["median_ms"] else None
+                    entry["stage_speedup"] = stage_speedup
+                    stages = ", ".join(
+                        f"{stage} {python['stages'][stage]['median_ms']:.1f}/{rust['stages'][stage]['median_ms']:.1f}"
+                        for stage in STAGES)
                     print(f"BENCH {name} turbo={turbo}: Python {python['median_ms']:.2f} ms, "
-                          f"Rust {rust['median_ms']:.2f} ms", flush=True)
+                          f"Rust {rust['median_ms']:.2f} ms | py/rust stages: {stages}", flush=True)
                 except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, TypeError, KeyError) as error:
                     entry["error"] = str(error)
                     self.fail(f"benchmark/{name}/{turbo}", str(error))
                 results.append(entry)
         write_json(ROOT / "target" / "benchmark.json", {
             "runs": runs, "warmup": warmup, "opencv_threads": cv2.getNumThreads(),
-            "scope": "detection only, preloaded image, repeated in one process per configuration",
+            "scope": "detection only, preloaded image, repeated in one process per configuration; per-stage medians included",
             "environment": environment(self.binary), "results": results})
 
 

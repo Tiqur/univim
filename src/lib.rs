@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 use std::time::Instant;
 
 pub mod compose;
+#[cfg(target_os = "linux")]
+pub mod desktop;
 pub mod refine;
 pub mod render;
 pub mod signals;
