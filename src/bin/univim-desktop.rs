@@ -42,6 +42,9 @@ mod linux {
             /// Show only flattened leaf targets; do not expose parents for drill-down.
             #[arg(long)]
             flat: bool,
+            /// Color target boxes and hint tags by element type instead of green.
+            #[arg(long)]
+            color_by_type: bool,
             #[arg(long,default_value_t=30,value_parser=clap::value_parser!(u64).range(1..=3600))]
             timeout: u64,
         },
@@ -149,6 +152,7 @@ mod linux {
                 interactive_only,
                 no_click,
                 flat,
+                color_by_type,
                 timeout,
             } => {
                 opencv::core::set_num_threads(1)?;
@@ -165,6 +169,7 @@ mod linux {
                         },
                         no_click,
                         flat,
+                        color_by_type,
                         timeout: Duration::from_secs(timeout),
                     },
                     socket,

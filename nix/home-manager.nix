@@ -42,6 +42,7 @@ let
   ++ lib.optional cfg.interactiveOnly "--interactive-only"
   ++ lib.optional cfg.noClick "--no-click"
   ++ lib.optional cfg.flat "--flat"
+  ++ lib.optional cfg.colorByType "--color-by-type"
   ++ [
     "--timeout"
     (toString cfg.timeout)
@@ -137,6 +138,7 @@ in
     interactiveOnly = lib.mkEnableOption "interactive-only detection";
     noClick = lib.mkEnableOption "display without injecting clicks";
     flat = lib.mkEnableOption "flattened leaf-only hints";
+    colorByType = lib.mkEnableOption "target and hint tag colors selected by element type";
 
     timeout = lib.mkOption {
       type = lib.types.ints.between 1 3600;

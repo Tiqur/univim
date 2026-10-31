@@ -191,6 +191,7 @@ services.univim = {
   # Optional service settings:
   output = "DP-3";       # null follows the focused monitor
   flat = true;           # leaf-only hints, no drill-down
+  colorByType = true;    # lime/magenta/... targets by element type
   turbo = true;
   interactiveOnly = false;
   noClick = false;
@@ -298,7 +299,7 @@ adding it or committing captured screenshots.
 
 `check` reports capabilities and discovered outputs without capturing or injecting
 input. `serve [--output NAME] [--turbo] [--interactive-only] [--no-click]
-[--flat] [--timeout 30]` runs the service. Output discovery is dynamic: each activation
+[--flat] [--color-by-type] [--timeout 30]` runs the service. Output discovery is dynamic: each activation
 uses the currently focused monitor unless `--output NAME` selects a connector.
 Monitor position, scale and transform come from runtime metadata, not a fixed
 layout. Unavailable outputs fail rather than falling back to another monitor.
@@ -306,6 +307,9 @@ layout. Unavailable outputs fail rather than falling back to another monitor.
 selection without injecting clicks; it still captures and takes overlay keyboard
 focus during an active session. `--flat` flattens all composite targets to
 their leaf descendants before hints, so parent hints and drill-down are absent.
+`--color-by-type` colors each target outline and hint tag by element type using
+a bright palette (lime, magenta, cyan, amber, sky, orange, rose, lemon and
+violet) with black tag text.
 The session timeout defaults to 30 seconds
 (accepted range 1-3600). `cancel` dismisses selection; `quit` stops the service.
 `status` reports JSON including activity, mode, output and overlay state.

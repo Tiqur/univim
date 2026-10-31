@@ -13,5 +13,6 @@ pub struct Config {
     pub options: crate::Options,
     pub no_click: bool,
     pub flat: bool,
+    pub color_by_type: bool,
     pub timeout: Duration,
 }

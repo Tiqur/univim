@@ -116,6 +116,7 @@ let
         interactiveOnly = true;
         noClick = true;
         flat = true;
+        colorByType = true;
         timeout = 42;
       };
     }
@@ -200,6 +201,7 @@ let
     ${pkgs.gnugrep}/bin/grep -F -- '--interactive-only' ${launcher}
     ${pkgs.gnugrep}/bin/grep -F -- '--no-click' ${launcher}
     ${pkgs.gnugrep}/bin/grep -F -- '--flat' ${launcher}
+    ${pkgs.gnugrep}/bin/grep -F -- '--color-by-type' ${launcher}
     ${pkgs.gnugrep}/bin/grep -F -- '--timeout 42' ${launcher}
     ${pkgs.coreutils}/bin/touch $out
   '';

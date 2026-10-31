@@ -386,6 +386,7 @@ struct State {
     configured: bool,
     size: (u32, u32),
     dirty: bool,
+    color_by_type: bool,
     capture_manager: Option<capture::ZwlrScreencopyManagerV1>,
     pointer_manager: Option<pointers::ZwlrVirtualPointerManagerV1>,
     shortcuts: Vec<shortcut::HyprlandGlobalShortcutV1>,
@@ -440,6 +441,7 @@ impl State {
             configured: false,
             size: (1, 1),
             dirty: false,
+            color_by_type: false,
             capture_manager: None,
             pointer_manager: None,
             shortcuts: vec![],
@@ -598,7 +600,8 @@ impl State {
             loading = Session::hints(w as i32, h as i32, vec![]);
             &loading
         };
-        let pixels = super::draw::render(session, self.background.as_ref(), w, h)?;
+        let pixels =
+            super::draw::render(session, self.background.as_ref(), w, h, self.color_by_type)?;
         let expected = w as usize * h as usize * 4;
         if pixels.len() != expected {
             return Err("renderer returned wrong buffer size".into());
@@ -680,6 +683,7 @@ pub fn run(config: Config, control: UnixDatagram) -> Result<(), String> {
     let qh = queue.handle();
     let mut state = State::new(&globals, &qh)?;
     state.input_enabled = true;
+    state.color_by_type = config.color_by_type;
     state.capture_manager = Some(globals.bind(&qh, 3..=3, ()).map_err(error)?);
     state.pointer_manager = Some(globals.bind(&qh, 2..=2, ()).map_err(error)?);
     let manager: shortcuts::HyprlandGlobalShortcutsManagerV1 =
@@ -734,7 +738,7 @@ pub fn run(config: Config, control: UnixDatagram) -> Result<(), String> {
                             }
                             "status" => {
                                 if let Some(path) = address.as_pathname() {
-                                    let reply = json!({"active":state.mode.is_some(),"locked":state.locked,"loading":!state.finishing && (state.capture.is_some()||(state.mode.is_some()&&state.session.is_none())),"no_click":config.no_click,"flat":config.flat,
+                                    let reply = json!({"active":state.mode.is_some(),"locked":state.locked,"loading":!state.finishing && (state.capture.is_some()||(state.mode.is_some()&&state.session.is_none())),"no_click":config.no_click,"flat":config.flat,"color_by_type":config.color_by_type,
                                         "mode":state.mode.map(|m| match m { Mode::Hints => "hints", Mode::Grid => "grid" }),
                                         "output":state.geometry.as_ref().map(|g| &g.output.name),
                                         "session_count":state.session_count,"finishing":state.finishing,
