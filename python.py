@@ -1337,57 +1337,100 @@ class ViselDetector:
                         break
 
         if collapse_paragraphs and include_text:
-            tb_indices = [
-                i
-                for i, rb in enumerate(rem_rbs)
-                if rb[5] == "text_block"
-                or (
-                    rb[5] == "text_link"
-                    and any(
-                        rb2[5] == "text_block"
-                        and 0 <= abs(rb[1] - (rb2[1] + rb2[3])) <= max(12, int(14 * s))
-                        and abs(rb[0] - rb2[0]) <= max(10, int(12 * s))
-                        and abs(rb[3] - rb2[3]) <= 6
-                        for rb2 in rem_rbs
-                    )
-                )
+            # User-Designed Structural Paragraph Engine:
+            # 1. Consolidate collinear same-line fragments (inline links, highlighted terms, badges on same row)
+            line_consolidated = []
+            rem_rbs.sort(key=lambda b: (b[1], b[0]))
+            used_cons = set()
+            for i, rbi in enumerate(rem_rbs):
+                if i in used_cons:
+                    continue
+                if rbi[5] not in ("text_block", "text_link", "inline_link"):
+                    line_consolidated.append(rbi)
+                    continue
+                same_row = [i]
+                used_cons.add(i)
+                for j in range(i + 1, len(rem_rbs)):
+                    if j in used_cons:
+                        continue
+                    rbj = rem_rbs[j]
+                    if rbj[5] not in ("text_block", "text_link", "inline_link"):
+                        continue
+                    v_overlap = min(rbi[1] + rbi[3], rbj[1] + rbj[3]) - max(rbi[1], rbj[1])
+                    h_gap = rbj[0] - max(rem_rbs[k][0] + rem_rbs[k][2] for k in same_row)
+                    # Collinear if high vertical overlap on same baseline and reasonable word/tag gap
+                    if v_overlap >= 0.70 * min(rbi[3], rbj[3]) and 0 <= h_gap <= max(18, int(1.8 * L_0)):
+                        # Check no vertical barrier cuts between them
+                        if not np.any(v_pure_gray[max(rbi[1], rbj[1]):min(rbi[1]+rbi[3], rbj[1]+rbj[3]), rbj[0]-h_gap:rbj[0]].mean(axis=0) >= 0.55):
+                            same_row.append(j)
+                            used_cons.add(j)
+                if len(same_row) == 1:
+                    line_consolidated.append(rbi)
+                else:
+                    lx = min(rem_rbs[k][0] for k in same_row)
+                    ly = min(rem_rbs[k][1] for k in same_row)
+                    lw = max(rem_rbs[k][0] + rem_rbs[k][2] for k in same_row) - lx
+                    lh = max(rem_rbs[k][1] + rem_rbs[k][3] for k in same_row) - ly
+                    c_hints = generate_vimium_hints(len(same_row))
+                    frag_children = [
+                        make_child_dict(
+                            rem_rbs[k][0], rem_rbs[k][1], rem_rbs[k][2], rem_rbs[k][3],
+                            rem_rbs[k][4], rem_rbs[k][5], "word" if rem_rbs[k][5] != "inline_link" else "control",
+                            c_hints[ci], rem_rbs[k][7]
+                        )
+                        for ci, k in enumerate(same_row)
+                    ]
+                    line_consolidated.append([lx, ly, lw, lh, 0.85, "text_block", "line", frag_children])
+
+            rem_rbs = line_consolidated
+
+            # 2. Structural Paragraph Chaining (Straight left edge, uniform line height, uniform vertical pitch, ragged right)
+            text_line_indices = [
+                i for i, rb in enumerate(rem_rbs)
+                if rb[5] in ("text_block", "text_link") and rb[2] >= int(3.5 * L_0) and rb[3] <= int(2.4 * L_0)
             ]
-            tb_indices.sort(key=lambda idx: (rem_rbs[idx][1], rem_rbs[idx][0]))
+            text_line_indices.sort(key=lambda idx: (rem_rbs[idx][1], rem_rbs[idx][0]))
             merged_tb = set()
             para_rbs = []
-            for idx in tb_indices:
+
+            for idx in text_line_indices:
                 if idx in merged_tb:
                     continue
                 chain_tb = [idx]
                 merged_tb.add(idx)
                 curr = rem_rbs[idx]
-                for idx2 in tb_indices:
+                curr_left = curr[0]
+                curr_h = curr[3]
+                prev_pitch = None
+
+                for idx2 in text_line_indices:
                     if idx2 in merged_tb:
                         continue
                     cand = rem_rbs[idx2]
+                    # Invariant 1: Straight left edge (margin alignment within 9px / 0.45*L0)
+                    left_diff = abs(cand[0] - curr_left)
+                    # Invariant 2: Similar text line height (within 5px / 0.25*L0)
+                    h_diff = abs(cand[3] - curr_h)
+                    # Invariant 3: Tight, uniform vertical gutter
                     v_gap = cand[1] - (curr[1] + curr[3])
-                    if 0 <= v_gap <= max(12, int(14 * s)) and abs(cand[0] - curr[0]) <= max(12, int(14 * s)):
-                        chain_tb.append(idx2)
-                        merged_tb.add(idx2)
-                        curr = cand
+
+                    if left_diff <= max(9, int(0.48 * L_0)) and h_diff <= max(5, int(0.25 * L_0)):
+                        if 1 <= v_gap <= max(14, int(0.78 * L_0)):
+                            pitch = v_gap
+                            if prev_pitch is None or abs(pitch - prev_pitch) <= max(4, int(0.24 * L_0)):
+                                # Invariant 4: No horizontal structural divider line cutting through the paragraph
+                                if not np.any(h_pure_gray[curr[1]+curr[3]:cand[1], min(curr[0], cand[0]):min(curr[0]+curr[2], cand[0]+cand[2])].mean(axis=1) >= 0.55):
+                                    chain_tb.append(idx2)
+                                    merged_tb.add(idx2)
+                                    prev_pitch = pitch
+                                    curr = cand
+                                    curr_left = int(round(np.median([rem_rbs[k][0] for k in chain_tb])))
+
                 if len(chain_tb) >= 2:
                     px = min(rem_rbs[k][0] for k in chain_tb)
                     py = min(rem_rbs[k][1] for k in chain_tb)
                     pw = max(rem_rbs[k][0] + rem_rbs[k][2] for k in chain_tb) - px
                     ph = max(rem_rbs[k][1] + rem_rbs[k][3] for k in chain_tb) - py
-                    chain_set = set(chain_tb)
-                    has_intruder = any(
-                        m not in chain_set
-                        and rem_rbs[m][5] not in ("inline_link",)
-                        and max(0, min(px + pw, rem_rbs[m][0] + rem_rbs[m][2]) - max(px, rem_rbs[m][0]))
-                        * max(0, min(py + ph, rem_rbs[m][1] + rem_rbs[m][3]) - max(py, rem_rbs[m][1]))
-                        > 0
-                        for m in range(len(rem_rbs))
-                    )
-                    if has_intruder:
-                        for k in chain_tb:
-                            para_rbs.append(rem_rbs[k])
-                        continue
                     l_hints = generate_vimium_hints(len(chain_tb))
                     line_children = [
                         make_child_dict(
@@ -1403,10 +1446,11 @@ class ViselDetector:
                         )
                         for li, k in enumerate(chain_tb)
                     ]
-                    para_rbs.append([px, py, pw, ph, 0.80, "text_block", "paragraph", line_children])
+                    para_rbs.append([px, py, pw, ph, 0.82, "text_block", "paragraph", line_children])
                 else:
                     para_rbs.append(rem_rbs[idx])
-            tb_set = set(tb_indices)
+
+            tb_set = set(text_line_indices)
             rem_rbs = [rb for i, rb in enumerate(rem_rbs) if i not in tb_set] + para_rbs
 
         # Sibling Rail Normalization
