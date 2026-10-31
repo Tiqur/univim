@@ -17,6 +17,7 @@ const OUTLINE: Scalar = Scalar::new(70., 220., 70., 220.);
 const LABEL_FONT: i32 = imgproc::FONT_HERSHEY_SIMPLEX;
 const LABEL_SCALE: f64 = 0.48;
 const LABEL_THICKNESS: i32 = 1;
+const LABEL_BOLD_THICKNESS: i32 = 2;
 const LABEL_PAD_X: i32 = 3;
 const LABEL_PAD_Y: i32 = 2;
 
@@ -113,8 +114,9 @@ fn tag(m: &mut Mat, value: &str, x: i32, y: i32, highlight: usize) -> opencv::Re
         imgproc::LINE_AA,
         false,
     )?;
-    // Emphasis uses color rather than a thicker stroke, which stays legible at
-    // small sizes. The prefix is laid out at the same origin as the full label.
+    // The prefix is laid out at the same origin as the full label. A single
+    // heavier stroke gives the typed characters a little extra weight without
+    // applying bold to every label.
     if highlight > 0 {
         let prefix: String = value.chars().take(highlight).collect();
         imgproc::put_text(
@@ -124,7 +126,7 @@ fn tag(m: &mut Mat, value: &str, x: i32, y: i32, highlight: usize) -> opencv::Re
             LABEL_FONT,
             LABEL_SCALE,
             BLACK,
-            LABEL_THICKNESS,
+            LABEL_BOLD_THICKNESS,
             imgproc::LINE_AA,
             false,
         )?;
