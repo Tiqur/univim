@@ -154,8 +154,8 @@ def fixtures(quick):
         for col in range(20):
             text(dense, "Menu", 14 + col * 71, 30 + row * 58, 0.43)
     yield "dense-hints", dense
-    # Borderless rounded pills exercise Stage 2B fill-contrast peeling, including
-    # pill-width limits, stroke minima, interior flatness and ring flatness.
+    # Borderless rounded pills exercise contour-ladder recovery of controls
+    # without rectangular card borders; the ellipse has no pure H/V seed.
     pills = np.full((900, 1440, 3), 246, np.uint8)
 
     def pill(x, y, w, h, color, ink, label):
@@ -167,13 +167,9 @@ def fixtures(quick):
             cv2.circle(pills, (cx, cy), radius, color, -1)
         text(pills, label, x + 12, y + h // 2 + 5, 0.52, ink, 2)
 
-    # Ink keeps nearly the fill's green level so Stage 2B's interior green
-    # standard deviation stays low while B/R carry the glyph edge contrast.
     pill(90, 120, 190, 36, (190, 110, 40), (30, 104, 30), "Continue")
     pill(330, 124, 150, 34, (50, 140, 70), (10, 134, 10), "Apply")
     pill(540, 118, 220, 38, (180, 70, 140), (180, 64, 10), "Open all settings")
-    # An ellipse has no pure horizontal/vertical contour seed for Stage 2A, so
-    # only Stage 2B's border-pixel closing can recover it as a filled control.
     cv2.ellipse(pills, (195, 250), (95, 18), 0, 0, 360, (60, 130, 190), -1)
     text(pills, "Ellipse action", 120, 256, 0.52, (60, 124, 20), 2)
     yield "rounded-pills", pills

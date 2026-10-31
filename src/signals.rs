@@ -472,12 +472,6 @@ pub fn prepare(bgr: &Mat, options: Options) -> opencv::Result<State> {
             cnts_list.push(c);
         }
     }
-    let border_pix = threshold(
-        &grad_max,
-        (physics.border_thr + 1).max(4) as f64,
-        255.0,
-        false,
-    )?;
     let strip_w = w.min((260.0 * s) as i32);
     let border_hi = threshold(
         &Mat::roi(&grad_max, Rect::new(0, 0, strip_w, h))?.try_clone()?,
@@ -733,124 +727,6 @@ pub fn prepare(bgr: &Mat, options: Options) -> opencv::Result<State> {
             continue;
         }
         thumbs.push(t);
-    }
-
-    // Stage 2B: peel uniform-fill pills and borderless rounded buttons by
-    // comparing interior flat fill and outer-ring color.
-    let pill_edges = morph(&border_pix, imgproc::MORPH_CLOSE, &kernel(3, 3)?)?;
-    let (b_ch, g_ch, r_ch) = (channels.get(0)?, channels.get(1)?, channels.get(2)?);
-    for pc in contours(&pill_edges, imgproc::RETR_EXTERNAL)? {
-        if pc.len() < 4 {
-            continue;
-        }
-        let bb = imgproc::bounding_rect(&pc)?;
-        let (px, py, pw, ph) = (bb.x, bb.y, bb.width, bb.height);
-        if ph < min_frame_h
-            || ph > (2.6 * l0) as i32
-            || pw < (1.6 * l0) as i32
-            || pw > (15.0 * l0) as i32
-            || (pw as f64) < ph as f64 * 1.45
-        {
-            continue;
-        }
-        if imgproc::contour_area(&pc, false)? < (pw * ph) as f64 * 0.74 {
-            continue;
-        }
-        let inner_st = count(&stroke_18, px + 4, py + 3, px + pw - 4, py + ph - 3)?;
-        if inner_st < 6.max((((pw - 8) * (ph - 6)) as f64 * 0.015) as i32) {
-            continue;
-        }
-        let (ix1, iy1, ix2, iy2) = (px + 3, py + 2, px + pw - 3, py + ph - 2);
-        let mut in_flat = Vec::new();
-        for yy in iy1..iy2 {
-            let row = flat_pix.at_row::<u8>(yy)?;
-            for xx in ix1..ix2 {
-                in_flat.push(row[xx as usize] > 0);
-            }
-        }
-        let in_size = ((ix2 - ix1) * (iy2 - iy1)).max(1);
-        if (in_flat.iter().filter(|&&v| v).count() as f64) < 0.32 * in_size as f64 {
-            continue;
-        }
-        let vals: Vec<u8> = in_flat
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &keep)| {
-                if !keep {
-                    return None;
-                }
-                let yy = iy1 + (i / (ix2 - ix1) as usize) as i32;
-                let xx = ix1 + (i % (ix2 - ix1) as usize) as i32;
-                g_ch.at_2d::<u8>(yy, xx).ok().copied()
-            })
-            .collect();
-        let g_mean = vals.iter().map(|&v| v as f64).sum::<f64>() / vals.len().max(1) as f64;
-        let g_std = (vals
-            .iter()
-            .map(|&v| (v as f64 - g_mean) * (v as f64 - g_mean))
-            .sum::<f64>()
-            / vals.len().max(1) as f64)
-            .sqrt();
-        if g_std > 9.5 {
-            continue;
-        }
-        let (oy1, oy2) = ((py - 4).max(0), (py + ph + 4).min(h));
-        let (ox1, ox2) = ((px - 4).max(0), (px + pw + 4).min(w));
-        let mut ring_total = 0_u64;
-        let mut ring_flat = 0_u64;
-        for yy in oy1..oy2 {
-            let flat_row = flat_pix.at_row::<u8>(yy)?;
-            for xx in ox1..ox2 {
-                if yy >= py && yy < py + ph && xx >= px && xx < px + pw {
-                    continue;
-                }
-                ring_total += 1;
-                if flat_row[xx as usize] > 0 {
-                    ring_flat += 1;
-                }
-            }
-        }
-        if (ring_flat as f64) < 0.45 * ring_total as f64 {
-            continue;
-        }
-        let mut in_b = Vec::new();
-        let mut in_g = Vec::new();
-        let mut in_r = Vec::new();
-        let mut ring_b = Vec::new();
-        let mut ring_g = Vec::new();
-        let mut ring_r = Vec::new();
-        for yy in oy1..oy2 {
-            let fb = b_ch.at_row::<u8>(yy)?;
-            let fg = g_ch.at_row::<u8>(yy)?;
-            let fr = r_ch.at_row::<u8>(yy)?;
-            let flat_row = flat_pix.at_row::<u8>(yy)?;
-            for xx in ox1..ox2 {
-                let interior = yy >= py && yy < py + ph && xx >= px && xx < px + pw;
-                if interior {
-                    if yy >= iy1 && yy < iy2 && xx >= ix1 && xx < ix2 {
-                        let i = (yy - iy1) as usize * (ix2 - ix1) as usize + (xx - ix1) as usize;
-                        if in_flat[i] {
-                            in_b.push(fb[xx as usize]);
-                            in_g.push(fg[xx as usize]);
-                            in_r.push(fr[xx as usize]);
-                        }
-                    }
-                } else if flat_row[xx as usize] > 0 {
-                    ring_b.push(fb[xx as usize]);
-                    ring_g.push(fg[xx as usize]);
-                    ring_r.push(fr[xx as usize]);
-                }
-            }
-        }
-        if in_b.is_empty() || ring_b.is_empty() {
-            continue;
-        }
-        let db = median_u8(&in_b) - median_u8(&ring_b);
-        let dg = median_u8(&in_g) - median_u8(&ring_g);
-        let dr = median_u8(&in_r) - median_u8(&ring_r);
-        if (db * db + dg * dg + dr * dr).sqrt() >= 11.0 {
-            raw_frames.push(Target::new(px, py, pw, ph, 0.93, "frame", "control"));
-        }
     }
 
     raw_frames.sort_by_key(|f| std::cmp::Reverse(f.area()));

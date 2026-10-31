@@ -2,7 +2,7 @@
 //!
 //! Each proposal is cropped to its ink, then recursively split at horizontal
 //! whitespace bands, isolated separators, large column gaps, blue accent
-//! boundaries, or with multi-trial consensus sub-blocks. Splitting precedes
+//! boundaries, or with single-pass balanced sub-blocks. Splitting precedes
 //! texture rejection and classification so unrelated controls joined by coarse
 //! morphology can survive independently. The order of these decisions, their
 //! thresholds, and first-match tie handling follow the Python detector; changing
@@ -60,99 +60,6 @@ fn median_f64(values: &mut [f64]) -> Option<f64> {
     } else {
         (values[n / 2 - 1] + values[n / 2]) / 2.0
     })
-}
-
-type TrialBox = (i32, i32, i32, i32, f64);
-type WbfClusterItem = (i32, i32, i32, i32, f64, usize);
-
-/// Weighted Box Fusion keeps sub-boxes supported by multiple parameter regimes
-/// and averages their coordinates by boundary-sharpness weight.
-fn wbf_fuse_trials(
-    trial_lists: &[Vec<TrialBox>],
-    min_votes: usize,
-    iou_thr: f64,
-) -> Vec<(i32, i32, i32, i32)> {
-    let mut clusters: Vec<Vec<WbfClusterItem>> = Vec::new();
-    for (t_idx, boxes) in trial_lists.iter().enumerate() {
-        for &(bx, by, bw, bh, bscore) in boxes {
-            let b_area = (bw * bh).max(1) as f64;
-            let mut best_ci = None;
-            let mut best_iou = 0.0;
-            for (ci, cluster) in clusters.iter().enumerate() {
-                let weight: f64 = cluster.iter().map(|item| item.4).sum();
-                let cx = cluster
-                    .iter()
-                    .map(|item| item.0 as f64 * item.4)
-                    .sum::<f64>()
-                    / weight;
-                let cy = cluster
-                    .iter()
-                    .map(|item| item.1 as f64 * item.4)
-                    .sum::<f64>()
-                    / weight;
-                let cw = cluster
-                    .iter()
-                    .map(|item| item.2 as f64 * item.4)
-                    .sum::<f64>()
-                    / weight;
-                let ch = cluster
-                    .iter()
-                    .map(|item| item.3 as f64 * item.4)
-                    .sum::<f64>()
-                    / weight;
-                let inter = ((bx as f64 + bw as f64).min(cx + cw) - (bx as f64).max(cx)).max(0.0)
-                    * ((by as f64 + bh as f64).min(cy + ch) - (by as f64).max(cy)).max(0.0);
-                let iou = inter / (b_area + cw * ch - inter + 1e-5);
-                if iou >= iou_thr && iou > best_iou {
-                    best_iou = iou;
-                    best_ci = Some(ci);
-                }
-            }
-            if let Some(ci) = best_ci {
-                clusters[ci].push((bx, by, bw, bh, bscore, t_idx));
-            } else {
-                clusters.push(vec![(bx, by, bw, bh, bscore, t_idx)]);
-            }
-        }
-    }
-    let mut fused = Vec::new();
-    for cluster in clusters {
-        let unique_trials = cluster
-            .iter()
-            .map(|item| item.5)
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        let max_sc = cluster.iter().map(|item| item.4).fold(0.0, f64::max);
-        if unique_trials >= min_votes || max_sc >= 1.35 {
-            let weight: f64 = cluster.iter().map(|item| item.4).sum();
-            let fx = (cluster
-                .iter()
-                .map(|item| item.0 as f64 * item.4)
-                .sum::<f64>()
-                / weight)
-                .round_ties_even() as i32;
-            let fy = (cluster
-                .iter()
-                .map(|item| item.1 as f64 * item.4)
-                .sum::<f64>()
-                / weight)
-                .round_ties_even() as i32;
-            let fw = (cluster
-                .iter()
-                .map(|item| item.2 as f64 * item.4)
-                .sum::<f64>()
-                / weight)
-                .round_ties_even() as i32;
-            let fh = (cluster
-                .iter()
-                .map(|item| item.3 as f64 * item.4)
-                .sum::<f64>()
-                / weight)
-                .round_ties_even() as i32;
-            fused.push((fx, fy, fw, fh));
-        }
-    }
-    fused
 }
 
 pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target>, Vec<Target>)> {
@@ -521,82 +428,55 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
                 rh <= (4.2 * l0) as i32 && rw <= (38.0 * l0) as i32 && col_span >= 0.42;
             if !is_giant_heading {
                 if depth <= 6 {
-                    // Multi-regime trial consensus for large 2-D blocks: fine,
-                    // balanced, and cohesive stroke closures are fused by vote.
-                    let trial_params = [
-                        (
-                            20.max((state.stroke_thr as f64 * 1.25) as i32),
-                            6.max((0.48 * l0) as i32),
-                            2,
-                        ),
-                        (
-                            24.max((state.stroke_thr as f64 * 1.55) as i32),
-                            8.max((0.65 * l0) as i32),
-                            2,
-                        ),
-                        (
-                            30.max((state.stroke_thr as f64 * 1.85) as i32),
-                            11.max((0.88 * l0) as i32),
-                            3,
-                        ),
-                    ];
-                    let mut trial_results = Vec::new();
-                    for (t_thr, kw_sub, kh_sub) in trial_params {
-                        let roi_gm = Mat::roi(&state.grad_max, core::Rect::new(rx, ry, rw, rh))?
-                            .clone_pointee();
-                        let roi_bi = Mat::roi(&state.barrier_inv, core::Rect::new(rx, ry, rw, rh))?
-                            .clone_pointee();
-                        let sub_hi = crate::and(
-                            &crate::threshold(&roi_gm, t_thr as f64, 255.0, false)?,
-                            &roi_bi,
-                        )?;
-                        let mut sub_closed = crate::morph(
+                    // Single-pass balanced decomposition for large 2-D blocks,
+                    // calibrated by the image's stroke threshold and text height.
+                    let t_thr = 24.max((state.stroke_thr as f64 * 1.55) as i32);
+                    let kw_sub = 8.max((0.65 * l0) as i32);
+                    let kh_sub = 2;
+                    let roi_gm =
+                        Mat::roi(&state.grad_max, core::Rect::new(rx, ry, rw, rh))?.clone_pointee();
+                    let roi_bi = Mat::roi(&state.barrier_inv, core::Rect::new(rx, ry, rw, rh))?
+                        .clone_pointee();
+                    let sub_hi = crate::and(
+                        &crate::threshold(&roi_gm, t_thr as f64, 255.0, false)?,
+                        &roi_bi,
+                    )?;
+                    let mut sub_closed = crate::morph(
+                        &sub_hi,
+                        imgproc::MORPH_CLOSE,
+                        &crate::kernel(kw_sub, kh_sub)?,
+                    )?;
+                    let mut raw_b = crate::bounding_boxes(&sub_closed)?;
+                    let tiny_dots = raw_b
+                        .iter()
+                        .filter(|&&(_, _, sw, sh)| {
+                            (4..=(1.7 * l0) as i32).contains(&sw)
+                                && (4..=(0.95 * l0) as i32).contains(&sh)
+                        })
+                        .count();
+                    if raw_b.len() >= 18 && tiny_dots as f64 >= 0.65 * raw_b.len() as f64 {
+                        sub_closed = crate::morph(
                             &sub_hi,
                             imgproc::MORPH_CLOSE,
-                            &crate::kernel(kw_sub, kh_sub)?,
+                            &crate::kernel(24.max((2.2 * l0) as i32), 2)?,
                         )?;
-                        let mut raw_b = crate::bounding_boxes(&sub_closed)?;
-                        let tiny_dots = raw_b
-                            .iter()
-                            .filter(|&&(_, _, sw, sh)| {
-                                (4..=(1.7 * l0) as i32).contains(&sw)
-                                    && (4..=(0.95 * l0) as i32).contains(&sh)
-                            })
-                            .count();
-                        if raw_b.len() >= 18 && tiny_dots as f64 >= 0.65 * raw_b.len() as f64 {
-                            sub_closed = crate::morph(
-                                &sub_hi,
-                                imgproc::MORPH_CLOSE,
-                                &crate::kernel(24.max((2.2 * l0) as i32), 2)?,
-                            )?;
-                            raw_b = crate::bounding_boxes(&sub_closed)?;
-                        }
-                        let mut scored = Vec::new();
-                        for &(sx, sy, sw, sh) in &raw_b {
-                            if sw >= 5
-                                && sh >= 5
-                                && ((sw * sh) as f64) < 0.82 * rw as f64 * rh as f64
-                                && sh <= (4.0 * l0) as i32
-                            {
-                                let bonus = if sh as f64 >= 0.65 * l0 && sh as f64 <= 2.4 * l0 {
-                                    1.25
-                                } else {
-                                    0.90
-                                };
-                                scored.push((sx, sy, sw, sh, bonus));
-                            }
-                        }
-                        trial_results.push(scored);
+                        raw_b = crate::bounding_boxes(&sub_closed)?;
                     }
-                    for (sx, sy, sw, sh) in wbf_fuse_trials(&trial_results, 2, 0.50) {
-                        refine_region(
-                            state,
-                            options,
-                            (rx + sx, ry + sy, sw, sh),
-                            depth + 2,
-                            refined,
-                            inner,
-                        )?;
+                    for &(sx, sy, sw, sh) in &raw_b {
+                        if sw >= 5
+                            && sh >= 5
+                            && ((sw * sh) as f64) < 0.82 * rw as f64 * rh as f64
+                            && sh <= (4.0 * l0) as i32
+                        {
+                            refine_region(
+                                state,
+                                options,
+                                (rx + sx, ry + sy, sw, sh),
+                                depth + 2,
+                                refined,
+                                inner,
+                            )?;
+                        }
                     }
                 }
                 return Ok(());
