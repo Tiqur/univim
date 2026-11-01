@@ -1,5 +1,5 @@
 use super::{
-    RuntimeSettings,
+    PointerMotion, RuntimeSettings,
     geometry::FrameGeometry,
     session::{DebugView, Mode, Session},
 };
@@ -49,7 +49,7 @@ pub fn render_session_surface(
     })
 }
 
-fn render_debug_stage_canvas(
+pub(super) fn render_debug_stage_canvas(
     base_bgr: &Mat,
     session: &Session,
     debug_data: Option<&DebugData>,
@@ -415,6 +415,13 @@ fn draw_status_pill(canvas: &mut Mat, session: &Session) -> opencv::Result<()> {
         ""
     };
     let loop_tag = if session.auto_loop() { " [LOOP]" } else { "" };
+    let scroll_tag = match session.scroll_feedback() {
+        Some((_, dy)) if dy < 0 => " [SCROLLED DOWN]",
+        Some((_, dy)) if dy > 0 => " [SCROLLED UP]",
+        Some((dx, _)) if dx < 0 => " [SCROLLED LEFT]",
+        Some((dx, _)) if dx > 0 => " [SCROLLED RIGHT]",
+        _ => "",
+    };
 
     let typed_part = if session.typed().is_empty() {
         String::from("-")
@@ -423,7 +430,7 @@ fn draw_status_pill(canvas: &mut Mat, session: &Session) -> opencv::Result<()> {
     };
 
     let status = format!(
-        "{mode_text} [{typed_part}] | {} | {cache_tag}{focus_tag}{drag_tag}{loop_tag} | ;:Act v:Drag r:Ref F6:Loop F1:Opts F2:Dbg",
+        "{mode_text} [{typed_part}] | {} | {cache_tag}{focus_tag}{drag_tag}{loop_tag}{scroll_tag} | Shift:Right Ctrl:Middle ;:Act v:Drag F1:Opts F2:Dbg",
         session.action().label()
     );
 
@@ -517,7 +524,7 @@ fn draw_debug_hud(
 
     imgproc::put_text(
         canvas,
-        "Keys [1..6] or [ / ] switch stage | F2 hide",
+        "Views 1..6 visualizations | F3/F4 cycle | F2 hide",
         Point::new(x + 12, cy),
         font,
         0.38,
@@ -571,27 +578,22 @@ fn draw_debug_hud(
 
         let stages = [
             (
-                "S1 Grad+Phys",
+                "Signal",
                 t.stage1_gradients_ms,
                 Scalar::new(255.0, 190.0, 70.0, 0.0),
             ),
             (
-                "S2 Frames",
+                "Frames",
                 t.stage2_frames_ms,
                 Scalar::new(90.0, 230.0, 110.0, 0.0),
             ),
             (
-                "S3 Strokes",
+                "Coarse",
                 t.stage3_strokes_ms,
                 Scalar::new(70.0, 210.0, 255.0, 0.0),
             ),
             (
-                "S4 Decomp2D",
-                t.stage4_decompose_ms,
-                Scalar::new(190.0, 110.0, 255.0, 0.0),
-            ),
-            (
-                "S5 Post+NMS",
+                "Recursive+Post",
                 t.stage5_post_ms,
                 Scalar::new(110.0, 140.0, 255.0, 0.0),
             ),
@@ -645,7 +647,7 @@ fn draw_options_modal(
     settings: &RuntimeSettings,
 ) -> opencv::Result<()> {
     let modal_w = 460.min(canvas.cols() - 24).max(260);
-    let modal_h = 310.min(canvas.rows() - 24).max(200);
+    let modal_h = 370.min(canvas.rows() - 24).max(200);
     let x = ((canvas.cols() - modal_w) / 2).max(8);
     let y = ((canvas.rows() - modal_h) / 2).max(8);
     let rect = Rect::new(x, y, modal_w, modal_h);
@@ -707,6 +709,15 @@ fn draw_options_modal(
         ("Spotlight Background Dim", on_off(settings.spotlight_dim)),
         ("Show Status Pill", on_off(settings.show_status_bar)),
         ("Evdev Listener (Caps)", on_off(settings.use_evdev)),
+        (
+            "Pointer Movement",
+            match settings.pointer_motion {
+                PointerMotion::Instant => "Instant".to_string(),
+                PointerMotion::Linear => "Linear".to_string(),
+                PointerMotion::EaseOut => "Ease Out".to_string(),
+            },
+        ),
+        ("Pointer Speed", format!("{} px/s", settings.pointer_speed)),
     ];
 
     for (idx, (label, val)) in rows.iter().enumerate() {

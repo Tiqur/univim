@@ -64,8 +64,10 @@ let
     double_tap_ms = settings.doubleTapMs;
     cache_ttl_ms = settings.cacheTtlMs;
     spotlight_dim = settings.spotlightDim;
-    use_evdev = cfg.hyprland.evdev;
+    use_evdev = cfg.hyprland.evdev && !cfg.hyprland.singlePressCapsLock;
     show_status_bar = true;
+    pointer_motion = settings.pointerMotion;
+    pointer_speed = settings.pointerSpeed;
   };
 
   globalBind = key: event: "${bindingKey key}, global, ${event}";
@@ -99,6 +101,20 @@ let
           ", CAPS, global, univim:caps-lock"
       ))
     );
+  singleCapsBindings = lib.optionals (cfg.hyprland.enable && cfg.hyprland.singlePressCapsLock) (
+    if luaConfiguration then
+      [
+        (luaBind ", code:66" "hl.dsp.exec_cmd(${builtins.toJSON "${desktop} hints"})")
+        (luaBind "SHIFT, code:66" "hl.dsp.exec_cmd(${builtins.toJSON "${desktop} grid"})")
+        (luaBind "ALT, code:66" "hl.dsp.exec_cmd(${builtins.toJSON "${desktop} debug-open"})")
+      ]
+    else
+      [
+        (hyprlangBind ", code:66" "${desktop} hints")
+        (hyprlangBind "SHIFT, code:66" "${desktop} grid")
+        (hyprlangBind "ALT, code:66" "${desktop} debug-open")
+      ]
+  );
 
   bindingParts = value: map lib.trim (lib.splitString "," value);
   validBinding =
@@ -258,6 +274,17 @@ in
         default = true;
         description = "Whether to dim the background screenshot so hint badges stand out.";
       };
+
+      pointerMotion = lib.mkOption {
+        type = lib.types.enum [ "instant" "linear" "ease_out" ];
+        default = "instant";
+        description = "Cursor travel after selecting a hint; ease_out and linear glide at pointerSpeed pixels per second.";
+      };
+      pointerSpeed = lib.mkOption {
+        type = lib.types.ints.between 200 6000;
+        default = 1600;
+        description = "Cursor glide speed in logical pixels per second.";
+      };
     };
 
     hyprland = {
@@ -281,6 +308,12 @@ in
         type = lib.types.bool;
         default = false;
         description = "Bind non-consuming CapsLock taps for instant hints on double-tap.";
+      };
+
+      singlePressCapsLock = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Opt-in CapsLock keycode bindings and caps:none XKB option: Caps for hints, Shift+Caps for grid, Alt+Caps for debug. Disables evdev gestures and normal CapsLock. Merge any other kb_options yourself.";
       };
 
       evdev = lib.mkOption {
@@ -348,6 +381,10 @@ in
         message = "services.univim hints and grid bindings must differ.";
       }
       {
+        assertion = !cfg.hyprland.singlePressCapsLock || (cfg.hyprland.enable && !cfg.hyprland.doubleTapCapsLock);
+        message = "services.univim.hyprland.singlePressCapsLock requires hyprland.enable and conflicts with doubleTapCapsLock.";
+      }
+      {
         assertion = sessionTarget != "";
         message = "services.univim.sessionTarget must not be empty.";
       }
@@ -356,6 +393,9 @@ in
     home.packages = [ cfg.package ];
     xdg.configFile."univim/settings.json".text = runtimeSettingsJson;
 
+    # XKB consumes the CapsLock action; binding consumption alone only prevents
+    # client delivery, not the compositor's internal lock-state update.
+    # An existing kb_options definition will conflict rather than be discarded.
     systemd.user.services.univim = {
       Unit = {
         Description = "UniVim desktop navigation";
@@ -371,12 +411,13 @@ in
       Install.WantedBy = [ sessionTarget ];
     };
 
-    wayland.windowManager.hyprland.settings =
-      lib.mkIf (hyprlandEnabled && (bindings.enable || bindings.modifierGestures || cfg.hyprland.enable))
+    wayland.windowManager.hyprland.settings = lib.mkMerge [
+      (lib.mkIf cfg.hyprland.singlePressCapsLock { input.kb_options = "caps:none"; })
+      (lib.mkIf (hyprlandEnabled && (bindings.enable || bindings.modifierGestures || cfg.hyprland.enable))
         (
           if luaConfiguration then
             {
-              bind = explicitBindings ++ gestureBindings ++ globalBindings;
+              bind = explicitBindings ++ gestureBindings ++ globalBindings ++ singleCapsBindings;
               bindn = doubleTapBindings;
             }
           else
@@ -384,12 +425,13 @@ in
               base =
                 lib.optionalAttrs bindings.enable { bind = explicitBindings; }
                 // lib.optionalAttrs bindings.modifierGestures { bindn = gestureBindings; };
-              bindList = (base.bind or [ ]) ++ globalBindings;
+              bindList = (base.bind or [ ]) ++ globalBindings ++ singleCapsBindings;
               bindnList = (base.bindn or [ ]) ++ doubleTapBindings;
             in
             base
             // lib.optionalAttrs (bindList != [ ]) { bind = bindList; }
             // lib.optionalAttrs (bindnList != [ ]) { bindn = bindnList; }
-        );
+        ))
+    ];
   };
 }

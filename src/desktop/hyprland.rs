@@ -37,6 +37,12 @@ fn query(command: &str) -> Result<Value, String> {
     serde_json::from_slice(&reply).map_err(|e| format!("Hyprland {command}: {e}"))
 }
 
+/// Global logical cursor position reported by the compositor; no subprocesses.
+pub fn cursor_position() -> Option<(f64, f64)> {
+    let pos = query("cursorpos").ok()?;
+    Some((pos["x"].as_f64()?, pos["y"].as_f64()?))
+}
+
 fn monitors() -> Result<Vec<Value>, String> {
     query("monitors")?
         .as_array()

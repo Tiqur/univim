@@ -1,23 +1,17 @@
-//! Optional passive Linux keyboard listener for double-CapsLock gestures and
-//! `/dev/uinput` scroll wheel injection.
+//! Optional passive Linux keyboard listener for double-CapsLock gestures.
 use super::session::{GestureKey, TapEvent, TapTracker};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd},
+        fd::{AsFd, BorrowedFd},
         unix::fs::OpenOptionsExt,
     },
     path::PathBuf,
     time::Duration,
 };
 
-const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
-const EV_REL: u16 = 0x02;
-const SYN_REPORT: u16 = 0x00;
-const REL_HWHEEL: u16 = 0x06;
-const REL_WHEEL: u16 = 0x08;
 
 const KEY_LEFTSHIFT: u16 = 42;
 const KEY_RIGHTSHIFT: u16 = 54;
@@ -46,7 +40,6 @@ pub struct EvdevKeyboardSet {
     ctrl_down: u8,
     alt_down: u8,
     meta_down: u8,
-    uinput: Option<UinputEmitter>,
 }
 
 impl EvdevKeyboardSet {
@@ -69,7 +62,6 @@ impl EvdevKeyboardSet {
             ctrl_down: 0,
             alt_down: 0,
             meta_down: 0,
-            uinput: UinputEmitter::open().ok(),
         }
     }
 
@@ -83,16 +75,6 @@ impl EvdevKeyboardSet {
 
     pub fn files(&self) -> &[File] {
         &self.devices
-    }
-
-    /// Emit synthetic mouse wheel scroll ticks via `/dev/uinput` (`REL_WHEEL` / `REL_HWHEEL`).
-    /// Returns `true` if the event was injected via `/dev/uinput`.
-    pub fn emit_scroll(&mut self, dx: i32, dy: i32) -> bool {
-        if let Some(uinput) = self.uinput.as_mut() {
-            uinput.emit_wheel(dx, dy).is_ok()
-        } else {
-            false
-        }
     }
 
     /// Drain all pending kernel input events across opened devices and feed them into `TapTracker`.
@@ -177,107 +159,6 @@ impl EvdevKeyboardSet {
 
     pub fn first_fd(&self) -> Option<BorrowedFd<'_>> {
         self.devices.first().map(AsFd::as_fd)
-    }
-}
-
-/// Lightweight `/dev/uinput` virtual keyboard + scroll wheel emitter.
-struct UinputEmitter {
-    file: File,
-}
-
-#[repr(C)]
-struct UinputSetup {
-    id: [u16; 4],
-    name: [u8; 80],
-    ff_effects_max: u32,
-}
-
-impl UinputEmitter {
-    fn open() -> std::io::Result<Self> {
-        let path = if PathBuf::from("/dev/uinput").exists() {
-            "/dev/uinput"
-        } else {
-            "/dev/input/uinput"
-        };
-        let file = OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)?;
-        let fd = file.as_raw_fd();
-
-        // Constants from <linux/uinput.h>
-        const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
-        const UI_SET_RELBIT: libc::c_ulong = 0x4004_5566;
-        const UI_DEV_SETUP: libc::c_ulong = 0x405c_5503;
-        const UI_DEV_CREATE: libc::c_ulong = 0x5501;
-
-        unsafe {
-            if libc::ioctl(fd, UI_SET_EVBIT, libc::c_int::from(EV_KEY)) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::ioctl(fd, UI_SET_EVBIT, libc::c_int::from(EV_REL)) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::ioctl(fd, UI_SET_RELBIT, libc::c_int::from(REL_WHEEL)) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::ioctl(fd, UI_SET_RELBIT, libc::c_int::from(REL_HWHEEL)) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-
-            let mut setup = UinputSetup {
-                id: [0x03, 0x1209, 0x5556, 1],
-                name: [0u8; 80],
-                ff_effects_max: 0,
-            };
-            let label = b"univim-uinput-helper";
-            setup.name[..label.len()].copy_from_slice(label);
-
-            if libc::ioctl(fd, UI_DEV_SETUP, &setup as *const UinputSetup) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::ioctl(fd, UI_DEV_CREATE) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-
-        Ok(Self { file })
-    }
-
-    fn write_event(&mut self, type_: u16, code: u16, value: i32) -> std::io::Result<()> {
-        let ev = RawInputEvent {
-            tv_sec: 0,
-            tv_usec: 0,
-            type_,
-            code,
-            value,
-        };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&ev as *const RawInputEvent) as *const u8,
-                std::mem::size_of::<RawInputEvent>(),
-            )
-        };
-        self.file.write_all(bytes)
-    }
-
-    fn emit_wheel(&mut self, dx: i32, dy: i32) -> std::io::Result<()> {
-        if dy != 0 {
-            self.write_event(EV_REL, REL_WHEEL, dy)?;
-        }
-        if dx != 0 {
-            self.write_event(EV_REL, REL_HWHEEL, dx)?;
-        }
-        self.write_event(EV_SYN, SYN_REPORT, 0)
-    }
-}
-
-impl Drop for UinputEmitter {
-    fn drop(&mut self) {
-        const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
-        unsafe {
-            let _ = libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY);
-        }
     }
 }
 

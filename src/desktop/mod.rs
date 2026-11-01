@@ -24,6 +24,7 @@ pub use wayland::{capture_snapshot, check, run_daemon};
 pub enum CommandAction {
     Hints,
     Grid,
+    DebugOpen,
     TapCaps,
     ToggleDebug,
     ToggleOptions,
@@ -35,6 +36,7 @@ impl CommandAction {
         match self {
             Self::Hints => "hints\n",
             Self::Grid => "grid\n",
+            Self::DebugOpen => "debug-open\n",
             Self::TapCaps => "tap-caps\n",
             Self::ToggleDebug => "toggle-debug\n",
             Self::ToggleOptions => "toggle-options\n",
@@ -46,6 +48,7 @@ impl CommandAction {
         match text.trim() {
             "hints" => Some(Self::Hints),
             "grid" => Some(Self::Grid),
+            "debug-open" => Some(Self::DebugOpen),
             "tap-caps" | "tap_caps" | "caps" => Some(Self::TapCaps),
             "toggle-debug" | "debug" => Some(Self::ToggleDebug),
             "toggle-options" | "options" => Some(Self::ToggleOptions),
@@ -82,6 +85,23 @@ pub struct RuntimeSettings {
     pub use_evdev: bool,
     /// Whether to show the status & telemetry pill at the top-left of the overlay.
     pub show_status_bar: bool,
+    #[serde(default)]
+    pub pointer_motion: PointerMotion,
+    #[serde(default = "default_pointer_speed")]
+    pub pointer_speed: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerMotion {
+    #[default]
+    Instant,
+    Linear,
+    EaseOut,
+}
+
+fn default_pointer_speed() -> u32 {
+    1600
 }
 
 fn default_timeout_secs() -> u64 {
@@ -101,12 +121,14 @@ impl Default for RuntimeSettings {
             spotlight_dim: true,
             use_evdev: true,
             show_status_bar: true,
+            pointer_motion: PointerMotion::Instant,
+            pointer_speed: default_pointer_speed(),
         }
     }
 }
 
 impl RuntimeSettings {
-    pub const OPTION_COUNT: usize = 9;
+    pub const OPTION_COUNT: usize = 11;
 
     pub fn config_path() -> PathBuf {
         if let Some(cfg) = env::var_os("XDG_CONFIG_HOME") {
@@ -163,6 +185,20 @@ impl RuntimeSettings {
             6 => self.spotlight_dim = !self.spotlight_dim,
             7 => self.show_status_bar = !self.show_status_bar,
             8 => self.use_evdev = !self.use_evdev,
+            9 => {
+                self.pointer_motion = match (self.pointer_motion, delta.signum()) {
+                    (PointerMotion::Instant, 1) | (PointerMotion::EaseOut, -1) => {
+                        PointerMotion::Linear
+                    }
+                    (PointerMotion::Linear, 1) => PointerMotion::EaseOut,
+                    (PointerMotion::Linear, -1) => PointerMotion::Instant,
+                    _ => self.pointer_motion,
+                }
+            }
+            10 => {
+                self.pointer_speed =
+                    (self.pointer_speed as i64 + delta as i64 * 200).clamp(200, 6000) as u32
+            }
             _ => {}
         }
     }

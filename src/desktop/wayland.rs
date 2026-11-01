@@ -1,5 +1,5 @@
 use super::{
-    CommandAction, RuntimeSettings,
+    CommandAction, PointerMotion, RuntimeSettings,
     draw::{RenderedSurface, render_session_surface},
     evdev::EvdevKeyboardSet,
     geometry::FrameGeometry,
@@ -488,6 +488,7 @@ struct DaemonState {
     overlay: Option<ActiveOverlay>,
     layer: Option<OverlayLayer>,
     pending_click: Option<PendingClick>,
+    pointer_glide: Option<PointerGlide>,
     pending_re_capture: Option<PendingReCapture>,
     sync_pending: bool,
     should_exit: bool,
@@ -633,6 +634,47 @@ struct PendingClick {
     drag_from: Option<(u32, u32)>,
 }
 
+struct PointerGlide {
+    pointer: ZwlrVirtualPointerV1,
+    click: PendingClick,
+    from: (u32, u32),
+    started: Instant,
+    duration: Duration,
+    curve: PointerMotion,
+}
+
+fn glide_fraction(elapsed: Duration, duration: Duration, curve: PointerMotion) -> f64 {
+    let t = (elapsed.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
+    match curve {
+        PointerMotion::EaseOut => 1.0 - (1.0 - t).powi(3),
+        _ => t,
+    }
+}
+
+#[cfg(test)]
+mod glide_tests {
+    use super::{PointerMotion, glide_fraction};
+    use std::time::Duration;
+
+    #[test]
+    fn linear_and_ease_out_reach_target_without_overshooting() {
+        let duration = Duration::from_millis(100);
+        let halfway = Duration::from_millis(50);
+        assert_eq!(
+            glide_fraction(halfway, duration, PointerMotion::Linear),
+            0.5
+        );
+        assert_eq!(
+            glide_fraction(halfway, duration, PointerMotion::EaseOut),
+            0.875
+        );
+        assert_eq!(
+            glide_fraction(Duration::from_secs(2), duration, PointerMotion::EaseOut),
+            1.0
+        );
+    }
+}
+
 struct PendingReCapture {
     scroll: Option<(i32, i32)>,
     settle_until: Option<Instant>,
@@ -711,6 +753,7 @@ impl DaemonState {
             overlay: None,
             layer: None,
             pending_click: None,
+            pointer_glide: None,
             pending_re_capture: None,
             sync_pending: false,
             should_exit: false,
@@ -771,7 +814,10 @@ impl DaemonState {
     }
 
     fn has_async_work(&self) -> bool {
-        self.inflight_job.is_some() || self.capture.is_some() || self.pending_re_capture.is_some()
+        self.inflight_job.is_some()
+            || self.capture.is_some()
+            || self.pending_re_capture.is_some()
+            || self.pointer_glide.is_some()
     }
 
     fn is_auto_loop_active(&self) -> bool {
@@ -910,6 +956,13 @@ impl DaemonState {
                 }
                 return Ok(());
             }
+            CommandAction::DebugOpen => {
+                if self.overlay.is_some() {
+                    self.close_overlay();
+                }
+                self.debug_on_present = true;
+                return self.activate_hints_with_cache(qh);
+            }
             CommandAction::ToggleOptions => {
                 if let Some(overlay) = self.overlay.as_mut() {
                     let _ = overlay.session.handle_input(Input::ToggleOptionsMenu);
@@ -1013,7 +1066,7 @@ impl DaemonState {
                 false
             };
             if let Some((dx, dy)) = pending_scroll {
-                self.inject_scroll(dx, dy);
+                self.inject_scroll(dx, dy, qh);
                 if let Some(pending) = self.pending_re_capture.as_mut() {
                     pending.settle_until = Some(Instant::now() + Duration::from_millis(45));
                 }
@@ -1066,6 +1119,7 @@ impl DaemonState {
         {
             self.emit_virtual_action(click, qh);
         }
+        self.advance_pointer_glide();
 
         Ok(())
     }
@@ -1158,7 +1212,7 @@ impl DaemonState {
         };
 
         if capture.purpose == CapturePurpose::Snapshot {
-            let (targets, timings) = crate::detect(&upright_bgr, self.settings.detector)
+            let (targets, debug, _) = detect_with_debug(&upright_bgr, self.settings.detector, true)
                 .map_err(|err| format!("detector failed: {err}"))?;
             let targets = if self.settings.flat {
                 crate::flatten_leaves(&targets).unwrap_or(targets)
@@ -1166,6 +1220,13 @@ impl DaemonState {
                 targets
             };
             let rendered = crate::render::hierarchy_overlay(&upright_bgr, &targets)?;
+            let timings = serde_json::json!({
+                "signal_ms": debug.timings.stage1_gradients_ms,
+                "frames_ms": debug.timings.stage2_frames_ms,
+                "coarse_ms": debug.timings.stage3_strokes_ms,
+                "recursive_ms": debug.timings.stage5_post_ms,
+                "total_ms": debug.timings.total_ms,
+            });
             let directory = self
                 .snapshot_dir
                 .as_deref()
@@ -1176,6 +1237,7 @@ impl DaemonState {
                 &targets,
                 &capture.output.as_output(),
                 &timings,
+                &debug,
                 self.settings.detector,
                 directory,
             )?;
@@ -1289,6 +1351,11 @@ impl DaemonState {
     /// Unmap the layer-shell surface, wait for compositor sync, optionally inject scroll,
     /// and re-capture the screen cleanly without capturing the overlay itself.
     fn begin_overlay_re_capture(&mut self, scroll: Option<(i32, i32)>, qh: &QueueHandle<Self>) {
+        if let Some((dx, dy)) = scroll
+            && let Some(overlay) = self.overlay.as_mut()
+        {
+            overlay.session.mark_scrolled(dx, dy);
+        }
         self.destroy_layer_only();
         self.pending_re_capture = Some(PendingReCapture {
             scroll,
@@ -1298,9 +1365,51 @@ impl DaemonState {
         self.sync_pending = true;
     }
 
-    fn inject_scroll(&mut self, dx: i32, dy: i32) {
-        if self.evdev.emit_scroll(dx, dy) {}
-        // Fallback if `/dev/uinput` is not writable: scroll works automatically when user adds uinput permissions
+    fn inject_scroll(&mut self, dx: i32, dy: i32, qh: &QueueHandle<Self>) {
+        // The virtual pointer is already required for clicking. Using it for
+        // wheel events avoids both /dev/uinput permission failures and scrolling
+        // the wrong window when the current pointer is outside the focused one.
+        let Some(overlay) = self.overlay.as_ref() else {
+            return;
+        };
+        let output = &overlay.output;
+        let pointer = self
+            .virtual_pointer_manager
+            .create_virtual_pointer_with_output(
+                self.seat.as_ref(),
+                Some(&output.wl_output),
+                qh,
+                (),
+            );
+        let (logical_w, logical_h) = output.resolved_logical_size();
+        let [fx, fy, fw, fh] = overlay.session.focused_rect().unwrap_or([
+            0,
+            0,
+            overlay.base_bgr.cols(),
+            overlay.base_bgr.rows(),
+        ]);
+        let (lx, ly) = overlay.geometry.upright_pixel_to_logical(
+            fx + fw / 2,
+            fy + fh / 2,
+            logical_w,
+            logical_h,
+        );
+        pointer.motion_absolute(
+            0,
+            lx.round() as u32,
+            ly.round() as u32,
+            logical_w as u32,
+            logical_h as u32,
+        );
+        pointer.frame();
+        if dy != 0 {
+            pointer.axis_discrete(1, wl_pointer::Axis::VerticalScroll, (-dy * 10) as f64, -dy);
+        }
+        if dx != 0 {
+            pointer.axis_discrete(1, wl_pointer::Axis::HorizontalScroll, (dx * 10) as f64, dx);
+        }
+        pointer.frame();
+        pointer.destroy();
     }
 
     fn create_overlay_layer(
@@ -1490,14 +1599,19 @@ impl DaemonState {
             }
             _ => {
                 let utf8 = xkb_state.key_get_utf8(keycode);
-                let ch_opt = utf8.chars().next().or_else(|| {
-                    let raw = sym.raw();
-                    if (0x20..=0x7e).contains(&raw) {
-                        char::from_u32(raw)
-                    } else {
-                        None
-                    }
-                });
+                // Ctrl+letter can be returned as a control character by xkb;
+                // prefer the printable keysym for shortcuts and hint actions.
+                let ch_opt = (ctrl && (0x20..=0x7e).contains(&sym.raw()))
+                    .then(|| char::from(sym.raw() as u8))
+                    .or_else(|| utf8.chars().next())
+                    .or_else(|| {
+                        let raw = sym.raw();
+                        if (0x20..=0x7e).contains(&raw) {
+                            char::from_u32(raw)
+                        } else {
+                            None
+                        }
+                    });
                 if let Some(ch) = ch_opt {
                     let lower = ch.to_ascii_lowercase();
                     let typed_empty = self
@@ -1670,6 +1784,20 @@ impl DaemonState {
     }
 
     fn emit_virtual_action(&mut self, click: PendingClick, qh: &QueueHandle<Self>) {
+        let start = hyprland::cursor_position().and_then(|(x, y)| {
+            let output = self.outputs.get(click.output_index)?.as_output();
+            let local_x = x - f64::from(output.x);
+            let local_y = y - f64::from(output.y);
+            if local_x < 0.
+                || local_y < 0.
+                || local_x >= f64::from(click.logical_width)
+                || local_y >= f64::from(click.logical_height)
+            {
+                None
+            } else {
+                Some((local_x.round() as u32, local_y.round() as u32))
+            }
+        });
         let pointer: ZwlrVirtualPointerV1 =
             if let Some(output) = self.outputs.get(click.output_index) {
                 self.virtual_pointer_manager
@@ -1683,6 +1811,30 @@ impl DaemonState {
                 self.virtual_pointer_manager
                     .create_virtual_pointer(self.seat.as_ref(), qh, ())
             };
+
+        if let Some(from) = start
+            && self.settings.pointer_motion != PointerMotion::Instant
+            && click.drag_from.is_none()
+        {
+            let dx = click.x as f64 - from.0 as f64;
+            let dy = click.y as f64 - from.1 as f64;
+            let distance = dx.hypot(dy);
+            if distance >= 2.0 {
+                self.pointer_glide = Some(PointerGlide {
+                    pointer,
+                    click,
+                    from,
+                    started: Instant::now(),
+                    // Bound extreme cross-output travel so selection never stalls
+                    // the cursor for an unreasonably long time at low speeds.
+                    duration: Duration::from_secs_f64(
+                        (distance / f64::from(self.settings.pointer_speed.max(1))).clamp(0.02, 2.0),
+                    ),
+                    curve: self.settings.pointer_motion,
+                });
+                return;
+            }
+        }
 
         if let Some((from_x, from_y)) = click.drag_from {
             pointer.motion_absolute(
@@ -1725,7 +1877,37 @@ impl DaemonState {
         );
         pointer.frame();
 
-        match click.action {
+        Self::emit_pointer_button(&pointer, click.action);
+        pointer.destroy();
+    }
+
+    fn advance_pointer_glide(&mut self) {
+        let Some(glide) = self.pointer_glide.as_ref() else {
+            return;
+        };
+        let elapsed = glide.started.elapsed();
+        let t = glide_fraction(elapsed, glide.duration, glide.curve);
+        let x =
+            (glide.from.0 as f64 + (glide.click.x as f64 - glide.from.0 as f64) * t).round() as u32;
+        let y =
+            (glide.from.1 as f64 + (glide.click.y as f64 - glide.from.1 as f64) * t).round() as u32;
+        glide.pointer.motion_absolute(
+            0,
+            x,
+            y,
+            glide.click.logical_width,
+            glide.click.logical_height,
+        );
+        glide.pointer.frame();
+        if t >= 1.0 {
+            let finished = self.pointer_glide.take().unwrap();
+            Self::emit_pointer_button(&finished.pointer, finished.click.action);
+            finished.pointer.destroy();
+        }
+    }
+
+    fn emit_pointer_button(pointer: &ZwlrVirtualPointerV1, action: ClickAction) {
+        match action {
             ClickAction::HoverOnly => {}
             ClickAction::LeftClick => {
                 pointer.button(1, BTN_LEFT, wl_pointer::ButtonState::Pressed);
@@ -1756,7 +1938,6 @@ impl DaemonState {
                 pointer.frame();
             }
         }
-        pointer.destroy();
     }
 
     fn destroy_capture(&mut self) {

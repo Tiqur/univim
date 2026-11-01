@@ -9,15 +9,16 @@ use univim::{
 
 fn print_usage() {
     eprintln!(
-        "Usage: univim-desktop <daemon|snapshot|check|bindings|hints|grid|tap-caps|debug|options|stop> [options]
+        "Usage: univim-desktop <daemon|snapshot|check|bindings|hints|grid|debug-open|tap-caps|debug|options|stop> [options]
 
 Commands:
   daemon         Run the background Wayland/Hyprland overlay daemon (alias: serve)
-  snapshot       Capture one monitor and save raw, annotated, and JSON artifacts
+  snapshot       Capture one monitor; save raw, annotated, six debug views, contact sheet and JSON
   check          Enumerate advertised protocols and outputs (no capture/input)
   bindings       Print suggested opt-in Hyprland configuration
   hints          Show full-screen Vimium hints (auto-starts daemon if not running)
   grid           Show recursive 2-step grid overlay
+  debug-open     Open the live pipeline inspector from the desktop
   tap-caps       Record a 'CapsLock' tap (1st tap pre-computes cache, 2nd tap opens hints in 0ms)
   debug          Toggle the live pipeline inspector HUD (also F2 inside overlay)
   options        Toggle the live GUI options modal (also F1 / ? inside overlay)
@@ -191,6 +192,8 @@ fn main() {
             .map_err(|err| format!("failed to trigger hints on {}: {err}", socket.display())),
         "grid" => send_command_or_autospawn(&socket, CommandAction::Grid, options)
             .map_err(|err| format!("failed to trigger grid on {}: {err}", socket.display())),
+        "debug-open" => send_command_or_autospawn(&socket, CommandAction::DebugOpen, options)
+            .map_err(|err| format!("failed to open debug on {}: {err}", socket.display())),
         "tap-caps" | "caps" => send_command_or_autospawn(&socket, CommandAction::TapCaps, options)
             .map_err(|err| format!("failed to send tap-caps on {}: {err}", socket.display())),
         "debug" | "toggle-debug" => {

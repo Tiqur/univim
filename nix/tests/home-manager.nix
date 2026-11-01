@@ -141,6 +141,28 @@ let
       };
     }
   ];
+  singleCaps = evaluate [
+    (hyprland { })
+    {
+      services.univim = {
+        enable = true;
+        hyprland.enable = true;
+        hyprland.singlePressCapsLock = true;
+        settings.pointerMotion = "ease_out";
+        settings.pointerSpeed = 1800;
+      };
+    }
+  ];
+  singleCapsLua = evaluateFor "26.05" [
+    (hyprland { configType = "lua"; })
+    {
+      services.univim = {
+        enable = true;
+        hyprland.enable = true;
+        hyprland.singlePressCapsLock = true;
+      };
+    }
+  ];
   programsAlias = evaluate [
     {
       programs.univim.enable = true;
@@ -160,6 +182,9 @@ let
   globalValues = globalOptions.wayland.windowManager.hyprland.settings;
   globalLauncher = lib.head globalOptions.systemd.user.services.univim.Service.ExecStart;
   globalSettings = globalOptions.xdg.configFile."univim/settings.json".text;
+  singleCapsValues = singleCaps.wayland.windowManager.hyprland.settings;
+  singleCapsSettings = singleCaps.xdg.configFile."univim/settings.json".text;
+  singleCapsLuaText = singleCapsLua.xdg.configFile."hypr/hyprland.lua".text;
 
   checks = [
     (check "disabled by default" (
@@ -229,6 +254,23 @@ let
       lib.hasInfix "\"double_tap_ms\":240" globalSettings
       && lib.hasInfix "\"use_evdev\":false" globalSettings
       && lib.hasInfix "\"min_score\":0.52" globalSettings
+    ))
+    (check "opt-in single CapsLock generates consuming bindings and disables evdev gestures" (
+      lib.any (value: lib.hasInfix ", code:66, exec," value && lib.hasInfix "univim-desktop hints" value) singleCapsValues.bind
+      && lib.any (value: lib.hasInfix "SHIFT, code:66, exec," value && lib.hasInfix "univim-desktop grid" value) singleCapsValues.bind
+      && lib.any (value: lib.hasInfix "ALT, code:66, exec," value && lib.hasInfix "univim-desktop debug-open" value) singleCapsValues.bind
+      && singleCapsValues.input.kb_options == "caps:none"
+      && !(singleCapsValues ? bindn)
+      && lib.hasInfix "\"use_evdev\":false" singleCapsSettings
+      && lib.hasInfix "\"pointer_motion\":\"ease_out\"" singleCapsSettings
+      && lib.hasInfix "\"pointer_speed\":1800" singleCapsSettings
+    ))
+    (check "Lua single CapsLock bindings consume keys" (
+      lib.hasInfix "code:66" singleCapsLuaText
+      && lib.hasInfix "SHIFT + code:66" singleCapsLuaText
+      && lib.hasInfix "ALT + code:66" singleCapsLuaText
+      && lib.hasInfix "caps:none" singleCapsLuaText
+      && lib.hasInfix "univim-desktop debug-open" singleCapsLuaText
     ))
     (check "programs.univim remains a working alias" programsAlias.services.univim.enable)
   ];

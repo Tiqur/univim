@@ -148,6 +148,7 @@ The service starts automatically with the session; do not add an
 Apply with your normal command, for example:
 
 ```sh
+nix flake update univim # run from your system flake directory to fetch new UniVim
 sudo nixos-rebuild switch --flake .#myhost
 ```
 
@@ -184,47 +185,74 @@ automatic restarts, because restarting cannot repair a stale socket.
 
 ### Options
 
+Here is a complete Home Manager example. Import the module and pass `inputs`
+as shown above; replace the example file path and host name with yours. Every
+UniVim module option is set explicitly below; comments identify defaults.
+This example **opts in to single-press CapsLock**, replacing its normal action.
+
 ```nix
-services.univim = {
-  enable = true;
+# In a Home Manager module imported by your host configuration:
+{ inputs, pkgs, lib, ... }:
+{
+  imports = [ inputs.univim.homeManagerModules.default ];
 
-  # Optional service settings:
-  output = "DP-3";       # null follows the focused monitor
-  flat = true;           # leaf-only hints, no drill-down
-  turbo = true;          # alias for settings.fastHalfRes
-  interactiveOnly = false;
-  noClick = false;
-  timeout = 30;          # seconds, 1-3600
+  services.univim = {
+    enable = true; # Default: false. Install package and start session service.
+    package = inputs.univim.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      # Default: same package from this flake. Override only for a custom build.
+    output = null; # Default: null = focused monitor; e.g. "DP-3" to pin one.
+    sessionTarget = null; # Default: null = auto-select Hyprland or graphical target.
+    timeout = 30; # Default: 30 seconds; valid 1–3600.
+    noClick = false; # Default: false; true previews but never injects clicks.
+    flat = false; # Default: false; true uses leaf hints without parent drill-down.
+    turbo = false; # Default: false; alias for half-resolution detection.
+    interactiveOnly = false; # Default: false; true omits text targets.
+    colorByType = true; # Default: true; legacy setting, colors are always on.
 
-  # Detector and gesture tuning:
-  settings = {
-    minScore = 0.45;
-    includeText = true;
-    fastHalfRes = false;
-    collapseParagraphs = true;
-    doubleTapMs = 260;
-    cacheTtlMs = 900;
-    spotlightDim = true;
+    settings = {
+      minScore = 0.45; # Default: 0.45; higher filters more detections.
+      includeText = true; # Default: true; false omits text targets.
+      fastHalfRes = false; # Default: false; same effect as turbo = true.
+      collapseParagraphs = true; # Default: true; group multi-line prose.
+      doubleTapMs = 260; # Default: 260 ms; only used in double-tap mode.
+      cacheTtlMs = 900; # Default: 900 ms; speculative first-tap cache lifetime.
+      spotlightDim = true; # Default: true; dim screenshot behind hints.
+      pointerMotion = "instant"; # Default: "instant"; also "linear" or "ease_out".
+      pointerSpeed = 1600; # Default: 1600 logical px/s; 200–6000. Ignored if instant.
+    };
+
+    keybindings = {
+      enable = false; # Default: false; true adds SUPER+F/G exec shortcuts.
+      hints = "SUPER, F"; # Default: "SUPER, F" when enabled.
+      grid = "SUPER, G"; # Default: "SUPER, G" when enabled.
+      modifierGestures = false; # Default: false; best-effort double Shift/Ctrl.
+    };
+
+    hyprland = {
+      enable = true; # Default: false; required for the CapsLock bindings below.
+      hintsBind = null; # Default: null; e.g. "SUPER, F" for a global hint shortcut.
+      gridBind = null; # Default: null; e.g. "SUPER, G" for a global grid shortcut.
+      singlePressCapsLock = true; # Default: false; Caps=hints, Shift+Caps=grid,
+        # Alt+Caps=debug. Adds XKB caps:none + physical code:66 bindings;
+        # normal CapsLock no longer works. Conflicts with existing kb_options.
+      doubleTapCapsLock = false; # Default: false; cannot combine with single-press.
+      evdev = false; # Default: true; set false for single-press (also auto-disabled).
+    };
   };
 
-  # Optional declarative bindings:
-  keybindings = {
-    enable = true;
-    hints = "SUPER, F";
-    grid = "SUPER, G";
-    modifierGestures = false;
-  };
-
-  # Optional global shortcuts and passive evdev gestures:
-  hyprland = {
-    enable = true;
-    hintsBind = "SUPER, F";
-    gridBind = "SUPER, G";
-    doubleTapCapsLock = false;
-    evdev = true;
-  };
-};
+  # If you already use other XKB options, merge them with caps:none explicitly:
+  # wayland.windowManager.hyprland.settings.input.kb_options =
+  #   lib.mkForce "grp:alt_shift_toggle,caps:none";
+}
 ```
+
+For ordinary CapsLock instead, set `singlePressCapsLock = false` and choose
+`keybindings.enable = true` for SUPER+F/G, or set `evdev = true` for passive
+double-CapsLock. If using `doubleTapCapsLock = true`, keep single-press off;
+the optional nonconsuming Hyprland shortcut and the passive evdev listener can
+both see CapsLock, so prefer **one** activation method. Keep `hyprland.enable`
+enabled only if you want its optional bindings. Avoid declaring the same
+SUPER+F/G shortcuts under both `keybindings` and `hyprland.hintsBind/gridBind`.
 
 Binding values use Hyprland's `"<modifiers>, <key>"` form. They are merged with
 your existing `bind` and `bindn` lists; existing bindings are not replaced.
@@ -268,6 +296,11 @@ contents.
 
 ## Desktop Navigation
 
+`python.py` is the authoritative detector behavior reference. Always develop
+and verify detector changes in Python first, then port them to native Rust and
+checked with the exact differential tests. The desktop-only snapshot, input,
+rendering and Home Manager features documented here do not replace that rule.
+
 The commands in this section are manual development and diagnostic controls.
 For normal use, [Home Manager Installation](#home-manager-installation) starts
 the service and manages the keybindings.
@@ -300,14 +333,22 @@ univim-desktop snapshot --dir captures
 ```
 
 `snapshot` captures the focused monitor unless `--output NAME` is supplied and
-writes three artifacts with the same numeric stem:
+writes private artifacts with the same numeric stem:
 
 - `N.png`: raw screenshot.
 - `N.annotated.png`: every parent and descendant target boxed, colored by
   hierarchy depth, with `D<depth> <path> <kind>` labels.
 - `N.json`: the complete ordered hierarchy in `targets`, every node in `flat`,
   and immediate/word drill-down results for every parent in `drills`, together
-  with output metadata, options and detector timings.
+  with output metadata, options, detector timings, physics thresholds, stage
+  timings, candidate counts and mask occupancy in `debug`.
+- `N.debug-sheet.png`: all six inspector views in one labeled image.
+- `N.debug-1-overlay.png` through `N.debug-6-hierarchy.png`: full-resolution
+  individual visualizations from the **same** detector pass. These are not
+  separate screenshots or reruns. Inspector views 1–6 are UI visualizations:
+  overlay, raw capture/target outlines, gradients, barriers/frames,
+  strokes/coarse regions and final hierarchy. They do not correspond one-to-one
+  to the four measured phases (`signal`, `frames`, `coarse`, `recursive`) in JSON.
 
 `--turbo`, `--interactive-only` and `--min-score` apply to snapshots. Add
 `--flat` to replace every composite target with its leaf descendants: only
@@ -333,21 +374,54 @@ The session timeout defaults to 30 seconds
 (accepted range 1-3600). `stop` terminates the daemon.
 
 In hints mode, type a label to select its target and click its center. Labels
-filter as you type without being reassigned. Hold **Shift** or **Ctrl** on the
-final hint character to drill: Shift reaches word fragments and Ctrl reaches
-immediate children. On a leaf, Shift middle-clicks and Ctrl right-clicks.
-**Backspace** edits the prefix, or returns to the parent when the prefix
-is empty. **Escape** cancels. **Arrow keys** or **Ctrl+H/J/K/L** snap a
-reticule to the nearest target; **Enter** clicks it. **;** or **Tab** cycles the
-click action, **v** starts a two-point drag, **Ctrl+W** toggles focused-window
-filtering, **Shift+J/K/H/L** or **Ctrl+D/U** scroll and re-capture, **F5**
+filter as you type without being reassigned. On leaves, **Shift** on the final
+hint character right-clicks and **Ctrl** middle-clicks; Ctrl+Shift
+double-clicks and Alt hovers. On composites,
+Shift drills to words and Ctrl to immediate children instead. Press **;** or
+**Tab** to cycle the default action (left/right/double/middle/hover); this also
+lets you select single-letter J/K/H/L hints without triggering Shift+J/K/H/L
+scroll when the prefix is empty (the modifier shortcut takes precedence for
+those single-letter hints). **Backspace** edits the prefix, or returns to the
+parent when empty. **Escape** cancels. **Arrow keys** or **Ctrl+H/J/K/L** snap a
+reticule to the nearest target; **Enter** clicks it. **v** starts a two-point
+drag, **Ctrl+W** toggles focused-window filtering, **Shift+J/K/H/L** or
+**Ctrl+D/U** scroll and re-capture, **F5**
 refreshes, **F6** toggles continuous refresh, **F1**/`?` opens live options, and
-**F2** opens the pipeline inspector. Its diagnostic views omit hint labels so
-the underlying image remains visible. With the evdev listener enabled, double-tap
-CapsLock for hints, hold Shift while double-tapping CapsLock for grid, or hold Alt
-while double-tapping CapsLock for the pipeline inspector. Grid mode first shows a 6x4 grid with
+**F2** opens the pipeline inspector; **1–6** select its visualizations, **F3/F4**
+cycle them. Its diagnostic views omit hint labels so the underlying image
+remains visible. With the evdev listener enabled, double-tap CapsLock for
+hints, hold Shift while double-tapping CapsLock for grid, or hold Alt while
+double-tapping CapsLock for the pipeline inspector. Grid mode first shows a 6x4 grid with
 single-character labels; the second label selects one of its 6x4 subcells and
 clicks the center.
+
+Scrolling moves the Wayland virtual pointer to the focused window, injects
+wheel events and then re-captures; it needs no `/dev/uinput` permission.
+The status pill shows the requested scroll
+direction; actual application scrolling still needs live verification.
+Transient popup menus may dismiss when the overlay takes keyboard focus;
+those cannot be reliably selected with the current exclusive layer-shell
+overlay. Avoid claiming success for menu items whose popup has closed.
+
+The Home Manager opt-in `services.univim.hyprland.singlePressCapsLock = true;`
+(with `hyprland.enable = true`) generates consuming CapsLock, Shift+CapsLock
+and Alt+CapsLock bindings for hints, grid and debug. It adds `caps:none` XKB
+mapping and binds physical `code:66`, because consuming binds alone need not
+prevent the compositor's CapsLock state from toggling. If you already set
+Hyprland `input.kb_options`, merge your existing options with `caps:none`
+yourself (for example `"grp:alt_shift_toggle,caps:none"`) and give that
+definition priority with `lib.mkForce` if necessary; the module does not
+silently discard your existing keyboard options. It disables UniVim's
+passive double-tap evdev gestures and conflicts with `doubleTapCapsLock`.
+It replaces normal CapsLock behavior; test the bindings in your Hyprland
+session before relying on them. Nothing edits external configuration.
+`services.univim.settings.pointerMotion` selects `"instant"` (default),
+`"linear"` or `"ease_out"`; `pointerSpeed` (200–6000 logical px/s, default 1600)
+controls the distance-dependent glide after hint selection (20 ms minimum,
+2 seconds maximum). Both are also
+adjustable for the running session in the F1 overlay options menu. With Home
+Manager, edit the Nix options and rebuild to persist changes; the generated
+settings file is managed by Home Manager. Instant movement remains the default.
 
 ### Opt-In Hotkeys
 

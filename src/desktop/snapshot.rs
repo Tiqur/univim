@@ -1,8 +1,12 @@
 //! Numbered snapshot artifacts for replay and vision-assisted debugging.
 //! Each capture uses the same stem for the raw image, annotated image and JSON.
-use super::geometry::Output;
-use crate::{Options, Target, drill_down};
-use opencv::{core, imgcodecs, prelude::*};
+use super::{
+    draw::render_debug_stage_canvas,
+    geometry::Output,
+    session::{Input, Session},
+};
+use crate::{DebugData, Options, Target, drill_down};
+use opencv::{core, imgcodecs, imgproc, prelude::*};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -125,6 +129,7 @@ pub struct Saved {
     pub number: u32,
     pub screenshot: PathBuf,
     pub rendered: PathBuf,
+    pub debug_sheet: PathBuf,
     pub json: PathBuf,
     pub nodes: usize,
     pub drills: usize,
@@ -140,6 +145,7 @@ struct Document<'a> {
     output: &'a Output,
     options: Value,
     timings: &'a Value,
+    debug: Value,
     /// Complete ordered hierarchy: top-level targets and all nested children.
     targets: &'a [Target],
     /// Every node, flattened in hierarchy traversal order.
@@ -191,6 +197,7 @@ fn collect(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn document<'a>(
     number: u32,
     width: i32,
@@ -198,6 +205,7 @@ fn document<'a>(
     output: &'a Output,
     options: Options,
     timings: &'a Value,
+    debug: Value,
     targets: &'a [Target],
 ) -> Result<(Document<'a>, usize, usize), String> {
     let mut flat = Vec::new();
@@ -229,6 +237,7 @@ fn document<'a>(
                 "collapse_paragraphs": options.collapse_paragraphs,
             }),
             timings,
+            debug,
             targets,
             flat,
             drills,
@@ -276,16 +285,22 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .mode(0o600)
         .open(path)
         .map_err(|e| format!("create {}: {e}", path.display()))?;
-    file.write_all(bytes)
-        .map_err(|e| format!("write {}: {e}", path.display()))
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!("write {}: {error}", path.display()));
+    }
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn save(
     image: &Mat,
     rendered: &Mat,
     targets: &[Target],
     output: &Output,
     timings: &Value,
+    debug: &DebugData,
     options: Options,
     directory: &Path,
 ) -> Result<Saved, String> {
@@ -295,6 +310,100 @@ pub fn save(
     let annotated = directory.join(format!("{number}.annotated.png"));
     let json_path = directory.join(format!("{number}.json"));
 
+    // Snapshot each inspector view from the same detector pass. The six views
+    // are visualizations, not six separate detector passes.
+    let mut stages = Vec::new();
+    let mut tiles = Vec::new();
+    for (index, name, description, related_phase) in [
+        (1, "overlay", "Original capture with clickable hints", None),
+        (
+            2,
+            "physics",
+            "Capture with classified target outlines",
+            None,
+        ),
+        (
+            3,
+            "gradients",
+            "Maximum local gradient strength",
+            Some("signal"),
+        ),
+        (
+            4,
+            "barriers",
+            "Structural barriers and frame boundaries",
+            Some("frames"),
+        ),
+        (
+            5,
+            "strokes",
+            "Stroke and coarse candidate masks",
+            Some("coarse"),
+        ),
+        (
+            6,
+            "hierarchy",
+            "Final parent, child and word boxes",
+            Some("recursive"),
+        ),
+    ] {
+        let mut session = Session::hints(image.cols(), image.rows(), targets.to_vec());
+        let _ = session.handle_input(Input::SetDebugStage(index));
+        let visual = render_debug_stage_canvas(image, &session, Some(debug), false)
+            .map_err(|e| e.to_string())?;
+        let filename = format!("{number}.debug-{index}-{name}.png");
+        stages.push(json!({"view": index, "name": name, "description": description, "image": filename, "related_phase": related_phase}));
+        tiles.push((filename, name, visual));
+    }
+    let thumb_w = image.cols().clamp(1, 640);
+    let thumb_h = image.rows().clamp(1, 400);
+    let mut sheet = Mat::new_rows_cols_with_default(
+        thumb_h * 2 + 60,
+        thumb_w * 3,
+        core::CV_8UC3,
+        core::Scalar::new(20., 20., 20., 0.),
+    )
+    .map_err(|e| e.to_string())?;
+    for (idx, (_, name, visual)) in tiles.iter().enumerate() {
+        let mut scaled = Mat::default();
+        imgproc::resize(
+            visual,
+            &mut scaled,
+            core::Size::new(thumb_w, thumb_h),
+            0.,
+            0.,
+            imgproc::INTER_AREA,
+        )
+        .map_err(|e| e.to_string())?;
+        let x = (idx % 3) as i32 * thumb_w;
+        let y = (idx / 3) as i32 * (thumb_h + 30);
+        let mut roi = sheet
+            .roi_mut(core::Rect::new(x, y + 30, thumb_w, thumb_h))
+            .map_err(|e| e.to_string())?;
+        scaled.copy_to(&mut roi).map_err(|e| e.to_string())?;
+        imgproc::put_text(
+            &mut sheet,
+            &format!("{}: {}", idx + 1, name),
+            core::Point::new(x + 10, y + 22),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.55,
+            core::Scalar::new(255., 255., 255., 0.),
+            1,
+            imgproc::LINE_AA,
+            false,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let sheet_name = format!("{number}.debug-sheet.png");
+    let nonzero = |mask: &[u8]| mask.iter().filter(|&&value| value != 0).count();
+    let debug_json = json!({
+        "sheet": sheet_name, "views": stages,
+        "work_resolution": [debug.work_w, debug.work_h],
+        "physics": {"l0": debug.physics.l0, "noise_floor": debug.physics.noise_floor, "flat_threshold": debug.physics.flat_thr, "border_threshold": debug.physics.border_thr, "stroke_threshold": debug.physics.stroke_thr, "scale": debug.physics.scale},
+        "counts": {"frames": debug.frames_count, "thumbnails": debug.thumbs_count, "coarse_regions": debug.coarse_count, "gradient_nonzero": nonzero(&debug.grad_max), "barrier_nonzero": nonzero(&debug.bar_all), "stroke_nonzero": nonzero(&debug.stroke_mask), "coarse_nonzero": nonzero(&debug.coarse_mask)},
+        "pipeline_ms": {"signal": debug.timings.stage1_gradients_ms, "frames": debug.timings.stage2_frames_ms, "coarse": debug.timings.stage3_strokes_ms, "recursive": debug.timings.stage5_post_ms, "total": debug.timings.total_ms}
+    });
+
     let (doc, nodes, drills) = document(
         number,
         image.cols(),
@@ -302,6 +411,7 @@ pub fn save(
         output,
         options,
         timings,
+        debug_json,
         targets,
     )?;
     let mut png_bytes = core::Vector::<u8>::new();
@@ -317,20 +427,39 @@ pub fn save(
         return Err("failed to encode annotated snapshot PNG".into());
     }
     let json = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
-    write_private(&png, png_bytes.as_slice())?;
-    if let Err(error) = write_private(&annotated, annotated_bytes.as_slice()) {
-        let _ = fs::remove_file(&png);
-        return Err(error);
+    let mut artifacts = vec![
+        (png.clone(), png_bytes.to_vec()),
+        (annotated.clone(), annotated_bytes.to_vec()),
+        (json_path.clone(), json),
+    ];
+    for (filename, visual) in tiles
+        .iter()
+        .map(|(filename, _, visual)| (filename, visual))
+        .chain(std::iter::once((&sheet_name, &sheet)))
+    {
+        let mut bytes = core::Vector::<u8>::new();
+        if !imgcodecs::imencode(".png", visual, &mut bytes, &core::Vector::new())
+            .map_err(|e| e.to_string())?
+        {
+            return Err(format!("failed to encode {filename}"));
+        }
+        artifacts.push((directory.join(filename), bytes.to_vec()));
     }
-    if let Err(error) = write_private(&json_path, &json) {
-        let _ = fs::remove_file(&png);
-        let _ = fs::remove_file(&annotated);
-        return Err(error);
+    let mut written = Vec::new();
+    for (path, bytes) in artifacts {
+        if let Err(error) = write_private(&path, &bytes) {
+            for created in written {
+                let _ = fs::remove_file(created);
+            }
+            return Err(error);
+        }
+        written.push(path);
     }
     Ok(Saved {
         number,
         screenshot: png,
         rendered: annotated,
+        debug_sheet: directory.join(sheet_name),
         json: json_path,
         nodes,
         drills,
@@ -347,7 +476,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        PathBuf::from("/tmp/opencode").join(format!(
             "univim-snapshot-{name}-{}-{nonce}",
             std::process::id()
         ))
@@ -386,12 +515,81 @@ mod tests {
         };
         let timings = json!({});
         let targets = [root];
-        let (doc, nodes, drills) =
-            document(1, 100, 100, &output, Options::default(), &timings, &targets).unwrap();
+        let (doc, nodes, drills) = document(
+            1,
+            100,
+            100,
+            &output,
+            Options::default(),
+            &timings,
+            json!({}),
+            &targets,
+        )
+        .unwrap();
         assert_eq!(nodes, 4);
         assert_eq!(drills, 2);
         assert_eq!(doc.targets.len(), 1);
         assert!(doc.screenshot.ends_with("1.png"));
         assert!(doc.rendered.ends_with("1.annotated.png"));
+    }
+
+    #[test]
+    fn snapshot_writes_six_debug_views_and_sheet() {
+        let image =
+            Mat::new_rows_cols_with_default(64, 80, core::CV_8UC3, core::Scalar::all(40.)).unwrap();
+        let mut target = Target::new(4, 5, 20, 12, 0.8, "frame", "control");
+        target.hint = "S".into();
+        let targets = [target];
+        let debug = DebugData {
+            grad_bgr: Mat::default(),
+            barriers_bgr: Mat::default(),
+            strokes_coarse_bgr: Mat::default(),
+            hierarchy_bgr: Mat::default(),
+            grad_max: vec![60; 80 * 64],
+            bar_all: vec![0; 80 * 64],
+            stroke_mask: vec![0; 80 * 64],
+            coarse_mask: vec![0; 80 * 64],
+            physics: crate::DebugPhysics::default(),
+            timings: crate::DebugTimings::default(),
+            l0: 12.,
+            stroke_thr: 10,
+            scale_back: 1.,
+            work_w: 80,
+            work_h: 64,
+            frames_count: 1,
+            thumbs_count: 0,
+            coarse_count: 0,
+        };
+        let output = Output {
+            name: "synthetic".into(),
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 64,
+            scale: 1.,
+            transform: 0,
+        };
+        let directory = temp_dir("debug");
+        let saved = save(
+            &image,
+            &image,
+            &targets,
+            &output,
+            &json!({}),
+            &debug,
+            Options::default(),
+            &directory,
+        )
+        .unwrap();
+        let doc: Value = serde_json::from_slice(&fs::read(saved.json).unwrap()).unwrap();
+        assert_eq!(doc["debug"]["views"].as_array().unwrap().len(), 6);
+        assert_eq!(doc["debug"]["counts"]["frames"], 1);
+        assert_eq!(doc["debug"]["views"][2]["related_phase"], "signal");
+        assert!(doc["debug"]["pipeline_ms"]["recursive"].is_number());
+        assert!(saved.debug_sheet.exists());
+        for view in doc["debug"]["views"].as_array().unwrap() {
+            assert!(directory.join(view["image"].as_str().unwrap()).exists());
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 }

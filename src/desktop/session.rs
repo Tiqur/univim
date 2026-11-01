@@ -24,6 +24,7 @@ pub struct Session {
     drag_mode: bool,
     drag_anchor: Option<(i32, i32)>,
     auto_loop: bool,
+    scroll_feedback: Option<(i32, i32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,6 +350,7 @@ impl Session {
             drag_mode: false,
             drag_anchor: None,
             auto_loop: false,
+            scroll_feedback: None,
         }
     }
 
@@ -435,6 +437,7 @@ impl Session {
             drag_mode: false,
             drag_anchor: None,
             auto_loop: false,
+            scroll_feedback: None,
         };
         session.targets = session.make_grid_Step(0, 0, session.screen_w, session.screen_h);
         session
@@ -504,6 +507,14 @@ impl Session {
         self.auto_loop
     }
 
+    pub fn scroll_feedback(&self) -> Option<(i32, i32)> {
+        self.scroll_feedback
+    }
+
+    pub fn mark_scrolled(&mut self, dx: i32, dy: i32) {
+        self.scroll_feedback = Some((dx, dy));
+    }
+
     pub fn handle_input(&mut self, input: Input) -> Outcome {
         let mut dummy = RuntimeSettings::default();
         self.handle_input_with_settings(input, &mut dummy)
@@ -514,6 +525,7 @@ impl Session {
         input: Input,
         settings: &mut RuntimeSettings,
     ) -> Outcome {
+        self.scroll_feedback = None;
         if self.show_options_menu {
             match input {
                 Input::Escape | Input::ToggleOptionsMenu => {
@@ -825,9 +837,9 @@ impl Session {
             } else if ctrl && shift {
                 ClickAction::DoubleClick
             } else if ctrl {
-                ClickAction::RightClick
-            } else if shift && (self.mode != Mode::Hints || target.children.is_empty()) {
                 ClickAction::MiddleClick
+            } else if shift && (self.mode != Mode::Hints || target.children.is_empty()) {
+                ClickAction::RightClick
             } else {
                 self.action
             };
@@ -1187,5 +1199,31 @@ mod tests {
                 to_y: 110
             }
         );
+    }
+
+    #[test]
+    fn modified_leaf_hints_choose_right_and_middle_click() {
+        let mut target = sample_target();
+        target.children.clear();
+        let hint = target.hint.chars().next().unwrap();
+        for (shift, ctrl, expected) in [
+            (true, false, ClickAction::RightClick),
+            (false, true, ClickAction::MiddleClick),
+        ] {
+            let mut session = Session::hints(800, 600, vec![target.clone()]);
+            assert_eq!(
+                session.handle_input(Input::Char {
+                    ch: hint,
+                    shift,
+                    ctrl,
+                    alt: false
+                }),
+                Outcome::Action {
+                    x: target.x + target.w / 2,
+                    y: target.y + target.h / 2,
+                    action: expected
+                }
+            );
+        }
     }
 }
