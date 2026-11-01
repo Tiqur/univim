@@ -416,6 +416,16 @@ silently discard your existing keyboard options. It disables UniVim's
 passive double-tap evdev gestures and conflicts with `doubleTapCapsLock`.
 It replaces normal CapsLock behavior; test the bindings in your Hyprland
 session before relying on them. Nothing edits external configuration.
+With `services.univim.hyprland.enable = true`, left Alt defaults to **double-tap
+for hints** (`hyprland.altActivation = "double"`). Set it to `"single"` to
+open hints on one left Alt press, or `"off"` to leave left Alt unbound.
+The non-consuming shortcut leaves ordinary Alt events available, but a single
+press also activates on the first press of ordinary Alt chords. Double-tap
+recognition via compositor global shortcuts is best-effort: unrelated keys
+between taps cannot always be detected. Right Alt is never bound by this option.
+CapsLock modes remain separately opt-in; disable single-press CapsLock if you
+want its normal lock behavior alongside the Alt shortcut.
+
 `services.univim.settings.pointerMotion` selects `"instant"` (default),
 `"linear"` or `"ease_out"`; `pointerSpeed` (200–6000 logical px/s, default 1600)
 controls the distance-dependent glide after hint selection (20 ms minimum,

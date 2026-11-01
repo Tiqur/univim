@@ -148,6 +148,7 @@ let
         enable = true;
         hyprland.enable = true;
         hyprland.singlePressCapsLock = true;
+        hyprland.altActivation = "off";
         settings.pointerMotion = "ease_out";
         settings.pointerSpeed = 1800;
       };
@@ -160,6 +161,16 @@ let
         enable = true;
         hyprland.enable = true;
         hyprland.singlePressCapsLock = true;
+      };
+    }
+  ];
+  singleAlt = evaluate [
+    (hyprland { })
+    {
+      services.univim = {
+        enable = true;
+        hyprland.enable = true;
+        hyprland.altActivation = "single";
       };
     }
   ];
@@ -185,6 +196,7 @@ let
   singleCapsValues = singleCaps.wayland.windowManager.hyprland.settings;
   singleCapsSettings = singleCaps.xdg.configFile."univim/settings.json".text;
   singleCapsLuaText = singleCapsLua.xdg.configFile."hypr/hyprland.lua".text;
+  singleAltValues = singleAlt.wayland.windowManager.hyprland.settings;
 
   checks = [
     (check "disabled by default" (
@@ -250,6 +262,14 @@ let
     (check "double-tap CapsLock binding is non-consuming" (
       lib.elem ", CAPS, global, univim:caps-lock" globalValues.bindn
     ))
+    (check "left Alt double-tap defaults to a non-consuming global binding" (
+      lib.elem "ALT, Alt_L, global, univim:alt-left" globalValues.bindn
+      && !lib.elem "ALT, Alt_R, global, univim:alt-left" globalValues.bindn
+    ))
+    (check "single left Alt uses the hints shortcut without intercepting Alt chords" (
+      lib.elem "ALT, Alt_L, global, univim:hints" singleAltValues.bindn
+      && !lib.elem "ALT, Alt_L, global, univim:alt-left" singleAltValues.bindn
+    ))
     (check "settings configure the daemon and evdev" (
       lib.hasInfix "\"double_tap_ms\":240" globalSettings
       && lib.hasInfix "\"use_evdev\":false" globalSettings
@@ -264,6 +284,11 @@ let
       && lib.hasInfix "\"use_evdev\":false" singleCapsSettings
       && lib.hasInfix "\"pointer_motion\":\"ease_out\"" singleCapsSettings
       && lib.hasInfix "\"pointer_speed\":1800" singleCapsSettings
+    ))
+    (check "Hyprlang exec passes executable and arguments separately" (
+      lib.elem ", code:66, exec, ${univimPackage}/bin/univim-desktop hints" singleCapsValues.bind
+      && lib.elem "SHIFT, code:66, exec, ${univimPackage}/bin/univim-desktop grid" singleCapsValues.bind
+      && lib.elem "ALT, code:66, exec, ${univimPackage}/bin/univim-desktop debug-open" singleCapsValues.bind
     ))
     (check "Lua single CapsLock bindings consume keys" (
       lib.hasInfix "code:66" singleCapsLuaText

@@ -110,10 +110,28 @@ let
       ]
     else
       [
-        (hyprlangBind ", code:66" "${desktop} hints")
-        (hyprlangBind "SHIFT, code:66" "${desktop} grid")
-        (hyprlangBind "ALT, code:66" "${desktop} debug-open")
+        (hyprlangBind ", code:66" [ desktop "hints" ])
+        (hyprlangBind "SHIFT, code:66" [ desktop "grid" ])
+        (hyprlangBind "ALT, code:66" [ desktop "debug-open" ])
       ]
+  );
+  altBindings = lib.optionals cfg.hyprland.enable (
+    if cfg.hyprland.altActivation == "double" then
+      [
+        (if luaConfiguration then
+          luaGestureBind "ALT, Alt_L" "hl.dsp.global(\"univim:alt-left\")"
+        else
+          "ALT, Alt_L, global, univim:alt-left")
+      ]
+    else if cfg.hyprland.altActivation == "single" then
+      [
+        (if luaConfiguration then
+          luaGestureBind "ALT, Alt_L" "hl.dsp.global(\"univim:hints\")"
+        else
+          "ALT, Alt_L, global, univim:hints")
+      ]
+    else
+      [ ]
   );
 
   bindingParts = value: map lib.trim (lib.splitString "," value);
@@ -137,7 +155,9 @@ let
     else
       "${modifiers} + ${key}";
 
-  hyprlangBind = key: command: "${bindingKey key}, exec, ${lib.escapeShellArg command}";
+  # Escape the executable and each argument independently. Quoting the whole
+  # command turns `univim-desktop hints` into one nonexistent executable name.
+  hyprlangBind = key: args: "${bindingKey key}, exec, ${lib.escapeShellArgs args}";
   hyprlangGlobalBind = key: event: "${bindingKey key}, global, ${event}";
   luaBind = key: dispatcher: {
     _args = [
@@ -161,8 +181,8 @@ let
       ]
     else
       [
-        (hyprlangBind bindings.hints "${desktop} hints")
-        (hyprlangBind bindings.grid "${desktop} grid")
+        (hyprlangBind bindings.hints [ desktop "hints" ])
+        (hyprlangBind bindings.grid [ desktop "grid" ])
       ]
   );
   gestureBindings = lib.optionals bindings.modifierGestures (
@@ -289,6 +309,12 @@ in
 
     hyprland = {
       enable = lib.mkEnableOption "global UniVim Hyprland shortcuts";
+
+      altActivation = lib.mkOption {
+        type = lib.types.enum [ "off" "single" "double" ];
+        default = "double";
+        description = "Left Alt hints activation when Hyprland shortcuts are enabled. Double-tap preserves ordinary Alt chords best-effort; single-press also triggers on Alt chords.";
+      };
 
       hintsBind = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
@@ -418,7 +444,7 @@ in
           if luaConfiguration then
             {
               bind = explicitBindings ++ gestureBindings ++ globalBindings ++ singleCapsBindings;
-              bindn = doubleTapBindings;
+              bindn = doubleTapBindings ++ altBindings;
             }
           else
             let
@@ -426,7 +452,7 @@ in
                 lib.optionalAttrs bindings.enable { bind = explicitBindings; }
                 // lib.optionalAttrs bindings.modifierGestures { bindn = gestureBindings; };
               bindList = (base.bind or [ ]) ++ globalBindings ++ singleCapsBindings;
-              bindnList = (base.bindn or [ ]) ++ doubleTapBindings;
+              bindnList = (base.bindn or [ ]) ++ doubleTapBindings ++ altBindings;
             in
             base
             // lib.optionalAttrs (bindList != [ ]) { bind = bindList; }

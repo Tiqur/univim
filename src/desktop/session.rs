@@ -222,6 +222,7 @@ impl PrecomputedFrame {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GestureKey {
     CapsLock,
+    LeftAlt,
     Grid,
     Debug,
 }
@@ -234,7 +235,7 @@ pub enum TapEvent {
     Activate,
 }
 
-/// Tracks modifier-specific CapsLock double taps.
+/// Tracks double taps from global shortcuts and passive keyboard gestures.
 #[derive(Clone, Debug, Default)]
 pub struct TapTracker {
     last_key: Option<GestureKey>,
@@ -1048,6 +1049,22 @@ mod tests {
         );
         assert_eq!(
             tracker.on_tap(GestureKey::CapsLock, Duration::from_millis(250)),
+            TapEvent::Activate
+        );
+        assert_eq!(
+            tracker.on_tap(GestureKey::LeftAlt, Duration::from_millis(250)),
+            TapEvent::Warmup
+        );
+        assert_eq!(
+            tracker.on_tap(GestureKey::CapsLock, Duration::from_millis(250)),
+            TapEvent::Warmup
+        );
+        assert_eq!(
+            tracker.on_tap(GestureKey::LeftAlt, Duration::from_millis(250)),
+            TapEvent::Warmup
+        );
+        assert_eq!(
+            tracker.on_tap(GestureKey::LeftAlt, Duration::from_millis(250)),
             TapEvent::Activate
         );
         // Next tap starts a fresh cycle
