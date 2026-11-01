@@ -128,8 +128,22 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
             || ((3..=8.max((10. * s) as i32)).contains(&rw)
                 && (10.max((12. * s) as i32)..=34.max((40. * s) as i32)).contains(&rh)))
             && depth <= 3;
-        let is_single_char_ui = (4..=12).contains(&rw) && (7..=22).contains(&rh) && depth <= 3;
-        if !is_micro_icon && !is_single_char_ui && (rw < 6 || rh < 5 || (rw <= 9 && rh <= 7)) {
+        let is_single_char_ui = (3.max((0.24 * l0).round_ties_even() as i32)
+            ..=12.max((0.80 * l0).round_ties_even() as i32))
+            .contains(&rw)
+            && (6.max((0.42 * l0).round_ties_even() as i32)
+                ..=22.max((1.40 * l0).round_ties_even() as i32))
+                .contains(&rh)
+            && depth <= 3;
+        let min_box_w = 5.max((0.35 * l0).round_ties_even() as i32);
+        let min_box_h = 4.max((0.30 * l0).round_ties_even() as i32);
+        if !is_micro_icon
+            && !is_single_char_ui
+            && (rw < min_box_w
+                || rh < min_box_h
+                || (rw <= (0.55 * l0).round_ties_even() as i32
+                    && rh <= (0.45 * l0).round_ties_even() as i32))
+        {
             return Ok(());
         }
 
@@ -613,22 +627,22 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
             &core::no_array(),
         )?[0];
         let max_g = crate::max_roi(&state.grad_max, rx, ry, rw, rh)?;
+        let base_g_thr =
+            36.0_f64.max(state.stroke_thr as f64 * if local_flat >= 0.58 { 2.35 } else { 3.20 });
         let min_g_thr = if is_micro_icon {
-            60.
+            52.0_f64.max(state.stroke_thr as f64 * 3.30)
         } else if is_single_char_ui {
-            if local_flat >= 0.65
-                && rw >= 7
-                && rh >= 7
-                && (0.65..=1.50).contains(&(rw as f64 / rh.max(1) as f64))
+            if local_flat >= 0.62
+                && rw >= 6.max((0.40 * l0).round_ties_even() as i32)
+                && rh >= 6.max((0.40 * l0).round_ties_even() as i32)
+                && (0.62..=1.55).contains(&(rw as f64 / rh.max(1) as f64))
             {
-                42.
+                base_g_thr
             } else {
-                85.
+                78.0_f64.max(state.stroke_thr as f64 * 4.70)
             }
-        } else if local_flat >= 0.58 {
-            42.
         } else {
-            58.
+            base_g_thr
         };
         let active_cols = is_ink.iter().filter(|&&v| v).count();
         let total_stroke = col_proj.iter().sum::<u64>();
@@ -639,7 +653,12 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
             && (!is_micro_icon || local_flat >= 0.58)
             && !(is_single_char_ui
                 && (rw < 6 || rh < 6 || (rw <= 9 && rh <= 8))
-                && (local_flat < 0.74 || max_g < 95.))
+                && (local_flat < 0.74
+                    || (max_g < 95.
+                        && !(rw >= 6
+                            && rh >= 6
+                            && (0.70..=1.40).contains(&(rw as f64 / rh.max(1) as f64))
+                            && local_flat >= 0.74))))
             && !(local_flat < 0.48 && max_g < 72.)
             && !(local_flat < 0.34 && (max_g < 140. || rw < 24));
         let mut glyph_words = None;

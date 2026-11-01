@@ -931,15 +931,22 @@ pub fn prepare(bgr: &Mat, options: Options) -> opencv::Result<State> {
     let t_frames = Instant::now();
 
     // Stage 3: coarse proposals, retaining OpenCV's contour enumeration order.
-    let stroke_clean = and(&threshold(&grad_max, 18.0, 255.0, false)?, &barrier_inv)?;
+    let stroke_clean = and(
+        &threshold(
+            &grad_max,
+            physics.stroke_thr.saturating_add(2).min(18) as f64,
+            255.0,
+            false,
+        )?,
+        &barrier_inv,
+    )?;
     let stroke_01 = threshold(&stroke_clean, 0.0, 1.0, false)?;
     let blue_01 = threshold(&blue_excess, 55.0, 1.0, false)?;
     let mut coarse_boxes = Vec::new();
-    let k_c = if s >= 1.55 {
-        kernel(18, 7)?
-    } else {
-        kernel(14, 5)?
-    };
+    let k_c = kernel(
+        12.max((0.88 * l0).round_ties_even() as i32),
+        4.max((0.32 * l0).round_ties_even() as i32),
+    )?;
     let coarse_mask = and(
         &morph(&stroke_clean, imgproc::MORPH_CLOSE, &k_c)?,
         &barrier_inv,

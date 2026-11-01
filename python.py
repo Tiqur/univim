@@ -422,7 +422,17 @@ class ViselDetector:
             k65_g = min(len(gaps) - 1, int(len(gaps) * 0.65))
             kern_base = float(np.partition(gaps, k65_g)[k65_g])
 
-            is_monospace = bool(p85_pw <= 0.56 * rh and p85_pw <= 1.45 * med_pw)
+            is_monospace = bool(
+                p85_pw <= 0.56 * rh
+                and p85_pw <= 1.45 * med_pw
+                and not (g_max >= max(4, int(round(rh * 0.45))) and kern_base <= 2.0 and g_max >= 3.0 * max(1.0, kern_base))
+            )
+            if len(v_starts) == 2 and (
+                0.68 <= v_widths[0] / float(max(1, rh)) <= 1.38
+                and 0.68 <= v_widths[1] / float(max(1, rh)) <= 1.38
+                and gaps[0] >= max(3, int(round(rh * 0.22)))
+            ):
+                is_monospace = False
             if is_monospace:
                 # Discrete-character / monospace font: a space character (' ') spans at least one full
                 # character cell plus kerning (>= 0.36 * rh, >= 2.2 * kern_base + 1, and >= 0.85 * med_pw).
@@ -438,11 +448,17 @@ class ViselDetector:
                 # inter-word spaces are >= max(3, round(rh * 0.22), round(kern_prop * 1.9) + 1).
                 k50_g = len(gaps) >> 1
                 kern_prop = float(np.partition(gaps, k50_g)[k50_g])
-                min_space_thr = max(
-                    3,
-                    int(round(rh * 0.22)),
-                    int(round(kern_prop * 1.9)) + 1,
-                )
+                if len(v_starts) == 2 and (
+                    0.68 <= v_widths[0] / float(max(1, rh)) <= 1.38
+                    and 0.68 <= v_widths[1] / float(max(1, rh)) <= 1.38
+                ):
+                    min_space_thr = max(3, int(round(rh * 0.22)))
+                else:
+                    min_space_thr = max(
+                        3,
+                        int(round(rh * 0.22)),
+                        int(round(kern_prop * 1.9)) + 1,
+                    )
 
             if g_max < min_space_thr:
                 # All gaps on this strip are intra-word letter kerning (e.g. a single word, '[tiqur@nixos:~]$',
@@ -521,7 +537,11 @@ class ViselDetector:
                 pw = px1 - px0
                 cw = wx1 - wx0
                 gap = wx0 - px1
-                if gap <= max_attach_gap and (pw < min_standalone_w or cw < min_standalone_w):
+                is_icon_sep = (
+                    (gap >= max(4, int(round(rh * 0.45))) and (0.68 <= pw / float(max(1, rh)) <= 1.38 or 0.68 <= cw / float(max(1, rh)) <= 1.38))
+                    or (gap >= max(3, int(round(rh * 0.22))) and 0.68 <= pw / float(max(1, rh)) <= 1.38 and 0.68 <= cw / float(max(1, rh)) <= 1.38)
+                )
+                if not is_icon_sep and gap <= max_attach_gap and (pw < min_standalone_w or cw < min_standalone_w):
                     merged_words[-1] = (px0, wx1)
                 else:
                     merged_words.append((wx0, wx1))
@@ -980,14 +1000,16 @@ class ViselDetector:
 
         t_frames = time.perf_counter()
 
-        # Stage 3: Coarse Proposal Generation
-        _, stroke_bin = cv2.threshold(grad_max, 18, 255, cv2.THRESH_BINARY)
+        # Stage 3: Coarse Proposal Generation (Self-Calibrated to L_0 & stroke_thr)
+        _, stroke_bin = cv2.threshold(grad_max, min(18, stroke_thr + 2), 255, cv2.THRESH_BINARY)
         stroke_clean = cv2.bitwise_and(stroke_bin, barrier_inv)
 
         _, stroke_01 = cv2.threshold(stroke_clean, 0, 1, cv2.THRESH_BINARY)
         _, blue_01 = cv2.threshold(blue_excess, 55, 1, cv2.THRESH_BINARY)
 
-        k_c = self.k_coarse_hi if s >= 1.55 else self.k_coarse
+        kc_w = max(12, int(round(0.88 * L_0)))
+        kc_h = max(4, int(round(0.32 * L_0)))
+        k_c = cv2.getStructuringElement(cv2.MORPH_RECT, (kc_w, kc_h))
         coarse_mask = cv2.bitwise_and(
             cv2.morphologyEx(stroke_clean, cv2.MORPH_CLOSE, k_c),
             barrier_inv,
@@ -1041,8 +1063,14 @@ class ViselDetector:
                  or (3 <= rw <= max(8, int(10 * s)) and max(10, int(12 * s)) <= rh <= max(34, int(40 * s))))
                 and depth <= 3
             )
-            is_single_char_ui = (4 <= rw <= 12 and 7 <= rh <= 22 and depth <= 3)
-            if not is_micro_icon and not is_single_char_ui and (rw < 6 or rh < 5 or (rw <= 9 and rh <= 7)):
+            is_single_char_ui = (
+                max(3, int(round(0.24 * L_0))) <= rw <= max(12, int(round(0.80 * L_0)))
+                and max(6, int(round(0.42 * L_0))) <= rh <= max(22, int(round(1.40 * L_0)))
+                and depth <= 3
+            )
+            min_box_w = max(5, int(round(0.35 * L_0)))
+            min_box_h = max(4, int(round(0.30 * L_0)))
+            if not is_micro_icon and not is_single_char_ui and (rw < min_box_w or rh < min_box_h or (rw <= int(round(0.55 * L_0)) and rh <= int(round(0.45 * L_0)))):
                 return
 
             icon_guard_w = max(36, int(38 * s))
@@ -1247,7 +1275,20 @@ class ViselDetector:
                 min_dx_mean = 4.2
             mean_dx_val = float(cv2.mean(dx[ry : ry + rh, rx : rx + rw])[0])
             _, max_g, _, _ = cv2.minMaxLoc(grad_max[ry : ry + rh, rx : rx + rw])
-            min_g_thr = 60 if is_micro_icon else (85 if is_single_char_ui else (42 if local_flat >= 0.58 else 58))
+            # Smooth contrast threshold scaled to calibrated `stroke_thr` and local background flatness `local_flat`
+            base_g_thr = max(36.0, float(stroke_thr) * (2.35 if local_flat >= 0.58 else 3.20))
+            if is_micro_icon:
+                min_g_thr = max(52.0, float(stroke_thr) * 3.30)
+            elif is_single_char_ui:
+                is_sym_icon = (
+                    local_flat >= 0.62
+                    and rw >= max(6, int(round(0.40 * L_0)))
+                    and rh >= max(6, int(round(0.40 * L_0)))
+                    and 0.62 <= rw / float(max(1, rh)) <= 1.55
+                )
+                min_g_thr = base_g_thr if is_sym_icon else max(78.0, float(stroke_thr) * 4.70)
+            else:
+                min_g_thr = base_g_thr
 
             active_cols = np.count_nonzero(is_ink)
             mean_ink_col = float(col_proj.sum()) / float(max(1, active_cols))
@@ -1262,7 +1303,7 @@ class ViselDetector:
                 std_pass = False
             elif is_micro_icon and local_flat < 0.58:
                 std_pass = False
-            elif is_single_char_ui and (rw < 6 or rh < 6 or (rw <= 9 and rh <= 8)) and (local_flat < 0.74 or max_g < 95):
+            elif is_single_char_ui and (rw < 6 or rh < 6 or (rw <= 9 and rh <= 8)) and (local_flat < 0.74 or (max_g < 95 and not (rw >= 6 and rh >= 6 and 0.70 <= rw / float(max(1, rh)) <= 1.40 and local_flat >= 0.74))):
                 std_pass = False
             elif local_flat < 0.48 and max_g < 72:
                 std_pass = False
