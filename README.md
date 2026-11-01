@@ -539,12 +539,12 @@ OpenCV 4.13.0, NumPy 2.5.3. Results vary with system load and image content.
 
 | Synthetic Workload | Resolution | Mode | Python | Rust | Speedup |
 | --- | --- | --- | ---: | ---: | ---: |
-| Light UI | 2561 x 1601 | Normal | 103.88 | 81.18 | 1.28x |
-| Light UI | 2561 x 1601 | Turbo | 38.12 | 24.61 | 1.55x |
-| Light UI | 1440 x 900 | Normal | 30.15 | 19.08 | 1.58x |
-| Light UI | 1440 x 900 | Turbo | 30.81 | 19.23 | 1.60x |
-| Dense controls | 1440 x 900 | Normal | 128.05 | 27.62 | 4.64x |
-| Dense controls | 1440 x 900 | Turbo | 128.98 | 27.46 | 4.70x |
+| Light UI | 2561 x 1601 | Normal | 95.21 | 108.94 | 0.87x |
+| Light UI | 2561 x 1601 | Turbo | 38.20 | 33.80 | 1.13x |
+| Light UI | 1440 x 900 | Normal | 30.50 | 27.13 | 1.12x |
+| Light UI | 1440 x 900 | Turbo | 30.57 | 19.22 | 1.59x |
+| Dense controls | 1440 x 900 | Normal | 118.86 | 17.95 | 6.62x |
+| Dense controls | 1440 x 900 | Turbo | 121.84 | 21.09 | 5.78x |
 
 Per-stage medians use the reference's boundaries: `signal` covers scaling,
 gradients and structural barriers; `frames` covers frame/thumbnail recovery and
@@ -554,23 +554,33 @@ Python / Rust milliseconds.
 
 | Workload | Mode | Signal | Frames | Coarse | Recursive |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Light UI 2561 x 1601 | Normal | 50.4 / 46.0 | 22.4 / 22.1 | 3.1 / 8.3 | 27.0 / 3.4 |
-| Light UI 2561 x 1601 | Turbo | 18.8 / 17.8 | 7.3 / 5.0 | 0.75 / 0.64 | 10.9 / 1.1 |
-| Light UI 1440 x 900 | Normal | 6.4 / 5.5 | 11.0 / 9.1 | 0.95 / 2.75 | 11.4 / 1.2 |
-| Light UI 1440 x 900 | Turbo | 6.6 / 5.6 | 11.3 / 9.1 | 0.95 / 2.73 | 11.7 / 1.3 |
-| Dense controls 1440 x 900 | Normal | 6.3 / 11.7 | 7.7 / 8.8 | 1.2 / 2.7 | 112.6 / 2.3 |
-| Dense controls 1440 x 900 | Turbo | 6.6 / 11.9 | 7.8 / 8.6 | 1.2 / 2.7 | 112.8 / 2.2 |
+| Light UI 2561 x 1601 | Normal | 50.0 / 62.9 | 21.8 / 29.6 | 3.2 / 8.2 | 19.7 / 2.9 |
+| Light UI 2561 x 1601 | Turbo | 19.0 / 21.4 | 7.2 / 7.8 | 0.8 / 2.1 | 11.0 / 1.2 |
+| Light UI 1440 x 900 | Normal | 6.4 / 9.5 | 11.0 / 11.8 | 1.0 / 2.7 | 11.8 / 1.5 |
+| Light UI 1440 x 900 | Turbo | 6.4 / 5.5 | 11.0 / 9.1 | 1.0 / 2.7 | 11.9 / 1.5 |
+| Dense controls 1440 x 900 | Normal | 6.3 / 4.4 | 7.7 / 7.4 | 1.1 / 2.8 | 103.4 / 2.7 |
+| Dense controls 1440 x 900 | Turbo | 6.5 / 4.6 | 7.8 / 10.2 | 1.2 / 2.7 | 106.0 / 3.0 |
 
-Rust is faster overall in every measured configuration. The remaining relative
-weaknesses are localized: `coarse` is slower on the large and 1440 x 900 UI cases,
-and `signal` is slower on the dense-controls case. Those stages repeatedly
-allocate and inspect full-resolution masks and contour ROIs, so memory traffic,
-allocation and cache behavior are likely contributors. The largest absolute win
-comes from recursive refinement and composition, which dominates Python's dense
-controls time. Turbo changes the algorithm's working resolution and coarse pass,
-so compare implementations within the same mode rather than normal versus turbo.
-Stage medians may not sum exactly to wall-clock totals because they are measured
-at internal boundaries.
+Rust is faster in five of the six configurations in this run. Large colored
+screenshots are the exception in absolute medians, but they are also the noisiest:
+the same release binary measured about 82 ms in standalone runs and about 106 ms
+immediately after the in-suite Python benchmark. Running 30 Python detections
+first reproduces that gap, so thermal or scheduling state, not detector work,
+dominates this case. Controlled alternating A/B runs of the pre- and post-
+optimization binaries measured 82.91 vs 82.10 ms on the large normal UI and
+30.10 vs 16.91 ms on dense controls. The achromatic fast path therefore removes
+the chroma pipeline for grayscale BGR screenshots without regressing colored
+ones.
+
+The remaining relative weaknesses are localized: `coarse` is slower on the large
+and 1440 x 900 UI cases, and `frames` is occasionally slower on grayscale dense
+controls. Those stages repeatedly allocate and inspect full-resolution masks and
+contour ROIs, so memory traffic, allocation and cache behavior are likely
+contributors. The largest absolute win comes from recursive refinement and
+composition, which dominates Python's dense controls time. Turbo changes the
+algorithm's working resolution and coarse pass, so compare implementations within
+the same mode rather than normal versus turbo. Stage medians may not sum exactly
+to wall-clock totals because they are measured at internal boundaries.
 
 See `AGENTS.md` for architecture, parity pitfalls, comment conventions and the
 required workflow for future changes.

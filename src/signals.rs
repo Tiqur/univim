@@ -68,6 +68,19 @@ fn scale_chroma(src: &Mat) -> opencv::Result<Mat> {
     Ok(out)
 }
 
+fn is_achromatic(bgr: &Mat) -> opencv::Result<bool> {
+    for y in 0..bgr.rows() {
+        let row = bgr.at_row::<core::Vec3b>(y)?;
+        if row[..bgr.cols() as usize]
+            .iter()
+            .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2])
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Ratio-orthogonal edge mask: a primary edge must clear the floor and be at
 /// least twice the cross-axis response, so diagonal glyph strokes drop out.
 fn pure_mask(primary: &Mat, cross: &Mat, thr: i32) -> opencv::Result<Mat> {
@@ -405,61 +418,102 @@ pub fn prepare(bgr: &Mat, options: Options) -> opencv::Result<State> {
     // Stage 1: gradients and JPEG-resilient structural barriers.
     let mut gray = Mat::default();
     imgproc::cvt_color_def(bgr, &mut gray, imgproc::COLOR_BGR2GRAY)?;
-    let mut channels = Vector::<Mat>::new();
-    core::split(bgr, &mut channels)?;
-    let chroma = {
-        let (b, g, r) = (channels.get(0)?, channels.get(1)?, channels.get(2)?);
-        let mut bg_max = Mat::default();
-        let mut bgr_max = Mat::default();
-        let mut bg_min = Mat::default();
-        let mut bgr_min = Mat::default();
-        core::max(&b, &g, &mut bg_max)?;
-        core::max(&bg_max, &r, &mut bgr_max)?;
-        core::min(&b, &g, &mut bg_min)?;
-        core::min(&bg_min, &r, &mut bgr_min)?;
-        let mut chroma = Mat::default();
-        core::subtract(&bgr_max, &bgr_min, &mut chroma, &no_array(), -1)?;
-        chroma
-    };
-    let blue_excess = {
-        let (b, r) = (channels.get(0)?, channels.get(2)?);
-        let mut blue_excess = Mat::default();
-        core::subtract(&b, &r, &mut blue_excess, &no_array(), -1)?;
-        blue_excess
+    // A grayscale BGR input has identically zero chroma and blue excess. Test
+    // the source directly to avoid splitting channels and scanning them again.
+    let achromatic = is_achromatic(bgr)?;
+    let (chroma, blue_excess) = if achromatic {
+        (zeros(h, w)?, zeros(h, w)?)
+    } else {
+        let mut channels = Vector::<Mat>::new();
+        core::split(bgr, &mut channels)?;
+        let chroma = {
+            let (b, g, r) = (channels.get(0)?, channels.get(1)?, channels.get(2)?);
+            let mut bg_max = Mat::default();
+            let mut bgr_max = Mat::default();
+            let mut bg_min = Mat::default();
+            let mut bgr_min = Mat::default();
+            core::max(&b, &g, &mut bg_max)?;
+            core::max(&bg_max, &r, &mut bgr_max)?;
+            core::min(&b, &g, &mut bg_min)?;
+            core::min(&bg_min, &r, &mut bgr_min)?;
+            let mut chroma = Mat::default();
+            core::subtract(&bgr_max, &bgr_min, &mut chroma, &no_array(), -1)?;
+            chroma
+        };
+        let blue_excess = {
+            let (b, r) = (channels.get(0)?, channels.get(2)?);
+            let mut blue_excess = Mat::default();
+            core::subtract(&b, &r, &mut blue_excess, &no_array(), -1)?;
+            blue_excess
+        };
+        (chroma, blue_excess)
     };
 
     let k_dx = kernel(2, 1)?;
     let k_dy = kernel(1, 2)?;
     let dx_gray = morph(&gray, imgproc::MORPH_GRADIENT, &k_dx)?;
     let dy_gray = morph(&gray, imgproc::MORPH_GRADIENT, &k_dy)?;
-    let dx_ch = scale_chroma(&morph(&chroma, imgproc::MORPH_GRADIENT, &k_dx)?)?;
-    let dy_ch = scale_chroma(&morph(&chroma, imgproc::MORPH_GRADIENT, &k_dy)?)?;
-    let mut dx = Mat::default();
-    let mut dy = Mat::default();
+    // An achromatic screenshot has no chroma edges. Skip both full-image
+    // chroma gradients and their scaling; gray gradients already are the max.
+    let (dx, dy) = if achromatic {
+        (dx_gray.clone(), dy_gray.clone())
+    } else {
+        let dx_ch = scale_chroma(&morph(&chroma, imgproc::MORPH_GRADIENT, &k_dx)?)?;
+        let dy_ch = scale_chroma(&morph(&chroma, imgproc::MORPH_GRADIENT, &k_dy)?)?;
+        let mut dx = Mat::default();
+        let mut dy = Mat::default();
+        core::max(&dx_gray, &dx_ch, &mut dx)?;
+        core::max(&dy_gray, &dy_ch, &mut dy)?;
+        (dx, dy)
+    };
     let mut grad_max = Mat::default();
-    core::max(&dx_gray, &dx_ch, &mut dx)?;
-    core::max(&dy_gray, &dy_ch, &mut dy)?;
     core::max(&dx, &dy, &mut grad_max)?;
 
     let ortho_thr = if w * h <= 1_500_000 { 3 } else { 4 };
     let k_hline = kernel(24.max((34.0 * s) as i32), 1)?;
     let k_hseg = kernel(20.max((26.0 * s) as i32), 1)?;
     let k_vline_short = kernel(1, 16.max((20.0 * s) as i32))?;
-    let k_hzone = kernel(9, 9)?;
 
     let h_pure_raw = pure_mask(&dy, &dx, ortho_thr)?;
     let h_pure = morph(&h_pure_raw, imgproc::MORPH_CLOSE, &kernel(3, 1)?)?;
     let h_bar = morph(&h_pure, imgproc::MORPH_OPEN, &k_hline)?;
-    let h_zone = dilate(&morph(&h_pure, imgproc::MORPH_OPEN, &k_hseg)?, &k_hzone)?;
     let v_pure_raw = pure_mask(&dx, &dy, ortho_thr)?;
     let v_pure = morph(&v_pure_raw, imgproc::MORPH_CLOSE, &kernel(1, 3)?)?;
     let v_raw = morph(&v_pure, imgproc::MORPH_OPEN, &k_vline_short)?;
     let mut v_bar = zeros(h, w)?;
     let min_v_long = 36.max((48.0 * s) as i32);
-    for vc in contours(&v_raw, imgproc::RETR_EXTERNAL)? {
+    let vertical_contours = contours(&v_raw, imgproc::RETR_EXTERNAL)?;
+    // Horizontal segments only support the vertical-contour intersection test.
+    // With no vertical contours there is no reason to open/dilate another
+    // full-image mask (common on dense, text-only control grids).
+    let h_segments = if vertical_contours.is_empty() {
+        None
+    } else {
+        Some(morph(&h_pure, imgproc::MORPH_OPEN, &k_hseg)?)
+    };
+    // For a few candidates, expanded-box queries avoid a full-image dilation.
+    // Dense edge maps instead amortize that dilation across all queries.
+    let h_zone = if vertical_contours.len() > 64 {
+        Some(dilate(h_segments.as_ref().unwrap(), &kernel(9, 9)?)?)
+    } else {
+        None
+    };
+    for vc in vertical_contours {
         let bb = imgproc::bounding_rect(&vc)?;
+        // A 9x9 dilation intersects the candidate iff the original segment
+        // intersects its box expanded by the kernel's four-pixel radius.
         if bb.height >= min_v_long
-            || count(&h_zone, bb.x, bb.y, bb.x + bb.width, bb.y + bb.height)? > 0
+            || if let Some(zone) = &h_zone {
+                count(zone, bb.x, bb.y, bb.x + bb.width, bb.y + bb.height)? > 0
+            } else {
+                count(
+                    h_segments.as_ref().unwrap(),
+                    bb.x - 4,
+                    bb.y - 4,
+                    bb.x + bb.width + 4,
+                    bb.y + bb.height + 4,
+                )? > 0
+            }
         {
             let mut one = Vector::<Vector<Point>>::new();
             one.push(vc);
