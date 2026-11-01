@@ -781,12 +781,19 @@ impl Session {
             return;
         };
 
+        if let Some(next_idx) = self.snap_neighbor(cur_idx, dir) {
+            self.snapped_idx = Some(next_idx);
+        }
+    }
+
+    /// Target that an arrow key would select from `cur_idx`. Drawing uses the
+    /// same weighted cost as navigation so the affordances cannot drift.
+    fn snap_neighbor(&self, cur_idx: usize, dir: Cardinal) -> Option<usize> {
         let cur = &self.targets[cur_idx];
         let cx = cur.x + cur.w / 2;
         let cy = cur.y + cur.h / 2;
 
-        let best = self
-            .targets
+        self.targets
             .iter()
             .enumerate()
             .filter(|&(i, _)| i != cur_idx)
@@ -807,11 +814,29 @@ impl Session {
                 Some((cost, i))
             })
             .min_by_key(|&(cost, _)| cost)
-            .map(|(_, i)| i);
+            .map(|(_, i)| i)
+    }
 
-        if let Some(next_idx) = best {
-            self.snapped_idx = Some(next_idx);
-        }
+    /// Rectangles the arrow keys would select from the current snapped target,
+    /// ordered up, down, left, right. The overlay draws one connector per entry.
+    pub fn snap_neighbors(&self) -> Vec<(Cardinal, [i32; 4])> {
+        let Some(cur_idx) = self.snapped_idx.filter(|&i| i < self.targets.len()) else {
+            return Vec::new();
+        };
+        [
+            Cardinal::Up,
+            Cardinal::Down,
+            Cardinal::Left,
+            Cardinal::Right,
+        ]
+        .into_iter()
+        .filter_map(|dir| {
+            self.snap_neighbor(cur_idx, dir).map(|idx| {
+                let target = &self.targets[idx];
+                (dir, [target.x, target.y, target.w, target.h])
+            })
+        })
+        .collect()
     }
 
     fn push_char(&mut self, ch: char, shift: bool, ctrl: bool, alt: bool) -> Outcome {

@@ -1,7 +1,7 @@
 use super::{
     Appearance, PointerMotion, RuntimeSettings,
     geometry::FrameGeometry,
-    session::{DebugView, Mode, Session},
+    session::{Cardinal, DebugView, Mode, Session},
 };
 use crate::{DebugData, Target};
 use opencv::{
@@ -33,6 +33,7 @@ pub fn render_session_surface(
     )?;
 
     draw_focused_window_And_reticule(&mut canvas, session)?;
+    draw_snap_neighbor_lines(&mut canvas, session)?;
 
     if settings.show_status_bar || !session.typed().is_empty() || session.show_debug_hud() {
         draw_status_pill(&mut canvas, session, &settings.appearance)?;
@@ -284,6 +285,83 @@ fn draw_focused_window_And_reticule(canvas: &mut Mat, session: &Session) -> open
         )?;
     }
 
+    Ok(())
+}
+
+/// Connector lines from the edges of the snapped box to the target each arrow
+/// key would select. Each direction gets its own color and a small arrowhead so
+/// the four destinations stay distinguishable when lines cross.
+fn draw_snap_neighbor_lines(canvas: &mut Mat, session: &Session) -> opencv::Result<()> {
+    let Some(current) = session.snapped_target() else {
+        return Ok(());
+    };
+    let (w, h) = (canvas.cols(), canvas.rows());
+    if w <= 1 || h <= 1 {
+        return Ok(());
+    }
+    let cur_left = current.x.clamp(0, w - 1);
+    let cur_top = current.y.clamp(0, h - 1);
+    let cur_right = (current.x + current.w).clamp(0, w - 1);
+    let cur_bottom = (current.y + current.h).clamp(0, h - 1);
+    let (cx, cy) = ((cur_left + cur_right) / 2, (cur_top + cur_bottom) / 2);
+
+    for (dir, [x, y, tw, th]) in session.snap_neighbors() {
+        let left = x.clamp(0, w - 1);
+        let top = y.clamp(0, h - 1);
+        let right = (x + tw).clamp(0, w - 1);
+        let bottom = (y + th).clamp(0, h - 1);
+        let (start, end, color) = match dir {
+            Cardinal::Up => (
+                Point::new(cx, cur_top),
+                Point::new((left + right) / 2, bottom),
+                Scalar::new(255.0, 220.0, 80.0, 0.0),
+            ),
+            Cardinal::Down => (
+                Point::new(cx, cur_bottom),
+                Point::new((left + right) / 2, top),
+                Scalar::new(80.0, 170.0, 255.0, 0.0),
+            ),
+            Cardinal::Left => (
+                Point::new(cur_left, cy),
+                Point::new(right, (top + bottom) / 2),
+                Scalar::new(120.0, 255.0, 140.0, 0.0),
+            ),
+            Cardinal::Right => (
+                Point::new(cur_right, cy),
+                Point::new(left, (top + bottom) / 2),
+                Scalar::new(255.0, 130.0, 220.0, 0.0),
+            ),
+        };
+        if start.x == end.x && start.y == end.y {
+            continue;
+        }
+        imgproc::line(canvas, start, end, color, 2, LINE_AA, 0)?;
+        draw_arrow_head(canvas, start, end, color)?;
+    }
+    Ok(())
+}
+
+fn draw_arrow_head(
+    canvas: &mut Mat,
+    start: Point,
+    end: Point,
+    color: Scalar,
+) -> opencv::Result<()> {
+    let dx = (end.x - start.x) as f64;
+    let dy = (end.y - start.y) as f64;
+    let length = dx.hypot(dy);
+    if length < 14.0 {
+        return Ok(());
+    }
+    let (ux, uy) = (dx / length, dy / length);
+    for spread in [0.5_f64, -0.5] {
+        let (sin, cos) = spread.sin_cos();
+        let back = Point::new(
+            (end.x as f64 - 11.0 * (ux * cos - uy * sin)) as i32,
+            (end.y as f64 - 11.0 * (ux * sin + uy * cos)) as i32,
+        );
+        imgproc::line(canvas, end, back, color, 2, LINE_AA, 0)?;
+    }
     Ok(())
 }
 
