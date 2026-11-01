@@ -174,6 +174,16 @@ let
       };
     }
   ];
+  singleAltLua = evaluateFor "26.05" [
+    (hyprland { configType = "lua"; })
+    {
+      services.univim = {
+        enable = true;
+        hyprland.enable = true;
+        hyprland.altActivation = "single";
+      };
+    }
+  ];
   programsAlias = evaluate [
     {
       programs.univim.enable = true;
@@ -197,6 +207,7 @@ let
   singleCapsSettings = singleCaps.xdg.configFile."univim/settings.json".text;
   singleCapsLuaText = singleCapsLua.xdg.configFile."hypr/hyprland.lua".text;
   singleAltValues = singleAlt.wayland.windowManager.hyprland.settings;
+  singleAltLuaText = singleAltLua.xdg.configFile."hypr/hyprland.lua".text;
 
   checks = [
     (check "disabled by default" (
@@ -263,12 +274,17 @@ let
       lib.elem ", CAPS, global, univim:caps-lock" globalValues.bindn
     ))
     (check "left Alt double-tap defaults to a non-consuming global binding" (
-      lib.elem "ALT, Alt_L, global, univim:alt-left" globalValues.bindn
-      && !lib.elem "ALT, Alt_R, global, univim:alt-left" globalValues.bindn
+      lib.elem ", Alt_L, global, univim:alt-left" globalValues.bindn
+      && !lib.elem ", Alt_R, global, univim:alt-left" globalValues.bindn
     ))
     (check "single left Alt uses the hints shortcut without intercepting Alt chords" (
-      lib.elem "ALT, Alt_L, global, univim:hints" singleAltValues.bindn
-      && !lib.elem "ALT, Alt_L, global, univim:alt-left" singleAltValues.bindn
+      lib.elem ", Alt_L, global, univim:hints" singleAltValues.bindn
+      && !lib.elem ", Alt_L, global, univim:alt-left" singleAltValues.bindn
+    ))
+    (check "Lua left Alt binding has no modifier requirement" (
+      lib.hasInfix "Alt_L" singleAltLuaText
+      && lib.hasInfix "univim:hints" singleAltLuaText
+      && !lib.hasInfix "ALT + Alt_L" singleAltLuaText
     ))
     (check "settings configure the daemon and evdev" (
       lib.hasInfix "\"double_tap_ms\":240" globalSettings

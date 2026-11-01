@@ -423,6 +423,8 @@ The non-consuming shortcut leaves ordinary Alt events available, but a single
 press also activates on the first press of ordinary Alt chords. Double-tap
 recognition via compositor global shortcuts is best-effort: unrelated keys
 between taps cannot always be detected. Right Alt is never bound by this option.
+The modifier-only binding uses an empty modifier field (`bindn = , Alt_L`):
+requiring `ALT` as a modifier prevents Hyprland from matching the Alt key itself.
 CapsLock modes remain separately opt-in; disable single-press CapsLock if you
 want its normal lock behavior alongside the Alt shortcut.
 

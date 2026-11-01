@@ -119,16 +119,16 @@ let
     if cfg.hyprland.altActivation == "double" then
       [
         (if luaConfiguration then
-          luaGestureBind "ALT, Alt_L" "hl.dsp.global(\"univim:alt-left\")"
+          luaGestureBind ", Alt_L" "hl.dsp.global(\"univim:alt-left\")"
         else
-          "ALT, Alt_L, global, univim:alt-left")
+          ", Alt_L, global, univim:alt-left")
       ]
     else if cfg.hyprland.altActivation == "single" then
       [
         (if luaConfiguration then
-          luaGestureBind "ALT, Alt_L" "hl.dsp.global(\"univim:hints\")"
+          luaGestureBind ", Alt_L" "hl.dsp.global(\"univim:hints\")"
         else
-          "ALT, Alt_L, global, univim:hints")
+          ", Alt_L, global, univim:hints")
       ]
     else
       [ ]
