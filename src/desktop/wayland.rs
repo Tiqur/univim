@@ -1,1827 +1,2233 @@
-//! Persistent Wayland runtime. No surface or keyboard focus is held while idle.
-//! Selection release draining is bounded to two seconds; expiry cancels without input.
-//! Shortcut timing uses compositor timestamps, independent of event delivery delays.
+use super::{
+    CommandAction, RuntimeSettings,
+    draw::{RenderedSurface, render_session_surface},
+    evdev::EvdevKeyboardSet,
+    geometry::FrameGeometry,
+    hyprland::{self, Context as HyprContext},
+    session::{
+        Cardinal, ClickAction, GestureKey, Input, Mode, Outcome, PrecomputedFrame, Session,
+        TapEvent, TapTracker,
+    },
+    snapshot::{self, RawCaptureFrame, Saved, decode_raw_frame_to_bgr},
+};
+use crate::{DebugData, DetectorOptions, detect_with_debug};
+use opencv::{core::Mat, prelude::*};
 use std::{
-    collections::HashSet,
-    io,
-    os::{fd::AsFd, unix::net::UnixDatagram},
-    sync::{Arc, Mutex, mpsc},
+    env,
+    fs::{self, File},
+    io::{self, Read, Seek, SeekFrom, Write},
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd},
+        unix::{
+            fs::{DirBuilderExt, PermissionsExt},
+            net::UnixListener,
+        },
+    },
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
 };
-
-use super::{
-    Config,
-    geometry::{FrameGeometry, Output},
-    hyprland,
-    session::{GestureKey, Input, Mode, Outcome, Session, TapTracker},
-};
-use nix::poll::{PollFd, PollFlags, poll};
-use nix::sys::{
-    signal::{SigSet, SigmaskHow, Signal, pthread_sigmask},
-    signalfd::{SfdFlags, SignalFd},
-};
-use opencv::core::{self, Mat, MatTraitConst, MatTraitManual, Scalar};
-use serde_json::{Value, json};
-use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm,
-    output::{OutputHandler, OutputState},
-    registry::{ProvidesRegistryState, RegistryState},
-    registry_handlers,
-    seat::{
-        Capability, SeatHandler, SeatState,
-        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
-    },
-    shell::{
-        WaylandSurface,
-        wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-            LayerSurfaceConfigure,
-        },
-    },
-    shm::{Shm, ShmHandler, raw::RawPool, slot::SlotPool},
-};
+use tempfile::tempfile;
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, WEnum,
-    globals::registry_queue_init,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop,
+    globals::{GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
-        wl_buffer, wl_callback, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
+        wl_buffer::{self, WlBuffer},
+        wl_callback::{self, WlCallback},
+        wl_compositor::WlCompositor,
+        wl_display::WlDisplay,
+        wl_keyboard::{self, KeyState, WlKeyboard},
+        wl_output::{self, Transform, WlOutput},
+        wl_pointer::{self},
+        wl_registry::{self, WlRegistry},
+        wl_seat::{self, WlSeat},
+        wl_shm::{self, Format as ShmFormat, WlShm},
+        wl_shm_pool::WlShmPool,
+        wl_surface::WlSurface,
     },
 };
-use wayland_protocols_hyprland::{
-    global_shortcuts::v1::client::{
-        hyprland_global_shortcut_v1 as shortcut, hyprland_global_shortcuts_manager_v1 as shortcuts,
-    },
-    lock_notify::v1::client::{
-        hyprland_lock_notification_v1 as lock, hyprland_lock_notifier_v1 as locks,
-    },
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
+use wayland_protocols_hyprland::global_shortcuts::v1::client::{
+    hyprland_global_shortcut_v1::{self, HyprlandGlobalShortcutV1},
+    hyprland_global_shortcuts_manager_v1::{self, HyprlandGlobalShortcutsManagerV1},
 };
 use wayland_protocols_wlr::{
+    layer_shell::v1::client::{
+        zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
+        zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
+    },
     screencopy::v1::client::{
-        zwlr_screencopy_frame_v1 as frame, zwlr_screencopy_manager_v1 as capture,
+        zwlr_screencopy_frame_v1::{self, Flags as ScreencopyFlags, ZwlrScreencopyFrameV1},
+        zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
     },
     virtual_pointer::v1::client::{
-        zwlr_virtual_pointer_manager_v1 as pointers, zwlr_virtual_pointer_v1 as pointer,
+        zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
+        zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
     },
 };
+use xkbcommon::xkb;
 
-fn error(e: impl std::fmt::Display) -> String {
-    e.to_string()
-}
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
-fn ready_to_unmap(drain_input: bool, keys: usize, buttons: usize, modifiers: bool) -> bool {
-    // Capture-only cancellation has no keyboard focus and cannot receive releases.
-    // A mapped overlay drains selection AND cancellation keys before losing focus.
-    !drain_input || (keys == 0 && buttons == 0 && !modifiers)
-}
+/// Interval between automatic pipeline re-captures when `F6` Continuous Loop mode is active.
+const AUTO_LOOP_INTERVAL: Duration = Duration::from_millis(650);
 
-fn validate_session(active_work: bool, finishing: bool, syncing: bool, click: bool) -> bool {
-    (active_work && !finishing && !syncing) || click
-}
+pub fn run_daemon(socket_path: &Path, settings: RuntimeSettings) -> Result<(), String> {
+    ensure_wayland_and_hyprland_env();
 
-fn release_drain_expired(deadline: &mut Option<Instant>, now: Instant) -> bool {
-    if deadline.is_some_and(|end| now >= end) {
-        *deadline = None;
-        true
-    } else {
-        false
+    if let Some(parent) = socket_path.parent() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        let metadata = fs::symlink_metadata(parent)
+            .map_err(|err| format!("failed to inspect {}: {err}", parent.display()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "control socket parent {} is not a real directory",
+                parent.display()
+            ));
+        }
     }
+    if socket_path.exists() {
+        return Err(format!(
+            "control socket {} already exists; verify no daemon is running, then remove it",
+            socket_path.display()
+        ));
+    }
+
+    let listener = UnixListener::bind(socket_path)
+        .map_err(|err| format!("failed to bind {}: {err}", socket_path.display()))?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("failed to secure {}: {err}", socket_path.display()))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| format!("failed to make control socket nonblocking: {err}"))?;
+
+    let conn = Connection::connect_to_env()
+        .map_err(|err| format!("failed to connect to Wayland compositor: {err}"))?;
+    let (globals, mut event_queue) = registry_queue_init::<DaemonState>(&conn)
+        .map_err(|err| format!("failed to initialize Wayland globals: {err}"))?;
+    let qh = event_queue.handle();
+
+    let mut state = DaemonState::bind(&globals, conn.display(), &qh, settings)?;
+    event_queue
+        .roundtrip(&mut state)
+        .map_err(|err| format!("initial Wayland roundtrip failed: {err}"))?;
+    state.finish_init(&qh)?;
+    event_queue
+        .roundtrip(&mut state)
+        .map_err(|err| format!("post-init Wayland roundtrip failed: {err}"))?;
+
+    let result = daemon_loop(&conn, &mut event_queue, &qh, &listener, &mut state);
+    let _ = fs::remove_file(socket_path);
+    result
 }
 
-fn gesture_event(
-    tracker: &mut TapTracker,
-    key: GestureKey,
-    event: shortcut::Event,
-) -> Option<Mode> {
-    let (pressed, hi, lo, nanos) = match event {
-        shortcut::Event::Pressed {
-            tv_sec_hi,
-            tv_sec_lo,
-            tv_nsec,
-        } => (true, tv_sec_hi, tv_sec_lo, tv_nsec),
-        shortcut::Event::Released {
-            tv_sec_hi,
-            tv_sec_lo,
-            tv_nsec,
-        } => (false, tv_sec_hi, tv_sec_lo, tv_nsec),
-        _ => return None,
+/// Capture one monitor and save numbered raw, annotated, and JSON artifacts
+/// without creating an overlay layer or listening for input.
+pub fn capture_snapshot(
+    output: Option<&str>,
+    directory: &Path,
+    options: DetectorOptions,
+    flat: bool,
+) -> Result<Saved, String> {
+    ensure_wayland_and_hyprland_env();
+    let conn = Connection::connect_to_env()
+        .map_err(|err| format!("failed to connect to Wayland compositor: {err}"))?;
+    let (globals, mut event_queue) = registry_queue_init::<DaemonState>(&conn)
+        .map_err(|err| format!("failed to initialize Wayland globals: {err}"))?;
+    let qh = event_queue.handle();
+    let settings = RuntimeSettings {
+        detector: options,
+        output: output.map(str::to_owned),
+        no_click: true,
+        flat,
+        ..RuntimeSettings::default()
     };
-    if nanos >= 1_000_000_000 {
-        tracker.reset();
-        return None;
-    }
-    let time = Duration::new((u64::from(hi) << 32) | u64::from(lo), nanos);
-    // TapTracker rejects backward protocol timestamps and invalidates the gesture.
-    if pressed {
-        tracker.press(key, time);
-        None
-    } else {
-        tracker.release(key, time)
-    }
-}
-
-/// Enumeration only: deliberately does not bind input extensions or create surfaces.
-pub fn check() -> Result<Value, String> {
-    let conn = Connection::connect_to_env().map_err(error)?;
-    let (globals, mut queue) = registry_queue_init::<State>(&conn).map_err(error)?;
-    let qh = queue.handle();
-    let mut state = State::new(&globals, &qh)?;
-    queue.roundtrip(&mut state).map_err(error)?;
-    let protocols = globals.contents().with_list(|list| {
-        list.iter()
-            .map(|g| json!({"interface":g.interface,"version":g.version}))
-            .collect::<Vec<_>>()
-    });
-    let outputs = state
-        .outputs
-        .outputs()
-        .filter_map(|o| state.outputs.info(&o).and_then(|i| i.name))
-        .collect::<Vec<_>>();
-    Ok(json!({"protocols":protocols,"outputs":outputs,
-        "gesture_limitation":"Anonymous compositor shortcuts cannot observe arbitrary intervening chords; configure nonconsuming modifier-only press/release bindings."}))
-}
-
-/// One-shot native capture for numbered diagnostic snapshots. No surface or
-/// input object is created; the frame is decoded upright into owned BGR memory.
-pub struct Captured {
-    pub image: Mat,
-    pub targets: Vec<crate::Target>,
-    pub output: Output,
-    pub timings: Value,
-}
-
-pub fn capture(output_name: Option<&str>, options: crate::Options) -> Result<Captured, String> {
-    let conn = Connection::connect_to_env().map_err(error)?;
-    let (globals, mut queue) = registry_queue_init::<State>(&conn).map_err(error)?;
-    let qh = queue.handle();
-    let mut state = State::new(&globals, &qh)?;
-    state.capture_manager = Some(globals.bind(&qh, 3..=3, ()).map_err(error)?);
-    queue.roundtrip(&mut state).map_err(error)?;
-
-    let output = hyprland::selected_output(output_name)?;
-    let (logical_w, logical_h) = output.logical_size()?;
-    if !logical_w.is_finite()
-        || !logical_h.is_finite()
-        || logical_w < 1.
-        || logical_h < 1.
-        || logical_w > 32768.
-        || logical_h > 32768.
-    {
-        return Err("invalid output logical size".into());
-    }
-    let wl_output = state
-        .outputs
-        .outputs()
-        .find(|candidate| {
-            state
-                .outputs
-                .info(candidate)
-                .is_some_and(|info| info.name.as_deref() == Some(output.name.as_str()))
-        })
-        .ok_or("selected output is absent from Wayland registry")?;
-    state.output = Some(wl_output.clone());
-    state.geometry = Some(FrameGeometry {
-        output: output.clone(),
-        pixel_width: 1,
-        pixel_height: 1,
-    });
-    state.size = (logical_w.round() as u32, logical_h.round() as u32);
-    let manager = state
-        .capture_manager
-        .as_ref()
-        .ok_or("screencopy unavailable")?;
-    state.capture = Some(Capture {
-        frame: manager.capture_output(0, &wl_output, &qh, ()),
-        pool: None,
-        buffer: None,
-        format: None,
-        width: 0,
-        height: 0,
-        stride: 0,
-        inverted: false,
-        started: Instant::now(),
-    });
+    let mut state = DaemonState::bind(&globals, conn.display(), &qh, settings)?;
+    event_queue
+        .roundtrip(&mut state)
+        .map_err(|err| format!("initial Wayland roundtrip failed: {err}"))?;
+    state.finish_init(&qh)?;
+    event_queue
+        .roundtrip(&mut state)
+        .map_err(|err| format!("post-init Wayland roundtrip failed: {err}"))?;
+    state.snapshot_dir = Some(directory.to_path_buf());
+    state.start_capture(CapturePurpose::Snapshot, &qh)?;
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        queue.dispatch_pending(&mut state).map_err(error)?;
-        if let Some(failure) = state.failure.take() {
-            return Err(failure);
+        event_queue
+            .blocking_dispatch(&mut state)
+            .map_err(|err| format!("snapshot event loop failed: {err}"))?;
+        if let Some(err) = state.last_error.take() {
+            return Err(err);
         }
-        if state.captured.is_some() {
-            break;
+        if let Some(saved) = state.snapshot_saved.take() {
+            return Ok(saved);
+        }
+        state.step(&qh)?;
+        if let Some(saved) = state.snapshot_saved.take() {
+            return Ok(saved);
         }
         if Instant::now() >= deadline {
             return Err("snapshot capture timed out".into());
         }
-        let blocked = match conn.flush() {
-            Ok(()) => false,
-            Err(wayland_client::backend::WaylandError::Io(ref e))
-                if e.kind() == io::ErrorKind::WouldBlock =>
-            {
-                true
-            }
-            Err(e) => return Err(error(e)),
-        };
-        let Some(guard) = queue.prepare_read() else {
-            continue;
-        };
-        let mut flags = PollFlags::POLLIN;
-        if blocked {
-            flags |= PollFlags::POLLOUT;
-        }
-        let mut fds = [PollFd::new(conn.as_fd(), flags)];
-        poll(&mut fds, Some(250u16)).map_err(error)?;
-        let revents = fds[0].revents().unwrap_or(PollFlags::empty());
-        if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
-            drop(guard);
-            return Err("Wayland connection closed during snapshot".into());
-        }
-        if revents.contains(PollFlags::POLLIN) {
-            match guard.read() {
-                Ok(_) => {}
-                Err(wayland_client::backend::WaylandError::Io(ref e))
-                    if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(error(e)),
-            }
-        } else {
-            drop(guard);
-        }
     }
-
-    let image = state.captured.take().ok_or("snapshot produced no image")?;
-    if let Some(geometry) = state.geometry.as_mut() {
-        geometry.pixel_width = image.cols();
-        geometry.pixel_height = image.rows();
-        let output = geometry.output.clone();
-        let (targets, timings) = crate::detect(&image, options).map_err(error)?;
-        return Ok(Captured {
-            image,
-            targets,
-            output,
-            timings,
-        });
-    }
-    Err("snapshot geometry is missing".into())
 }
 
-struct Capture {
-    frame: frame::ZwlrScreencopyFrameV1,
-    pool: Option<RawPool>,
-    buffer: Option<wl_buffer::WlBuffer>,
-    format: Option<wl_shm::Format>,
+struct CheckState;
+
+impl Dispatch<WlRegistry, GlobalListContents> for CheckState {
+    fn event(
+        _state: &mut Self,
+        _registry: &WlRegistry,
+        _event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// Enumerate advertised Wayland globals and the Hyprland focused output without
+/// binding input extensions or creating a surface.
+pub fn check() -> Result<serde_json::Value, String> {
+    ensure_wayland_and_hyprland_env();
+    let conn = Connection::connect_to_env()
+        .map_err(|err| format!("failed to connect to Wayland compositor: {err}"))?;
+    let (globals, mut event_queue) = registry_queue_init::<CheckState>(&conn)
+        .map_err(|err| format!("failed to initialize Wayland globals: {err}"))?;
+    let mut state = CheckState;
+    event_queue
+        .roundtrip(&mut state)
+        .map_err(|err| format!("Wayland registry roundtrip failed: {err}"))?;
+    let protocols = globals.contents().with_list(|list| {
+        list.iter()
+            .map(|global| {
+                serde_json::json!({
+                    "interface": global.interface,
+                    "version": global.version,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let focused_output = hyprland::selected_output(None).ok();
+    Ok(serde_json::json!({
+        "protocols": protocols,
+        "focused_output": focused_output,
+        "gesture_limitation": "Anonymous compositor shortcuts cannot observe arbitrary intervening chords; configure nonconsuming modifier-only or evdev bindings."
+    }))
+}
+
+/// Auto-discover `WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE` inside `$XDG_RUNTIME_DIR`
+/// if systemd user service started before the environment variables were imported.
+fn ensure_wayland_and_hyprland_env() {
+    let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) else {
+        return;
+    };
+    if env::var_os("WAYLAND_DISPLAY").is_none()
+        && let Ok(entries) = fs::read_dir(&runtime_dir)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            if s.starts_with("wayland-") && !s.ends_with(".lock") {
+                // SAFETY: environment mutation happens once during startup,
+                // before any other threads are spawned.
+                unsafe {
+                    env::set_var("WAYLAND_DISPLAY", s.as_ref());
+                }
+                break;
+            }
+        }
+    }
+    if env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+        let hypr_dir = runtime_dir.join("hypr");
+        if let Ok(entries) = fs::read_dir(hypr_dir) {
+            for entry in entries.flatten() {
+                if entry.path().join(".socket.sock").exists() {
+                    // SAFETY: see the WAYLAND_DISPLAY discovery above.
+                    unsafe {
+                        env::set_var("HYPRLAND_INSTANCE_SIGNATURE", entry.file_name());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn daemon_loop(
+    conn: &Connection,
+    event_queue: &mut EventQueue<DaemonState>,
+    qh: &QueueHandle<DaemonState>,
+    listener: &UnixListener,
+    state: &mut DaemonState,
+) -> Result<(), String> {
+    while !state.should_exit {
+        event_queue
+            .dispatch_pending(state)
+            .map_err(|err| format!("Wayland dispatch failed: {err}"))?;
+        state.poll_worker_results(qh)?;
+        state.step(qh)?;
+        conn.flush()
+            .map_err(|err| format!("Wayland flush failed: {err}"))?;
+
+        accept_control_commands(listener, state, qh)?;
+        state.poll_evdev_shortcuts(qh)?;
+        state.poll_auto_loop(qh)?;
+        state.poll_worker_results(qh)?;
+        state.step(qh)?;
+        conn.flush()
+            .map_err(|err| format!("Wayland flush failed: {err}"))?;
+
+        if state.should_exit {
+            break;
+        }
+
+        if let Some(read_guard) = event_queue.prepare_read() {
+            let wayland_fd = read_guard.connection_fd();
+            let evdev_fd = state.evdev_fd();
+            let timeout = if state.has_async_work() {
+                5
+            } else if state.is_auto_loop_active() {
+                35
+            } else {
+                250
+            };
+            let ready = poll_fds(wayland_fd, listener.as_fd(), evdev_fd, timeout)?;
+            if ready.wayland_readable {
+                read_guard
+                    .read()
+                    .map_err(|err| format!("failed to read Wayland events: {err}"))?;
+            } else {
+                drop(read_guard);
+            }
+            if ready.control_readable {
+                accept_control_commands(listener, state, qh)?;
+            }
+            if ready.evdev_readable {
+                state.poll_evdev_shortcuts(qh)?;
+            }
+        }
+        event_queue
+            .dispatch_pending(state)
+            .map_err(|err| format!("Wayland dispatch failed: {err}"))?;
+        state.poll_worker_results(qh)?;
+        state.step(qh)?;
+    }
+    Ok(())
+}
+
+struct PollOutcome {
+    wayland_readable: bool,
+    control_readable: bool,
+    evdev_readable: bool,
+}
+
+fn poll_fds(
+    wayland_fd: BorrowedFd<'_>,
+    control_fd: BorrowedFd<'_>,
+    evdev_fd: Option<BorrowedFd<'_>>,
+    timeout_ms: i32,
+) -> Result<PollOutcome, String> {
+    let mut fds = vec![
+        libc::pollfd {
+            fd: wayland_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: control_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    if let Some(efd) = evdev_fd {
+        fds.push(libc::pollfd {
+            fd: efd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            return Ok(PollOutcome {
+                wayland_readable: false,
+                control_readable: false,
+                evdev_readable: false,
+            });
+        }
+        return Err(format!("poll(2) failed: {err}"));
+    }
+    Ok(PollOutcome {
+        wayland_readable: (fds[0].revents & libc::POLLIN) != 0,
+        control_readable: (fds[1].revents & libc::POLLIN) != 0,
+        evdev_readable: fds
+            .get(2)
+            .is_some_and(|pfd| (pfd.revents & libc::POLLIN) != 0),
+    })
+}
+
+fn accept_control_commands(
+    listener: &UnixListener,
+    state: &mut DaemonState,
+    qh: &QueueHandle<DaemonState>,
+) -> Result<(), String> {
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _addr)) => {
+                let mut text = String::new();
+                stream
+                    .read_to_string(&mut text)
+                    .map_err(|err| format!("failed to read control command: {err}"))?;
+                if let Some(action) = CommandAction::from_wire(&text) {
+                    state.enqueue_command(action, qh)?;
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) => return Err(format!("failed to accept control socket client: {err}")),
+        }
+    }
+}
+
+struct WorkerJob {
+    job_id: u64,
+    purpose: CapturePurpose,
+    output_name: Option<String>,
+    geometry: FrameGeometry,
+    upright_w: i32,
+    upright_h: i32,
+    bgr_bytes: Vec<u8>,
+    options: DetectorOptions,
+    flat: bool,
+}
+
+struct WorkerOutput {
+    job_id: u64,
+    purpose: CapturePurpose,
+    geometry: FrameGeometry,
+    frame: PrecomputedFrame,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapturePurpose {
+    /// Silent background capture triggered on the 1st tap of `ff` / `gg` / `CapsLock`.
+    SpeculativeWarmup,
+    /// Immediate overlay presentation (either direct `hints` or promoted 2nd tap).
+    PresentOverlay(Mode),
+    /// Re-capture while an overlay session is already active (after scroll or `r` / `F5` / `F6` loop).
+    RefreshOverlay,
+    /// One-shot numbered snapshot with no overlay or input surface.
+    Snapshot,
+}
+
+struct DaemonState {
+    settings: RuntimeSettings,
+    display: WlDisplay,
+    compositor: WlCompositor,
+    shm: WlShm,
+    layer_shell: ZwlrLayerShellV1,
+    screencopy_manager: ZwlrScreencopyManagerV1,
+    virtual_pointer_manager: ZwlrVirtualPointerManagerV1,
+    viewporter: Option<WpViewporter>,
+    shortcuts_manager: Option<HyprlandGlobalShortcutsManagerV1>,
+    shortcuts: Vec<HyprlandGlobalShortcutV1>,
+    seat: Option<WlSeat>,
+    keyboard: Option<WlKeyboard>,
+    outputs: Vec<OutputInfo>,
+    xkb_context: xkb::Context,
+    xkb_state: Option<xkb::State>,
+    pending_command: Option<CommandAction>,
+    capture: Option<ActiveCapture>,
+    overlay: Option<ActiveOverlay>,
+    layer: Option<OverlayLayer>,
+    pending_click: Option<PendingClick>,
+    pending_re_capture: Option<PendingReCapture>,
+    sync_pending: bool,
+    should_exit: bool,
+    last_error: Option<String>,
+    tap_tracker: TapTracker,
+    cached_frame: Option<PrecomputedFrame>,
+    next_job_id: u64,
+    inflight_job: Option<(u64, CapturePurpose)>,
+    worker_tx: Sender<WorkerJob>,
+    worker_rx: Receiver<WorkerOutput>,
+    evdev: EvdevKeyboardSet,
+    snapshot_dir: Option<PathBuf>,
+    snapshot_saved: Option<Saved>,
+}
+
+#[derive(Clone)]
+struct OutputInfo {
+    wl_output: WlOutput,
+    global_name: u32,
+    name: Option<String>,
+    logical_width: i32,
+    logical_height: i32,
+    mode_width: i32,
+    mode_height: i32,
+    x: i32,
+    y: i32,
+    scale: i32,
+    transform: Transform,
+}
+
+impl OutputInfo {
+    fn new(wl_output: WlOutput, global_name: u32) -> Self {
+        Self {
+            wl_output,
+            global_name,
+            name: None,
+            logical_width: 0,
+            logical_height: 0,
+            mode_width: 0,
+            mode_height: 0,
+            x: 0,
+            y: 0,
+            scale: 1,
+            transform: Transform::Normal,
+        }
+    }
+
+    fn as_output(&self) -> crate::desktop::geometry::Output {
+        crate::desktop::geometry::Output {
+            name: self.name.clone().unwrap_or_default(),
+            x: self.x,
+            y: self.y,
+            width: self.mode_width,
+            height: self.mode_height,
+            scale: f64::from(self.scale.max(1)),
+            transform: match self.transform {
+                Transform::Normal => 0,
+                Transform::_90 => 1,
+                Transform::_180 => 2,
+                Transform::_270 => 3,
+                Transform::Flipped => 4,
+                Transform::Flipped90 => 5,
+                Transform::Flipped180 => 6,
+                Transform::Flipped270 => 7,
+                _ => 0,
+            },
+        }
+    }
+
+    fn resolved_logical_size(&self) -> (i32, i32) {
+        if self.logical_width > 0 && self.logical_height > 0 {
+            return (self.logical_width, self.logical_height);
+        }
+        let scale = self.scale.max(1);
+        let (w, h) = match self.transform {
+            Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => {
+                (self.mode_height, self.mode_width)
+            }
+            _ => (self.mode_width, self.mode_height),
+        };
+        ((w / scale).max(1), (h / scale).max(1))
+    }
+}
+
+struct ActiveCapture {
+    purpose: CapturePurpose,
+    output: OutputInfo,
+    frame: ZwlrScreencopyFrameV1,
+    spec: Option<BufferSpec>,
+    shm_file: Option<File>,
+    buffer: Option<WlBuffer>,
+    flags: ScreencopyFlags,
+    ready: bool,
+    failed: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BufferSpec {
+    format: ShmFormat,
     width: u32,
     height: u32,
     stride: u32,
-    inverted: bool,
-    started: Instant,
-}
-impl Drop for Capture {
-    fn drop(&mut self) {
-        self.frame.destroy();
-        if let Some(buffer) = self.buffer.take() {
-            buffer.destroy();
-        }
-    }
 }
 
-struct Work {
-    generation: u64,
-    image: Mat,
-    options: crate::Options,
-}
-struct Detection {
-    generation: u64,
-    result: Result<(Mat, Vec<crate::Target>), String>,
-}
-
-// One running job plus one replaceable pending job; cancellation never spawns threads.
-struct Worker {
-    pending: Arc<Mutex<Option<Work>>>,
-    trigger: Option<mpsc::SyncSender<()>>,
-    results: Arc<Mutex<Option<Detection>>>,
-    wake: UnixDatagram,
-    join: Option<thread::JoinHandle<()>>,
-}
-impl Worker {
-    fn new() -> Result<Self, String> {
-        let (wake, notify) = UnixDatagram::pair().map_err(error)?;
-        wake.set_nonblocking(true).map_err(error)?;
-        notify.set_nonblocking(true).map_err(error)?;
-        let pending = Arc::new(Mutex::new(None::<Work>));
-        let shared = pending.clone();
-        let (trigger, jobs) = mpsc::sync_channel(1);
-        let results = Arc::new(Mutex::new(None));
-        let send = results.clone();
-        let join = thread::spawn(move || {
-            while jobs.recv().is_ok() {
-                let work = shared.lock().ok().and_then(|mut p| p.take());
-                let Some(work) = work else { continue };
-                let start = Instant::now();
-                let result = crate::detect(&work.image, work.options)
-                    .map(|(targets, timing)| {
-                        eprintln!(
-                            "univim detection timing={timing} elapsed_ms={:.1}",
-                            start.elapsed().as_secs_f64() * 1000.
-                        );
-                        (work.image, targets)
-                    })
-                    .map_err(error);
-                // Replace stale results without ever blocking on the event loop.
-                if let Ok(mut slot) = send.lock() {
-                    *slot = Some(Detection {
-                        generation: work.generation,
-                        result,
-                    });
-                    let _ = notify.send(&[1]);
-                }
-            }
-        });
-        Ok(Self {
-            pending,
-            trigger: Some(trigger),
-            results,
-            wake,
-            join: Some(join),
-        })
-    }
-    fn submit(&self, work: Work) -> Result<(), String> {
-        *self.pending.lock().map_err(error)? = Some(work);
-        if let Some(trigger) = &self.trigger {
-            let _ = trigger.try_send(());
-        }
-        Ok(())
-    }
-    fn clear(&self) {
-        if let Ok(mut p) = self.pending.lock() {
-            *p = None;
-        }
-    }
-}
-impl Drop for Worker {
-    fn drop(&mut self) {
-        self.clear();
-        self.trigger.take();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-    }
+struct ActiveOverlay {
+    output: OutputInfo,
+    geometry: FrameGeometry,
+    base_bgr: Mat,
+    debug_data: Option<DebugData>,
+    session: Session,
+    last_loop_refresh: Instant,
 }
 
-struct State {
-    registry: RegistryState,
-    seats: SeatState,
-    outputs: OutputState,
-    compositor: CompositorState,
-    layers: LayerShell,
-    shm: Shm,
-    pool: SlotPool,
-    keyboard: Option<wl_keyboard::WlKeyboard>,
-    physical_pointer: Option<wl_pointer::WlPointer>,
-    input_enabled: bool,
-    layer: Option<LayerSurface>,
+struct OverlayLayer {
+    surface: WlSurface,
+    layer_surface: ZwlrLayerSurfaceV1,
+    viewport: Option<WpViewport>,
+    logical_width: u32,
+    logical_height: u32,
     configured: bool,
-    size: (u32, u32),
+    closed: bool,
+    slot: Option<ShmSlot>,
     dirty: bool,
-    color_by_type: bool,
-    capture_manager: Option<capture::ZwlrScreencopyManagerV1>,
-    pointer_manager: Option<pointers::ZwlrVirtualPointerManagerV1>,
-    shortcuts: Vec<shortcut::HyprlandGlobalShortcutV1>,
-    notification: Option<lock::HyprlandLockNotificationV1>,
-    capture: Option<Capture>,
-    captured: Option<Mat>,
-    session: Option<Session>,
-    background: Option<Mat>,
-    geometry: Option<FrameGeometry>,
-    output: Option<wl_output::WlOutput>,
-    context: Option<hyprland::Context>,
-    mode: Option<Mode>,
-    requested: Option<Mode>,
-    generation: u64,
-    pressed: HashSet<u32>,
-    buttons: HashSet<u32>,
-    modifiers: bool,
-    finishing: bool,
-    release_deadline: Option<Instant>,
-    click: Option<(f64, f64)>,
-    sync_pending: bool,
-    locked: bool,
-    quit: bool,
-    failure: Option<String>,
-    invalidated: bool,
-    tracker: TapTracker,
-    clock: Instant,
-    active_since: Instant,
-    context_checked: Instant,
-    overlay_committed: bool,
-    session_count: u64,
 }
-impl State {
-    fn new(
-        globals: &wayland_client::globals::GlobalList,
+
+struct ShmSlot {
+    file: File,
+    buffer: WlBuffer,
+    len: usize,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Clone, Copy)]
+struct PendingClick {
+    output_index: usize,
+    logical_width: u32,
+    logical_height: u32,
+    x: u32,
+    y: u32,
+    action: ClickAction,
+    drag_from: Option<(u32, u32)>,
+}
+
+struct PendingReCapture {
+    scroll: Option<(i32, i32)>,
+    settle_until: Option<Instant>,
+}
+
+impl DaemonState {
+    fn bind(
+        globals: &GlobalList,
+        display: WlDisplay,
         qh: &QueueHandle<Self>,
+        settings: RuntimeSettings,
     ) -> Result<Self, String> {
-        let shm = Shm::bind(globals, qh).map_err(error)?;
-        let pool = SlotPool::new(4096, &shm).map_err(error)?;
+        let compositor: WlCompositor = globals
+            .bind(qh, 4..=6, ())
+            .map_err(|err| format!("missing wl_compositor: {err}"))?;
+        let shm: WlShm = globals
+            .bind(qh, 1..=1, ())
+            .map_err(|err| format!("missing wl_shm: {err}"))?;
+        let layer_shell: ZwlrLayerShellV1 = globals
+            .bind(qh, 1..=4, ())
+            .map_err(|err| format!("missing zwlr_layer_shell_v1: {err}"))?;
+        let screencopy_manager: ZwlrScreencopyManagerV1 = globals
+            .bind(qh, 1..=3, ())
+            .map_err(|err| format!("missing zwlr_screencopy_manager_v1: {err}"))?;
+        let virtual_pointer_manager: ZwlrVirtualPointerManagerV1 = globals
+            .bind(qh, 1..=2, ())
+            .map_err(|err| format!("missing zwlr_virtual_pointer_manager_v1: {err}"))?;
+        let viewporter: Option<WpViewporter> = globals.bind(qh, 1..=1, ()).ok();
+        let shortcuts_manager: Option<HyprlandGlobalShortcutsManagerV1> =
+            globals.bind(qh, 1..=1, ()).ok();
+        let seat: Option<WlSeat> = globals.bind(qh, 1..=8, ()).ok();
+
+        let mut outputs = Vec::new();
+        globals.contents().with_list(|list| {
+            for global in list {
+                if global.interface == WlOutput::interface().name {
+                    let version = global.version.min(4);
+                    let wl_output = globals.registry().bind::<WlOutput, _, _>(
+                        global.name,
+                        version,
+                        qh,
+                        global.name,
+                    );
+                    outputs.push(OutputInfo::new(wl_output, global.name));
+                }
+            }
+        });
+
+        let (worker_tx, job_rx) = mpsc::channel::<WorkerJob>();
+        let (res_tx, worker_rx) = mpsc::channel::<WorkerOutput>();
+        thread::Builder::new()
+            .name("univim-detector".to_string())
+            .spawn(move || detector_worker_loop(job_rx, res_tx))
+            .map_err(|err| format!("failed to spawn background detector thread: {err}"))?;
+
+        let evdev = EvdevKeyboardSet::discover();
+
         Ok(Self {
-            registry: RegistryState::new(globals),
-            seats: SeatState::new(globals, qh),
-            outputs: OutputState::new(globals, qh),
-            compositor: CompositorState::bind(globals, qh).map_err(error)?,
-            layers: LayerShell::bind(globals, qh).map_err(error)?,
+            settings,
+            display,
+            compositor,
             shm,
-            pool,
+            layer_shell,
+            screencopy_manager,
+            virtual_pointer_manager,
+            viewporter,
+            shortcuts_manager,
+            shortcuts: Vec::new(),
+            seat,
             keyboard: None,
-            physical_pointer: None,
-            input_enabled: false,
-            layer: None,
-            configured: false,
-            size: (1, 1),
-            dirty: false,
-            color_by_type: false,
-            capture_manager: None,
-            pointer_manager: None,
-            shortcuts: vec![],
-            notification: None,
+            outputs,
+            xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            xkb_state: None,
+            pending_command: None,
             capture: None,
-            captured: None,
-            session: None,
-            background: None,
-            geometry: None,
-            output: None,
-            context: None,
-            mode: None,
-            requested: None,
-            generation: 0,
-            pressed: HashSet::new(),
-            buttons: HashSet::new(),
-            modifiers: false,
-            finishing: false,
-            release_deadline: None,
-            click: None,
+            overlay: None,
+            layer: None,
+            pending_click: None,
+            pending_re_capture: None,
             sync_pending: false,
-            locked: false,
-            quit: false,
-            failure: None,
-            invalidated: false,
-            tracker: TapTracker::default(),
-            clock: Instant::now(),
-            active_since: Instant::now(),
-            context_checked: Instant::now(),
-            overlay_committed: false,
-            session_count: 0,
+            should_exit: false,
+            last_error: None,
+            tap_tracker: TapTracker::new(),
+            cached_frame: None,
+            next_job_id: 1,
+            inflight_job: None,
+            worker_tx,
+            worker_rx,
+            evdev,
+            snapshot_dir: None,
+            snapshot_saved: None,
         })
     }
-    fn cancel(&mut self) {
-        let drain_input = !self.finishing
-            && self.layer.is_some()
-            && (!self.pressed.is_empty() || !self.buttons.is_empty() || self.modifiers);
-        self.generation = self.generation.wrapping_add(1);
-        self.capture.take();
-        self.captured = None;
-        self.session = None;
-        self.background = None;
-        self.dirty = false;
-        self.click = None;
-        self.release_deadline = drain_input.then(|| Instant::now() + Duration::from_secs(2));
-        self.finishing = self.mode.is_some();
-        self.tracker.reset();
-    }
-    fn unmap(&mut self, conn: &Connection, qh: &QueueHandle<Self>) {
-        if let Some(layer) = self.layer.take() {
-            let surface = layer.wl_surface().clone();
-            layer.wl_surface().attach(None, 0, 0);
-            layer.commit();
-            drop(layer);
-            surface.destroy();
+
+    fn finish_init(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
+        if self.outputs.is_empty() {
+            return Err("Wayland compositor exposed no wl_output globals".to_string());
         }
-        self.configured = false;
-        self.release_deadline = None;
-        self.dirty = false;
-        self.pressed.clear();
-        self.buttons.clear();
-        self.modifiers = false;
-        self.sync_pending = true;
-        conn.display().sync(qh, ());
-    }
-    fn begin(&mut self, mode: Mode, config: &Config, qh: &QueueHandle<Self>) -> Result<(), String> {
-        if self.locked {
-            return Err("session is locked".into());
-        }
-        if self.keyboard.is_none() {
-            return Err("no Wayland keyboard is available for exclusive cancellation".into());
-        }
-        let context = hyprland::context()?;
-        let output = hyprland::selected_output(config.output.as_deref())?;
-        let (w, h) = output.logical_size()?;
-        if !w.is_finite() || !h.is_finite() || w < 1. || h < 1. || w > 32768. || h > 32768. {
-            return Err("invalid output logical size".into());
-        }
-        let wl_output = self
-            .outputs
-            .outputs()
-            .find(|o| {
-                self.outputs
-                    .info(o)
-                    .is_some_and(|i| i.name.as_deref() == Some(output.name.as_str()))
-            })
-            .ok_or("selected output is absent from Wayland registry")?;
-        if !hyprland::still_current(&context)? {
-            return Err("context changed before capture".into());
-        }
-        self.generation = self.generation.wrapping_add(1);
-        self.mode = Some(mode);
-        self.context = Some(context);
-        self.output = Some(wl_output.clone());
-        self.geometry = Some(FrameGeometry {
-            output,
-            pixel_width: 1,
-            pixel_height: 1,
-        });
-        self.size = (w.round() as u32, h.round() as u32);
-        self.active_since = Instant::now();
-        self.overlay_committed = false;
-        self.session_count = self.session_count.wrapping_add(1);
-        self.context_checked = Instant::now();
-        self.invalidated = false;
-        self.finishing = false;
-        self.release_deadline = None;
-        self.click = None;
-        self.dirty = false;
-        // Capture must finish before even the loading surface is created.
-        let manager = self
-            .capture_manager
-            .as_ref()
-            .ok_or("screencopy unavailable")?;
-        self.capture = Some(Capture {
-            frame: manager.capture_output(0, &wl_output, qh, ()),
-            pool: None,
-            buffer: None,
-            format: None,
-            width: 0,
-            height: 0,
-            stride: 0,
-            inverted: false,
-            started: Instant::now(),
-        });
-        Ok(())
-    }
-    fn show(&mut self, qh: &QueueHandle<Self>) {
-        let surface = self.compositor.create_surface(qh);
-        let layer = self.layers.create_layer_surface(
-            qh,
-            surface,
-            Layer::Overlay,
-            Some("univim"),
-            self.output.as_ref(),
-        );
-        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        layer.set_size(self.size.0, self.size.1);
-        layer.commit();
-        self.layer = Some(layer);
-    }
-    fn draw(&mut self) -> Result<(), String> {
-        if !self.configured || self.finishing {
-            return Ok(());
-        }
-        let Some(layer) = &self.layer else {
-            return Ok(());
-        };
-        let (w, h) = self.size;
-        let loading;
-        let session = if let Some(session) = &self.session {
-            session
-        } else {
-            loading = Session::hints(w as i32, h as i32, vec![]);
-            &loading
-        };
-        let pixels =
-            super::draw::render(session, self.background.as_ref(), w, h, self.color_by_type)?;
-        let expected = w as usize * h as usize * 4;
-        if pixels.len() != expected {
-            return Err("renderer returned wrong buffer size".into());
-        }
-        let (buffer, canvas) = self
-            .pool
-            .create_buffer(w as i32, h as i32, w as i32 * 4, wl_shm::Format::Argb8888)
-            .map_err(error)?;
-        canvas.copy_from_slice(&pixels);
-        layer.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
-        buffer.attach_to(layer.wl_surface()).map_err(error)?;
-        layer.commit();
-        if !self.overlay_committed {
-            eprintln!(
-                "univim overlay_commit_ms={:.1} loading={}",
-                self.active_since.elapsed().as_secs_f64() * 1000.,
-                self.session.is_none()
+        if let Some(manager) = &self.shortcuts_manager {
+            let hints = manager.register_shortcut(
+                "hints".to_string(),
+                "univim".to_string(),
+                "Show UniVim hint labels".to_string(),
+                "Capture the focused monitor and present full-screen Vimium hints".to_string(),
+                qh,
+                CommandAction::Hints,
             );
-            self.overlay_committed = true;
+            let grid = manager.register_shortcut(
+                "grid".to_string(),
+                "univim".to_string(),
+                "Show UniVim grid overlay".to_string(),
+                "Capture the focused monitor and present recursive 2-step grid hints".to_string(),
+                qh,
+                CommandAction::Grid,
+            );
+            let tap_f = manager.register_shortcut(
+                "tap-f".to_string(),
+                "univim".to_string(),
+                "Double-tap f trigger (speculative warmup on 1st tap, instant hints on 2nd)"
+                    .to_string(),
+                "Warm up detection cache on 1st f press and open hints immediately on 2nd f press"
+                    .to_string(),
+                qh,
+                CommandAction::TapF,
+            );
+            let tap_g = manager.register_shortcut(
+                "tap-g".to_string(),
+                "univim".to_string(),
+                "Double-tap g trigger (instant grid on 2nd tap)".to_string(),
+                "Open recursive grid mode on double-tap g".to_string(),
+                qh,
+                CommandAction::TapG,
+            );
+            let tap_caps = manager.register_shortcut(
+                "caps-lock".to_string(),
+                "univim".to_string(),
+                "Double-tap CapsLock trigger (speculative warmup on 1st tap, instant hints on 2nd)".to_string(),
+                "Warm up detection cache on 1st CapsLock press and open hints immediately on 2nd press".to_string(),
+                qh,
+                CommandAction::TapCaps,
+            );
+            self.shortcuts.extend([hints, grid, tap_f, tap_g, tap_caps]);
         }
-        self.dirty = false;
         Ok(())
     }
-    fn key(&mut self, event: KeyEvent) {
-        if self.finishing {
-            return;
-        }
-        let input = match event.keysym {
-            Keysym::Escape => Some(Input::Escape),
-            Keysym::BackSpace => Some(Input::Backspace),
-            Keysym::Tab => Some(Input::Tab),
-            Keysym::Return | Keysym::KP_Enter => Some(Input::Enter),
-            Keysym::Left => Some(Input::Parent),
-            _ => event.utf8.as_deref().and_then(|s| {
-                let mut c = s.chars();
-                let first = c.next()?;
-                (c.next().is_none() && !first.is_control()).then_some(Input::Character(first))
-            }),
-        };
-        if event.keysym == Keysym::Escape {
-            self.cancel();
-            return;
-        }
-        if let (Some(input), Some(session)) = (input, self.session.as_mut()) {
-            match session.input(input) {
-                Outcome::None => {}
-                Outcome::Changed => self.dirty = true,
-                Outcome::Cancel => self.cancel(),
-                Outcome::Click { x, y } => {
-                    self.click = Some((x, y));
-                    self.finishing = true;
-                    self.release_deadline = Some(Instant::now() + Duration::from_secs(2));
-                }
-            }
-        }
-    }
-}
 
-pub fn run(config: Config, control: UnixDatagram) -> Result<(), String> {
-    // Block before creating the worker so it inherits the mask. Consume shutdown
-    // signals through poll, allowing normal surface/socket cleanup on SIGTERM.
-    let mut shutdown = SigSet::empty();
-    shutdown.add(Signal::SIGINT);
-    shutdown.add(Signal::SIGTERM);
-    let mut previous = SigSet::empty();
-    pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&shutdown), Some(&mut previous)).map_err(error)?;
-    struct RestoreMask(SigSet);
-    impl Drop for RestoreMask {
-        fn drop(&mut self) {
-            let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&self.0), None);
+    fn evdev_fd(&self) -> Option<BorrowedFd<'_>> {
+        if self.settings.use_evdev {
+            self.evdev.first_fd()
+        } else {
+            None
         }
     }
-    let _restore = RestoreMask(previous);
-    let signals = SignalFd::with_flags(&shutdown, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)
-        .map_err(error)?;
-    control.set_nonblocking(true).map_err(error)?;
-    let conn = Connection::connect_to_env().map_err(error)?;
-    let (globals, mut queue) = registry_queue_init::<State>(&conn).map_err(error)?;
-    let qh = queue.handle();
-    let mut state = State::new(&globals, &qh)?;
-    state.input_enabled = true;
-    state.color_by_type = config.color_by_type;
-    state.capture_manager = Some(globals.bind(&qh, 3..=3, ()).map_err(error)?);
-    state.pointer_manager = Some(globals.bind(&qh, 2..=2, ()).map_err(error)?);
-    let manager: shortcuts::HyprlandGlobalShortcutsManagerV1 =
-        globals.bind(&qh, 1..=1, ()).map_err(error)?;
-    for (id, key) in [
-        ("shift-left", GestureKey::ShiftLeft),
-        ("shift-right", GestureKey::ShiftRight),
-        ("control-left", GestureKey::ControlLeft),
-        ("control-right", GestureKey::ControlRight),
-    ] {
-        state.shortcuts.push(manager.register_shortcut(
-            id.into(),
-            "univim".into(),
-            "UniVim modifier tap".into(),
-            "".into(),
-            &qh,
-            key,
-        ));
+
+    fn has_async_work(&self) -> bool {
+        self.inflight_job.is_some() || self.capture.is_some() || self.pending_re_capture.is_some()
     }
-    let notifier: locks::HyprlandLockNotifierV1 = globals.bind(&qh, 1..=1, ()).map_err(error)?;
-    state.notification = Some(notifier.get_lock_notification(&qh, ()));
-    queue.roundtrip(&mut state).map_err(error)?;
-    eprintln!(
-        "univim: idle native runtime; anonymous shortcuts cannot cancel taps on arbitrary intervening chords; use nonconsuming modifier-only compositor bindings"
-    );
-    let worker = Worker::new()?;
-    let result = (|| -> Result<(), String> {
-        loop {
-            queue.dispatch_pending(&mut state).map_err(error)?;
-            if signals.read_signal().map_err(error)?.is_some() {
-                state.quit = true;
-                state.requested = None;
-                state.cancel();
-            }
-            let mut command = [0u8; 64];
-            // Bound each drain so a local sender cannot starve Wayland or cancellation.
-            for _ in 0..32 {
-                match control.recv_from(&mut command) {
-                    Ok((len, address)) => {
-                        match std::str::from_utf8(&command[..len]).unwrap_or("").trim() {
-                            "hints" => state.requested = Some(Mode::Hints),
-                            "grid" => state.requested = Some(Mode::Grid),
-                            "cancel" => {
-                                state.requested = None;
-                                state.cancel();
-                                worker.clear();
-                            }
-                            "quit" => {
-                                state.quit = true;
-                                state.requested = None;
-                                state.cancel();
-                            }
-                            "status" => {
-                                if let Some(path) = address.as_pathname() {
-                                    let reply = json!({"active":state.mode.is_some(),"locked":state.locked,"loading":!state.finishing && (state.capture.is_some()||(state.mode.is_some()&&state.session.is_none())),"no_click":config.no_click,"flat":config.flat,"color_by_type":config.color_by_type,
-                                        "mode":state.mode.map(|m| match m { Mode::Hints => "hints", Mode::Grid => "grid" }),
-                                        "output":state.geometry.as_ref().map(|g| &g.output.name),
-                                        "session_count":state.session_count,"finishing":state.finishing,
-                                        "overlay_mapped":state.layer.is_some() && state.configured && state.overlay_committed,
-                                        "capture_pending":state.capture.is_some(),"session_ready":state.session.is_some(),
-                                        "age_ms":state.active_since.elapsed().as_millis(),"sync_pending":state.sync_pending});
-                                    let _ = control.send_to(reply.to_string().as_bytes(), path);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(error(e)),
-                }
-            }
-            if release_drain_expired(&mut state.release_deadline, Instant::now()) {
-                state.requested = None;
-                state.cancel();
-                worker.clear();
-            }
-            // Once the teardown sync is acknowledged, finalize below before
-            // evaluating stale context/timeouts again. Otherwise an expired
-            // session repeatedly schedules sync and can never return to idle.
-            let active_work =
-                state.layer.is_some() || state.capture.is_some() || state.captured.is_some();
-            if state.invalidated
-                || (state.mode.is_some()
-                    && validate_session(
-                        active_work,
-                        state.finishing,
-                        state.sync_pending,
-                        state.click.is_some(),
-                    )
-                    && state.active_since.elapsed() >= config.timeout)
-            {
-                state.requested = None;
-                state.cancel();
-                state.invalidated = false;
-                worker.clear();
-            }
-            if state
-                .capture
-                .as_ref()
-                .is_some_and(|c| c.started.elapsed() > Duration::from_secs(3))
-            {
-                eprintln!("univim: capture timed out");
-                state.cancel();
-            }
-            if state.mode.is_some()
-                && validate_session(
-                    active_work,
-                    state.finishing,
-                    state.sync_pending,
-                    state.click.is_some(),
-                )
-                && state.context_checked.elapsed() >= Duration::from_millis(250)
-            {
-                state.context_checked = Instant::now();
-                if !state
-                    .context
+
+    fn is_auto_loop_active(&self) -> bool {
+        self.overlay
+            .as_ref()
+            .is_some_and(|ov| ov.session.auto_loop())
+            && self.layer.is_some()
+    }
+
+    fn poll_evdev_shortcuts(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
+        if !self.settings.use_evdev || self.evdev.is_empty() {
+            return Ok(());
+        }
+        let events = self
+            .evdev
+            .drain_events(&mut self.tap_tracker, self.settings.double_tap_ms);
+        if self.overlay.is_some() {
+            return Ok(());
+        }
+        for (key, tap_ev) in events {
+            self.handle_tap_event(key, tap_ev, qh)?;
+        }
+        Ok(())
+    }
+
+    fn poll_auto_loop(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
+        let should_refresh = self.overlay.as_ref().is_some_and(|ov| {
+            ov.session.auto_loop()
+                && ov.session.typed().is_empty()
+                && !ov.session.show_options_menu()
+                && ov.last_loop_refresh.elapsed() >= AUTO_LOOP_INTERVAL
+        }) && self.layer.is_some()
+            && self.capture.is_none()
+            && self.inflight_job.is_none()
+            && self.pending_re_capture.is_none();
+
+        if should_refresh {
+            self.begin_overlay_re_capture(None, qh);
+        }
+        Ok(())
+    }
+
+    fn handle_tap_event(
+        &mut self,
+        key: GestureKey,
+        tap_ev: TapEvent,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), String> {
+        match (key, tap_ev) {
+            (GestureKey::F | GestureKey::CapsLock, TapEvent::Warmup) => {
+                let ttl = Duration::from_millis(self.settings.cache_ttl_ms);
+                let has_fresh_cache = self
+                    .cached_frame
                     .as_ref()
-                    .is_some_and(|c| hyprland::still_current(c).unwrap_or(false))
-                {
-                    state.requested = None;
-                    state.cancel();
+                    .is_some_and(|f| f.is_fresh(ttl, None));
+                if !has_fresh_cache && self.capture.is_none() && self.inflight_job.is_none() {
+                    let _ = self.start_capture(CapturePurpose::SpeculativeWarmup, qh);
                 }
             }
-            if let Some(failure) = state.failure.take() {
-                eprintln!("univim: {failure}");
-                state.cancel();
+            (GestureKey::F | GestureKey::CapsLock, TapEvent::Activate) => {
+                self.activate_hints_with_cache(qh)?;
             }
-            if state.requested.is_some() && state.mode.is_some() && !state.finishing {
-                state.cancel();
-                worker.clear();
-            }
-            if state.finishing
-                && ready_to_unmap(
-                    state.click.is_some() || state.release_deadline.is_some(),
-                    state.pressed.len(),
-                    state.buttons.len(),
-                    state.modifiers,
-                )
-                && !state.sync_pending
-            {
-                state.unmap(&conn, &qh);
-                state.finishing = false;
-            }
-            // A display sync acknowledges destruction before either capture or injection.
-            if state.mode.is_some()
-                && state.layer.is_none()
-                && state.capture.is_none()
-                && state.captured.is_none()
-                && !state.sync_pending
-                && !state.finishing
-            {
-                if let Some((x, y)) = state.click.take() {
-                    let valid = !state.locked
-                        && state
-                            .context
-                            .as_ref()
-                            .is_some_and(|c| hyprland::still_current(c).unwrap_or(false));
-                    if valid
-                        && let (Some(geometry), Some(output)) = (&state.geometry, &state.output)
-                    {
-                        let (lx, ly) = geometry.pixel_to_logical(x, y)?;
-                        let (w, h) = geometry.output.logical_size()?;
-                        if lx.is_finite()
-                            && ly.is_finite()
-                            && lx >= 0.
-                            && ly >= 0.
-                            && lx < w
-                            && ly < h
-                        {
-                            if config.no_click {
-                                eprintln!(
-                                    "univim selection {}",
-                                    json!({"x":lx,"y":ly,"injected":false})
-                                );
-                            } else {
-                                let pointer = state
-                                    .pointer_manager
-                                    .as_ref()
-                                    .ok_or("virtual pointer unavailable")?
-                                    .create_virtual_pointer_with_output(
-                                        None,
-                                        Some(output),
-                                        &qh,
-                                        (),
-                                    );
-                                let time = state.clock.elapsed().as_millis() as u32;
-                                const EXTENT: u32 = 1_000_000;
-                                pointer.motion_absolute(
-                                    time,
-                                    (lx / w * EXTENT as f64).round() as u32,
-                                    (ly / h * EXTENT as f64).round() as u32,
-                                    EXTENT,
-                                    EXTENT,
-                                );
-                                pointer.frame();
-                                pointer.button(time, 0x110, wl_pointer::ButtonState::Pressed);
-                                pointer.frame();
-                                pointer.button(time, 0x110, wl_pointer::ButtonState::Released);
-                                pointer.frame();
-                                pointer.destroy();
-                            }
-                        }
-                    }
-                }
-                state.mode = None;
-                state.session = None;
-                state.background = None;
-                state.context = None;
-                state.geometry = None;
-                state.output = None;
-            }
-            if !state.sync_pending
-                && state.mode.is_none()
-                && !state.quit
-                && let Some(mode) = state.requested.take()
-                && let Err(e) = state.begin(mode, &config, &qh)
-            {
-                eprintln!("univim: activation rejected: {e}");
-                state.cancel();
-            }
-            if let Some(image) = state.captured.take()
-                && !state.locked
-                && !state.finishing
-            {
-                let (w, h) = (image.cols(), image.rows());
-                if let Some(geometry) = state.geometry.as_mut() {
-                    geometry.pixel_width = w;
-                    geometry.pixel_height = h;
-                }
-                state.show(&qh);
-                match state.mode {
-                    Some(Mode::Hints) => worker.submit(Work {
-                        generation: state.generation,
-                        image,
-                        options: config.options,
-                    })?,
-                    Some(Mode::Grid) => {
-                        state.session = Some(Session::grid(w, h));
-                        state.background = Some(image);
-                        state.dirty = true;
-                    }
-                    None => {}
-                }
-            }
-            let mut wake = [0u8; 32];
-            while worker.wake.recv(&mut wake).is_ok() {}
-            let result = worker.results.lock().map_err(error)?.take();
-            if let Some(result) = result
-                && result.generation == state.generation
-                && !state.finishing
-                && state.mode.is_some()
-            {
-                match result.result {
-                    Ok((image, targets)) => {
-                        let targets = if config.flat {
-                            crate::flatten_leaves(&targets).map_err(error)?
-                        } else {
-                            targets
-                        };
-                        state.session = Some(Session::hints(image.cols(), image.rows(), targets));
-                        state.background = Some(image);
-                        state.dirty = true;
-                    }
-                    Err(e) => {
-                        eprintln!("univim: detection failed: {e}");
-                        state.cancel();
-                    }
-                }
-            }
-            if state.dirty
-                && let Err(e) = state.draw()
-            {
-                eprintln!("univim: render failed: {e}");
-                state.cancel();
-            }
-            // A full nonblocking Wayland socket is backpressure, not a lost
-            // connection. Wait for writability before retrying the flush.
-            let blocked = match conn.flush() {
-                Ok(()) => false,
-                Err(wayland_client::backend::WaylandError::Io(ref e))
-                    if e.kind() == io::ErrorKind::WouldBlock =>
-                {
-                    true
-                }
-                Err(e) => return Err(error(e)),
-            };
-            if state.quit && state.mode.is_none() && !state.sync_pending {
-                break;
-            }
-            let Some(guard) = queue.prepare_read() else {
-                continue;
-            };
-            let mut fds = [
-                PollFd::new(
-                    conn.as_fd(),
-                    PollFlags::POLLIN
-                        | if blocked {
-                            PollFlags::POLLOUT
-                        } else {
-                            PollFlags::empty()
-                        },
-                ),
-                PollFd::new(control.as_fd(), PollFlags::POLLIN),
-                PollFd::new(worker.wake.as_fd(), PollFlags::POLLIN),
-                PollFd::new(signals.as_fd(), PollFlags::POLLIN),
-            ];
-            let timeout = if state.mode.is_some() {
-                Some(250u16)
-            } else {
-                None
-            };
-            match poll(&mut fds, timeout) {
-                Ok(_) => {}
-                Err(nix::errno::Errno::EINTR) => {
-                    drop(guard);
-                    continue;
-                }
-                Err(e) => return Err(error(e)),
-            }
-            if fds[0]
-                .revents()
-                .unwrap_or(PollFlags::empty())
-                .intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
-            {
-                return Err("Wayland connection closed".into());
-            }
-            if fds[0]
-                .revents()
-                .unwrap_or(PollFlags::empty())
-                .contains(PollFlags::POLLIN)
-            {
-                match guard.read() {
-                    Ok(_) => {}
-                    Err(wayland_client::backend::WaylandError::Io(ref e))
-                        if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(error(e)),
-                }
-            } else {
-                drop(guard);
+            (GestureKey::G, TapEvent::Warmup) => {}
+            (GestureKey::G, TapEvent::Activate) => {
+                self.enqueue_command(CommandAction::Grid, qh)?;
             }
         }
         Ok(())
-    })();
-    state.capture.take();
-    if let Some(layer) = state.layer.take() {
-        let surface = layer.wl_surface().clone();
-        drop(layer);
-        surface.destroy();
     }
-    let _ = conn.flush();
-    drop(worker);
-    result
-}
 
-impl Dispatch<frame::ZwlrScreencopyFrameV1, ()> for State {
-    fn event(
-        state: &mut Self,
-        proxy: &frame::ZwlrScreencopyFrameV1,
-        event: frame::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        let Some(c) = state.capture.as_mut().filter(|c| c.frame == *proxy) else {
-            return;
-        };
-        let result = (|| -> Result<(), String> {
-            match event {
-                frame::Event::Buffer {
-                    format,
-                    width,
-                    height,
-                    stride,
-                } => {
-                    let WEnum::Value(format) = format else {
-                        return Err("unknown screencopy format".into());
-                    };
-                    if width == 0
-                        || height == 0
-                        || width > 32768
-                        || height > 32768
-                        || stride < width * 4
-                        || stride > i32::MAX as u32
-                        || u64::from(stride) * u64::from(height) > 512 * 1024 * 1024
-                    {
-                        return Err("invalid or oversized screencopy buffer".into());
-                    }
-                    if !supported(format) {
-                        return Err(format!("unsupported screencopy format: {format:?}"));
-                    }
-                    c.format = Some(format);
-                    c.width = width;
-                    c.height = height;
-                    c.stride = stride;
-                }
-                frame::Event::BufferDone => {
-                    let format = c.format.ok_or("screencopy has no supported SHM format")?;
-                    let mut pool = RawPool::new(c.stride as usize * c.height as usize, &state.shm)
-                        .map_err(error)?;
-                    let buffer = pool.create_buffer(
-                        0,
-                        c.width as i32,
-                        c.height as i32,
-                        c.stride as i32,
-                        format,
-                        (),
-                        qh,
-                    );
-                    c.frame.copy(&buffer);
-                    c.buffer = Some(buffer);
-                    c.pool = Some(pool);
-                }
-                frame::Event::Flags { flags } => {
-                    let WEnum::Value(flags) = flags else {
-                        return Err("unknown capture flags".into());
-                    };
-                    c.inverted = flags.contains(frame::Flags::YInvert);
-                }
-                frame::Event::Ready { .. } => {
-                    let geometry = state.geometry.as_ref().ok_or("capture has no geometry")?;
-                    if c.width as i32 != geometry.output.width
-                        || c.height as i32 != geometry.output.height
-                    {
-                        return Err("capture dimensions disagree with Hyprland native mode; refusing ambiguous orientation".into());
-                    }
-                    let pool = c.pool.as_mut().ok_or("capture has no SHM pool")?;
-                    state.captured = Some(decode(
-                        pool.mmap(),
-                        c.width,
-                        c.height,
-                        c.stride,
-                        c.format.ok_or("missing format")?,
-                        c.inverted,
-                        geometry.output.transform,
-                    )?);
-                    eprintln!(
-                        "univim capture_ms={:.1}",
-                        c.started.elapsed().as_secs_f64() * 1000.
-                    );
-                }
-                frame::Event::Failed => return Err("compositor rejected screencopy".into()),
-                _ => {}
-            }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            state.failure = Some(e);
-            state.capture.take();
-        } else if state.captured.is_some() {
-            state.capture.take();
-        }
-    }
-}
+    fn activate_hints_with_cache(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
+        let hypr_context = hyprland::context().ok();
+        let (output_idx, output) = self.select_output(hypr_context.as_ref())?;
+        let ttl = Duration::from_millis(self.settings.cache_ttl_ms);
 
-fn supported(format: wl_shm::Format) -> bool {
-    matches!(
-        format,
-        wl_shm::Format::Argb8888
-            | wl_shm::Format::Xrgb8888
-            | wl_shm::Format::Abgr8888
-            | wl_shm::Format::Xbgr8888
-            | wl_shm::Format::Argb2101010
-            | wl_shm::Format::Xrgb2101010
-            | wl_shm::Format::Abgr2101010
-            | wl_shm::Format::Xbgr2101010
-    )
-}
-
-fn decode(
-    bytes: &[u8],
-    w: u32,
-    h: u32,
-    stride: u32,
-    format: wl_shm::Format,
-    inverted: bool,
-    transform: i32,
-) -> Result<Mat, String> {
-    if !supported(format)
-        || w == 0
-        || h == 0
-        || w > 32768
-        || h > 32768
-        || u64::from(stride) < u64::from(w) * 4
-        || (bytes.len() as u64) < u64::from(stride) * u64::from(h)
-    {
-        return Err("invalid capture storage".into());
-    }
-    let mut raw =
-        Mat::new_rows_cols_with_default(h as i32, w as i32, core::CV_8UC3, Scalar::all(0.))
-            .map_err(error)?;
-    let bgr = raw.data_bytes_mut().map_err(error)?;
-    let swapped = matches!(
-        format,
-        wl_shm::Format::Abgr8888
-            | wl_shm::Format::Xbgr8888
-            | wl_shm::Format::Abgr2101010
-            | wl_shm::Format::Xbgr2101010
-    );
-    let ten = matches!(
-        format,
-        wl_shm::Format::Argb2101010
-            | wl_shm::Format::Xrgb2101010
-            | wl_shm::Format::Abgr2101010
-            | wl_shm::Format::Xbgr2101010
-    );
-    for y in 0..h as usize {
-        let sy = if inverted { h as usize - 1 - y } else { y };
-        let row = &bytes[sy * stride as usize..sy * stride as usize + w as usize * 4];
-        for (x, pixel) in row.as_chunks::<4>().0.iter().enumerate() {
-            let word = u32::from_ne_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
-            let (lo, g, hi) = if ten {
-                (
-                    ((word & 1023) * 255 + 511) / 1023,
-                    (((word >> 10) & 1023) * 255 + 511) / 1023,
-                    (((word >> 20) & 1023) * 255 + 511) / 1023,
-                )
-            } else {
-                (word & 255, (word >> 8) & 255, (word >> 16) & 255)
-            };
-            let i = (y * w as usize + x) * 3;
-            bgr[i] = if swapped { hi } else { lo } as u8;
-            bgr[i + 1] = g as u8;
-            bgr[i + 2] = if swapped { lo } else { hi } as u8;
-        }
-    }
-    // Hyprland 0.55 ScreenshareSession::calculateConstraints uses m_pixelSize,
-    // not m_transformedSize; ScreenshareFrame exports the raw framebuffer with
-    // output transform metadata. wlr-screencopy omits that metadata. Apply it
-    // here exactly once (including square/180-degree outputs, not size heuristics).
-    let mut upright = Mat::default();
-    let rotation = match transform {
-        0 | 4 => None,
-        1 | 5 => Some(core::ROTATE_90_COUNTERCLOCKWISE),
-        2 | 6 => Some(core::ROTATE_180),
-        3 | 7 => Some(core::ROTATE_90_CLOCKWISE),
-        _ => return Err("invalid output transform".into()),
-    };
-    if transform >= 4 {
-        core::flip(&raw, &mut upright, 1).map_err(error)?;
-        raw = upright;
-        upright = Mat::default();
-    }
-    if let Some(rotation) = rotation {
-        core::rotate(&raw, &mut upright, rotation).map_err(error)?;
-        Ok(upright)
-    } else {
-        Ok(raw)
-    }
-}
-
-impl Dispatch<wl_callback::WlCallback, ()> for State {
-    fn event(
-        state: &mut Self,
-        _: &wl_callback::WlCallback,
-        _: wl_callback::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        state.sync_pending = false;
-    }
-}
-impl Dispatch<shortcut::HyprlandGlobalShortcutV1, GestureKey> for State {
-    fn event(
-        state: &mut Self,
-        _: &shortcut::HyprlandGlobalShortcutV1,
-        event: shortcut::Event,
-        key: &GestureKey,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if state.locked {
-            state.tracker.reset();
-            return;
-        }
-        if let Some(mode) = gesture_event(&mut state.tracker, *key, event) {
-            state.requested = Some(mode);
-        }
-    }
-}
-impl Dispatch<lock::HyprlandLockNotificationV1, ()> for State {
-    fn event(
-        state: &mut Self,
-        _: &lock::HyprlandLockNotificationV1,
-        event: lock::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            lock::Event::Locked => {
-                state.locked = true;
-                state.requested = None;
-                state.cancel();
-            }
-            lock::Event::Unlocked => {
-                state.locked = false;
-                state.tracker.reset();
-            }
-            _ => {}
-        }
-    }
-}
-wayland_client::delegate_noop!(State: ignore capture::ZwlrScreencopyManagerV1);
-wayland_client::delegate_noop!(State: ignore pointers::ZwlrVirtualPointerManagerV1);
-wayland_client::delegate_noop!(State: ignore pointer::ZwlrVirtualPointerV1);
-wayland_client::delegate_noop!(State: ignore shortcuts::HyprlandGlobalShortcutsManagerV1);
-wayland_client::delegate_noop!(State: ignore locks::HyprlandLockNotifierV1);
-wayland_client::delegate_noop!(State: ignore wl_buffer::WlBuffer);
-
-impl CompositorHandler for State {
-    fn scale_factor_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
-    ) {
-    }
-    fn transform_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: wl_output::Transform,
-    ) {
-    }
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
-    fn surface_enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
-    fn surface_leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
-}
-impl OutputHandler for State {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.outputs
-    }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
-        self.invalidated = self.mode.is_some();
-    }
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
-        self.invalidated = self.mode.is_some();
-    }
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
-        self.invalidated = self.mode.is_some();
-    }
-}
-impl LayerShellHandler for State {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
-        if self.layer.as_ref() == Some(layer) {
-            self.cancel();
-        }
-    }
-    fn configure(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        layer: &LayerSurface,
-        c: LayerSurfaceConfigure,
-        _: u32,
-    ) {
-        if self.layer.as_ref() != Some(layer) {
-            return;
-        }
-        if (c.new_size.0 != 0 && c.new_size.0 != self.size.0)
-            || (c.new_size.1 != 0 && c.new_size.1 != self.size.1)
+        // 1. Instant path: if the 1st tap already finished pre-computing a fresh frame, open overlay in 0ms!
+        if let Some(cached) = self.cached_frame.take()
+            && cached.is_fresh(ttl, output.name.as_deref())
         {
-            self.cancel();
-            return;
+            let geometry = FrameGeometry {
+                output: output.as_output(),
+                pixel_width: cached.width,
+                pixel_height: cached.height,
+            };
+            let focused_rect = hypr_context
+                .as_ref()
+                .and_then(|ctx| ctx.focused_pixel_rect(&geometry));
+            return self.present_precomputed_frame(
+                output_idx,
+                output,
+                geometry,
+                cached,
+                focused_rect,
+                true,
+                qh,
+            );
         }
-        self.configured = true;
-        self.dirty = true;
+
+        // 2. In-flight promotion: if the 1st tap capture or worker job is currently mid-flight,
+        // promote it to PresentOverlay(Mode::Hints) so it opens the instant it finishes!
+        if let Some(capture) = self.capture.as_mut()
+            && capture.purpose == CapturePurpose::SpeculativeWarmup
+        {
+            capture.purpose = CapturePurpose::PresentOverlay(Mode::Hints);
+            return Ok(());
+        }
+        if let Some((_, purpose)) = self.inflight_job.as_mut()
+            && *purpose == CapturePurpose::SpeculativeWarmup
+        {
+            *purpose = CapturePurpose::PresentOverlay(Mode::Hints);
+            return Ok(());
+        }
+
+        // 3. Fallback: start a direct capture & detection pass.
+        self.start_capture(CapturePurpose::PresentOverlay(Mode::Hints), qh)
     }
-}
-impl ShmHandler for State {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
-    }
-}
-impl SeatHandler for State {
-    fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seats
-    }
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-    fn new_capability(
+
+    fn enqueue_command(
         &mut self,
-        _: &Connection,
+        action: CommandAction,
         qh: &QueueHandle<Self>,
-        seat: wl_seat::WlSeat,
-        cap: Capability,
-    ) {
-        if !self.input_enabled {
-            return;
-        }
-        if cap == Capability::Keyboard && self.keyboard.is_none() {
-            match self.seats.get_keyboard(qh, &seat, None) {
-                Ok(k) => self.keyboard = Some(k),
-                Err(e) => self.failure = Some(error(e)),
+    ) -> Result<(), String> {
+        match action {
+            CommandAction::Stop => {
+                self.close_overlay();
+                self.should_exit = true;
+                return Ok(());
+            }
+            CommandAction::ToggleDebug => {
+                if let Some(overlay) = self.overlay.as_mut() {
+                    let _ = overlay.session.handle_input(Input::ToggleDebugHud);
+                    if let Some(layer) = self.layer.as_mut() {
+                        layer.dirty = true;
+                    }
+                }
+                return Ok(());
+            }
+            CommandAction::ToggleOptions => {
+                if let Some(overlay) = self.overlay.as_mut() {
+                    let _ = overlay.session.handle_input(Input::ToggleOptionsMenu);
+                    if let Some(layer) = self.layer.as_mut() {
+                        layer.dirty = true;
+                    }
+                }
+                return Ok(());
+            }
+            CommandAction::TapF => {
+                if self.overlay.is_some() {
+                    self.close_overlay();
+                    return Ok(());
+                }
+                let ev = self.tap_tracker.on_tap(
+                    GestureKey::F,
+                    Duration::from_millis(self.settings.double_tap_ms.max(40)),
+                );
+                return self.handle_tap_event(GestureKey::F, ev, qh);
+            }
+            CommandAction::TapG => {
+                if self.overlay.is_some() {
+                    self.close_overlay();
+                    return Ok(());
+                }
+                let ev = self.tap_tracker.on_tap(
+                    GestureKey::G,
+                    Duration::from_millis(self.settings.double_tap_ms.max(40)),
+                );
+                return self.handle_tap_event(GestureKey::G, ev, qh);
+            }
+            CommandAction::TapCaps => {
+                if self.overlay.is_some() {
+                    self.close_overlay();
+                    return Ok(());
+                }
+                let ev = self.tap_tracker.on_tap(
+                    GestureKey::CapsLock,
+                    Duration::from_millis(self.settings.double_tap_ms.max(40)),
+                );
+                return self.handle_tap_event(GestureKey::CapsLock, ev, qh);
+            }
+            CommandAction::Hints => {
+                if self.overlay.is_some() {
+                    self.close_overlay();
+                }
+                return self.activate_hints_with_cache(qh);
+            }
+            CommandAction::Grid => {
+                if self.overlay.is_some() || self.capture.is_some() {
+                    self.close_overlay();
+                }
+                self.pending_command = Some(CommandAction::Grid);
             }
         }
-        if cap == Capability::Pointer && self.physical_pointer.is_none() {
-            match self.seats.get_pointer(qh, &seat) {
-                Ok(p) => self.physical_pointer = Some(p),
-                Err(e) => self.failure = Some(error(e)),
-            }
-        }
+        self.step(qh)
     }
-    fn remove_capability(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
-        cap: Capability,
-    ) {
-        if cap == Capability::Keyboard {
-            if let Some(k) = self.keyboard.take() {
-                k.release();
+
+    fn poll_worker_results(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
+        while let Ok(done) = self.worker_rx.try_recv() {
+            let mut effective_purpose = done.purpose;
+            if let Some((active_id, active_purpose)) = self.inflight_job
+                && active_id == done.job_id
+            {
+                effective_purpose = active_purpose;
+                self.inflight_job = None;
             }
-            self.pressed.clear();
-            self.modifiers = false;
-            self.cancel();
-        }
-        if cap == Capability::Pointer {
-            if let Some(p) = self.physical_pointer.take() {
-                p.release();
+            match effective_purpose {
+                CapturePurpose::SpeculativeWarmup => {
+                    self.cached_frame = Some(done.frame);
+                }
+                CapturePurpose::PresentOverlay(_mode) => {
+                    let hypr_context = hyprland::context().ok();
+                    let (output_idx, output) = self.select_output(hypr_context.as_ref())?;
+                    let focused_rect = hypr_context
+                        .as_ref()
+                        .and_then(|ctx| ctx.focused_pixel_rect(&done.geometry));
+                    self.present_precomputed_frame(
+                        output_idx,
+                        output,
+                        done.geometry,
+                        done.frame,
+                        focused_rect,
+                        false,
+                        qh,
+                    )?;
+                }
+                CapturePurpose::RefreshOverlay => {
+                    let hypr_context = hyprland::context().ok();
+                    let focused_rect = hypr_context
+                        .as_ref()
+                        .and_then(|ctx| ctx.focused_pixel_rect(&done.geometry));
+                    self.finish_overlay_refresh(done.geometry, done.frame, focused_rect, qh)?;
+                }
+                CapturePurpose::Snapshot => {}
             }
-            self.buttons.clear();
-            self.cancel();
         }
+        Ok(())
     }
-    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {
-        self.cancel();
-    }
-}
-impl KeyboardHandler for State {
-    fn enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        surface: &wl_surface::WlSurface,
-        _: u32,
-        raw: &[u32],
-        _: &[Keysym],
-    ) {
+
+    fn step(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
+        if let Some(err) = self.last_error.take() {
+            self.close_overlay();
+            return Err(err);
+        }
+
+        if self.overlay.as_ref().is_some_and(|overlay| {
+            overlay.last_loop_refresh.elapsed()
+                >= Duration::from_secs(self.settings.timeout_secs.max(1))
+        }) {
+            self.close_overlay();
+        }
+
+        // Advance any pending unmap -> scroll -> settle -> re-capture pipeline loop
+        if !self.sync_pending {
+            let mut pending_scroll = None;
+            let ready_to_capture = if let Some(pending) = self.pending_re_capture.as_mut() {
+                pending_scroll = pending.scroll.take();
+                pending
+                    .settle_until
+                    .is_none_or(|deadline| Instant::now() >= deadline)
+            } else {
+                false
+            };
+            if let Some((dx, dy)) = pending_scroll {
+                self.inject_scroll(dx, dy);
+                if let Some(pending) = self.pending_re_capture.as_mut() {
+                    pending.settle_until = Some(Instant::now() + Duration::from_millis(45));
+                }
+            }
+            if ready_to_capture {
+                self.pending_re_capture = None;
+                self.start_capture(CapturePurpose::RefreshOverlay, qh)?;
+            }
+        }
+
+        if let Some(action) = self.pending_command.take()
+            && action == CommandAction::Grid
+        {
+            self.start_capture(CapturePurpose::PresentOverlay(Mode::Grid), qh)?;
+        }
+
+        let capture_ready = self.capture.as_ref().is_some_and(|c| c.ready);
+        let capture_failed = self.capture.as_ref().is_some_and(|c| c.failed);
+        if capture_failed {
+            self.destroy_capture();
+            if self.overlay.is_some()
+                && self.layer.is_none()
+                && let Some(ov) = self.overlay.as_ref()
+            {
+                let (lw, lh) = ov.output.resolved_logical_size();
+                self.create_overlay_layer(&ov.output.wl_output.clone(), lw as u32, lh as u32, qh)?;
+            }
+        } else if capture_ready {
+            self.finish_capture(qh)?;
+        }
+
         if self
             .layer
             .as_ref()
-            .is_some_and(|l| l.wl_surface() == surface)
+            .is_some_and(|layer| layer.closed && self.pending_click.is_none())
         {
-            self.pressed.clear();
-            self.pressed.extend(raw.iter().copied());
+            self.close_overlay();
         }
-    }
-    fn leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        surface: &wl_surface::WlSurface,
-        _: u32,
-    ) {
-        if !self
+
+        if self
             .layer
             .as_ref()
-            .is_some_and(|l| l.wl_surface() == surface)
+            .is_some_and(|layer| layer.configured && layer.dirty)
         {
+            self.render_and_commit_overlay(qh)?;
+        }
+
+        if !self.sync_pending
+            && let Some(click) = self.pending_click.take()
+        {
+            self.emit_virtual_action(click, qh);
+        }
+
+        Ok(())
+    }
+
+    fn start_capture(
+        &mut self,
+        purpose: CapturePurpose,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), String> {
+        self.destroy_capture();
+        let hypr_context = hyprland::context().ok();
+        let (_, output) = self.select_output(hypr_context.as_ref())?;
+        let frame = self
+            .screencopy_manager
+            .capture_output(0, &output.wl_output, qh, ());
+        self.capture = Some(ActiveCapture {
+            purpose,
+            output,
+            frame,
+            spec: None,
+            shm_file: None,
+            buffer: None,
+            flags: ScreencopyFlags::empty(),
+            ready: false,
+            failed: false,
+        });
+        Ok(())
+    }
+
+    fn select_output(
+        &self,
+        hypr_context: Option<&HyprContext>,
+    ) -> Result<(usize, OutputInfo), String> {
+        if let Some(focused_name) = hypr_context.and_then(|ctx| ctx.focused_monitor())
+            && let Some((idx, info)) = self
+                .outputs
+                .iter()
+                .enumerate()
+                .find(|(_, info)| info.name.as_deref() == Some(focused_name))
+        {
+            return Ok((idx, info.clone()));
+        }
+        self.outputs
+            .first()
+            .cloned()
+            .map(|output| (0, output))
+            .ok_or_else(|| "no Wayland outputs available".to_string())
+    }
+
+    fn finish_capture(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
+        let mut capture = self
+            .capture
+            .take()
+            .ok_or_else(|| "internal error: missing active capture".to_string())?;
+        let spec = capture
+            .spec
+            .ok_or_else(|| "screencopy completed without a buffer spec".to_string())?;
+        let mut file = capture
+            .shm_file
+            .take()
+            .ok_or_else(|| "screencopy completed without a backing file".to_string())?;
+        let byte_len = (spec.stride as usize) * (spec.height as usize);
+        file.seek(SeekFrom::Start(0))
+            .map_err(|err| format!("failed to seek screencopy buffer: {err}"))?;
+        let mut bytes = vec![0u8; byte_len];
+        file.read_exact(&mut bytes)
+            .map_err(|err| format!("failed to read screencopy pixels: {err}"))?;
+
+        if let Some(buffer) = capture.buffer.take() {
+            buffer.destroy();
+        }
+        capture.frame.destroy();
+
+        let raw_frame = RawCaptureFrame {
+            width: spec.width,
+            height: spec.height,
+            stride: spec.stride as usize,
+            format: spec.format,
+            invert_y: capture.flags.contains(ScreencopyFlags::YInvert),
+            transform: capture.output.as_output().transform,
+            bytes: &bytes,
+        };
+        let upright_bgr = decode_raw_frame_to_bgr(raw_frame)?;
+        let upright_w = upright_bgr.cols();
+        let upright_h = upright_bgr.rows();
+        let geometry = FrameGeometry {
+            output: capture.output.as_output(),
+            pixel_width: upright_w,
+            pixel_height: upright_h,
+        };
+
+        if capture.purpose == CapturePurpose::Snapshot {
+            let (targets, timings) = crate::detect(&upright_bgr, self.settings.detector)
+                .map_err(|err| format!("detector failed: {err}"))?;
+            let targets = if self.settings.flat {
+                crate::flatten_leaves(&targets).unwrap_or(targets)
+            } else {
+                targets
+            };
+            let rendered = crate::render::hierarchy_overlay(&upright_bgr, &targets)?;
+            let directory = self
+                .snapshot_dir
+                .as_deref()
+                .ok_or("snapshot directory is missing")?;
+            let saved = snapshot::save(
+                &upright_bgr,
+                &rendered,
+                &targets,
+                &capture.output.as_output(),
+                &timings,
+                self.settings.detector,
+                directory,
+            )?;
+            self.snapshot_saved = Some(saved);
+            self.should_exit = true;
+            return Ok(());
+        }
+
+        if capture.purpose == CapturePurpose::PresentOverlay(Mode::Grid) {
+            let session = Session::grid(upright_w, upright_h);
+            let (logical_w, logical_h) = capture.output.resolved_logical_size();
+            self.overlay = Some(ActiveOverlay {
+                output: capture.output.clone(),
+                geometry,
+                base_bgr: upright_bgr,
+                debug_data: None,
+                session,
+                last_loop_refresh: Instant::now(),
+            });
+            self.create_overlay_layer(
+                &capture.output.wl_output,
+                logical_w as u32,
+                logical_h as u32,
+                qh,
+            )?;
+            return Ok(());
+        }
+
+        let bgr_bytes = mat_to_bgr_vec(&upright_bgr)?;
+        let job_id = self.next_job_id;
+        self.next_job_id += 1;
+        self.inflight_job = Some((job_id, capture.purpose));
+        let _ = self.worker_tx.send(WorkerJob {
+            job_id,
+            purpose: capture.purpose,
+            output_name: capture.output.name.clone(),
+            geometry,
+            upright_w,
+            upright_h,
+            bgr_bytes,
+            options: self.settings.detector,
+            flat: self.settings.flat,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn present_precomputed_frame(
+        &mut self,
+        _output_idx: usize,
+        output: OutputInfo,
+        geometry: FrameGeometry,
+        frame: PrecomputedFrame,
+        focused_rect: Option<[i32; 4]>,
+        cached_hit: bool,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), String> {
+        let base_bgr = bgr_vec_to_mat(&frame.bgr, frame.width, frame.height)?;
+        let session =
+            Session::hints_with_focus(frame.width, frame.height, frame.targets, focused_rect)
+                .with_telemetry(cached_hit, frame.pipeline_ms);
+
+        let (logical_w, logical_h) = output.resolved_logical_size();
+        self.overlay = Some(ActiveOverlay {
+            output: output.clone(),
+            geometry,
+            base_bgr,
+            debug_data: Some(frame.debug),
+            session,
+            last_loop_refresh: Instant::now(),
+        });
+        self.create_overlay_layer(&output.wl_output, logical_w as u32, logical_h as u32, qh)?;
+        Ok(())
+    }
+
+    fn finish_overlay_refresh(
+        &mut self,
+        geometry: FrameGeometry,
+        frame: PrecomputedFrame,
+        focused_rect: Option<[i32; 4]>,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), String> {
+        let base_bgr = bgr_vec_to_mat(&frame.bgr, frame.width, frame.height)?;
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.geometry = geometry;
+            overlay.base_bgr = base_bgr;
+            overlay.debug_data = Some(frame.debug);
+            overlay.session.update_targets(
+                frame.width,
+                frame.height,
+                frame.targets,
+                focused_rect,
+                frame.pipeline_ms,
+            );
+            overlay.last_loop_refresh = Instant::now();
+            let (logical_w, logical_h) = overlay.output.resolved_logical_size();
+            let wl_output = overlay.output.wl_output.clone();
+            if self.layer.is_none() {
+                self.create_overlay_layer(&wl_output, logical_w as u32, logical_h as u32, qh)?;
+            } else if let Some(layer) = self.layer.as_mut() {
+                layer.dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Unmap the layer-shell surface, wait for compositor sync, optionally inject scroll,
+    /// and re-capture the screen cleanly without capturing the overlay itself.
+    fn begin_overlay_re_capture(&mut self, scroll: Option<(i32, i32)>, qh: &QueueHandle<Self>) {
+        self.destroy_layer_only();
+        self.pending_re_capture = Some(PendingReCapture {
+            scroll,
+            settle_until: None,
+        });
+        let _callback: WlCallback = self.display.sync(qh, ());
+        self.sync_pending = true;
+    }
+
+    fn inject_scroll(&mut self, dx: i32, dy: i32) {
+        if self.evdev.emit_scroll(dx, dy) {}
+        // Fallback if `/dev/uinput` is not writable: scroll works automatically when user adds uinput permissions
+    }
+
+    fn create_overlay_layer(
+        &mut self,
+        wl_output: &WlOutput,
+        logical_width: u32,
+        logical_height: u32,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), String> {
+        self.destroy_layer_only();
+        let surface = self.compositor.create_surface(qh, ());
+        let layer_surface = self.layer_shell.get_layer_surface(
+            &surface,
+            Some(wl_output),
+            Layer::Overlay,
+            "univim".to_string(),
+            qh,
+            (),
+        );
+        layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+        layer_surface.set_exclusive_zone(-1);
+        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer_surface.set_size(logical_width.max(1), logical_height.max(1));
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|vp| vp.get_viewport(&surface, qh, ()));
+        surface.commit();
+
+        self.layer = Some(OverlayLayer {
+            surface,
+            layer_surface,
+            viewport,
+            logical_width: logical_width.max(1),
+            logical_height: logical_height.max(1),
+            configured: false,
+            closed: false,
+            slot: None,
+            dirty: true,
+        });
+        Ok(())
+    }
+
+    fn render_and_commit_overlay(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
+        let Some(overlay) = self.overlay.as_ref() else {
+            return Ok(());
+        };
+        let rendered: RenderedSurface = render_session_surface(
+            &overlay.base_bgr,
+            &overlay.session,
+            &overlay.geometry,
+            overlay.debug_data.as_ref(),
+            &self.settings,
+        )
+        .map_err(|err| format!("failed to render overlay surface: {err}"))?;
+
+        let Some(layer) = self.layer.as_mut() else {
+            return Ok(());
+        };
+        let needs_new_slot = layer.slot.as_ref().is_none_or(|slot| {
+            slot.width != rendered.width
+                || slot.height != rendered.height
+                || slot.len != rendered.argb.len()
+        });
+        if needs_new_slot {
+            if let Some(old) = layer.slot.take() {
+                old.buffer.destroy();
+            }
+            let file =
+                tempfile().map_err(|err| format!("failed to allocate overlay shm file: {err}"))?;
+            file.set_len(rendered.argb.len() as u64)
+                .map_err(|err| format!("failed to size overlay shm file: {err}"))?;
+            let pool = self
+                .shm
+                .create_pool(file.as_fd(), rendered.argb.len() as i32, qh, ());
+            let buffer = pool.create_buffer(
+                0,
+                rendered.width,
+                rendered.height,
+                rendered.width * 4,
+                ShmFormat::Argb8888,
+                qh,
+                (),
+            );
+            pool.destroy();
+            layer.slot = Some(ShmSlot {
+                file,
+                buffer,
+                len: rendered.argb.len(),
+                width: rendered.width,
+                height: rendered.height,
+            });
+        }
+
+        let slot = layer.slot.as_mut().unwrap();
+        slot.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|err| format!("failed to seek overlay shm file: {err}"))?;
+        slot.file
+            .write_all(&rendered.argb)
+            .map_err(|err| format!("failed to write overlay pixels: {err}"))?;
+        slot.file
+            .flush()
+            .map_err(|err| format!("failed to flush overlay pixels: {err}"))?;
+
+        if let Some(viewport) = &layer.viewport {
+            viewport.set_destination(layer.logical_width as i32, layer.logical_height as i32);
+        } else {
+            layer.surface.set_buffer_scale(overlay.output.scale.max(1));
+            layer.surface.set_buffer_transform(Transform::Normal);
+        }
+        layer.surface.attach(Some(&slot.buffer), 0, 0);
+        layer
+            .surface
+            .damage_buffer(0, 0, rendered.width, rendered.height);
+        layer.surface.commit();
+        layer.dirty = false;
+        Ok(())
+    }
+
+    fn handle_key_press(&mut self, raw_keycode: u32, qh: &QueueHandle<Self>) {
+        let Some(xkb_state) = self.xkb_state.as_ref() else {
             return;
-        }
-        if self.mode.is_some() {
-            self.click = None;
-            self.cancel();
-        }
-        self.pressed.clear();
-        self.modifiers = false;
-    }
-    fn press_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        event: KeyEvent,
-    ) {
-        if self.layer.is_some() {
-            self.pressed.insert(event.raw_code);
-            self.key(event);
-        }
-    }
-    fn repeat_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        _: KeyEvent,
-    ) {
-    }
-    fn release_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        event: KeyEvent,
-    ) {
-        self.pressed.remove(&event.raw_code);
-    }
-    fn update_modifiers(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        _: Modifiers,
-        raw: RawModifiers,
-        _: u32,
-    ) {
-        // Locked modifiers (Caps/Num Lock) do not represent held keys.
-        self.modifiers = raw.depressed != 0 || raw.latched != 0;
-    }
-}
-impl PointerHandler for State {
-    fn pointer_frame(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_pointer::WlPointer,
-        events: &[PointerEvent],
-    ) {
-        for event in events {
-            if !self
-                .layer
-                .as_ref()
-                .is_some_and(|l| l.wl_surface() == &event.surface)
-            {
-                continue;
-            }
-            match event.kind {
-                PointerEventKind::Press { button, .. } => {
-                    self.buttons.insert(button);
-                    self.cancel();
+        };
+        let keycode = xkb::Keycode::new(raw_keycode + 8);
+        let sym = xkb_state.key_get_one_sym(keycode);
+        let shift = xkb_state.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE);
+        let ctrl = xkb_state.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
+        let alt = xkb_state.mod_name_is_active(xkb::MOD_NAME_ALT, xkb::STATE_MODS_EFFECTIVE);
+
+        let input = match sym {
+            xkb::Keysym::Escape => Some(Input::Escape),
+            xkb::Keysym::BackSpace => Some(Input::Backspace),
+            xkb::Keysym::Return | xkb::Keysym::KP_Enter => Some(Input::Enter),
+            xkb::Keysym::F1 => Some(Input::ToggleOptionsMenu),
+            xkb::Keysym::F2 => Some(Input::ToggleDebugHud),
+            xkb::Keysym::F3 => Some(Input::CycleDebugPrev),
+            xkb::Keysym::F4 => Some(Input::CycleDebugNext),
+            xkb::Keysym::F5 => Some(Input::Refresh),
+            xkb::Keysym::F6 => Some(Input::ToggleLoop),
+            xkb::Keysym::Tab => Some(Input::CycleClickAction),
+            xkb::Keysym::Page_Down => Some(Input::Scroll { dx: 0, dy: -6 }),
+            xkb::Keysym::Page_Up => Some(Input::Scroll { dx: 0, dy: 6 }),
+            xkb::Keysym::Up => {
+                if self
+                    .overlay
+                    .as_ref()
+                    .is_some_and(|ov| ov.session.show_options_menu())
+                {
+                    Some(Input::MenuUp)
+                } else {
+                    Some(Input::Snap(Cardinal::Up))
                 }
-                PointerEventKind::Release { button, .. } => {
-                    self.buttons.remove(&button);
-                }
-                PointerEventKind::Axis { .. } => self.cancel(),
-                _ => {}
             }
-        }
-    }
-}
-delegate_compositor!(State);
-delegate_output!(State);
-delegate_shm!(State);
-delegate_seat!(State);
-delegate_keyboard!(State);
-delegate_pointer!(State);
-delegate_layer!(State);
-delegate_registry!(State);
-impl ProvidesRegistryState for State {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry
-    }
-    registry_handlers![OutputState, SeatState];
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use opencv::core::MatTraitConstManual;
-
-    #[test]
-    fn teardown_ack_is_finalized_before_timeout_revalidation() {
-        assert!(validate_session(true, false, false, false));
-        assert!(!validate_session(false, false, false, false));
-        assert!(!validate_session(false, false, true, false));
-        assert!(!validate_session(true, true, false, false));
-        assert!(validate_session(false, true, false, true));
-    }
-
-    #[test]
-    fn selection_release_deadline_expires_once_and_can_be_rearmed() {
-        let now = Instant::now();
-        let mut deadline = Some(now + Duration::from_secs(2));
-        assert!(!release_drain_expired(&mut deadline, now));
-        assert!(!release_drain_expired(
-            &mut deadline,
-            now + Duration::from_secs(2) - Duration::from_nanos(1)
-        ));
-        assert!(release_drain_expired(
-            &mut deadline,
-            now + Duration::from_secs(2)
-        ));
-        assert_eq!(deadline, None);
-        assert!(!release_drain_expired(
-            &mut deadline,
-            now + Duration::from_secs(3)
-        ));
-        deadline = Some(now + Duration::from_secs(4));
-        assert!(!release_drain_expired(
-            &mut deadline,
-            now + Duration::from_secs(3)
-        ));
-        // Cancellation or unmapping disarms the deadline for the next lifecycle.
-        deadline = None;
-        assert!(!release_drain_expired(
-            &mut deadline,
-            now + Duration::from_secs(5)
-        ));
-    }
-
-    #[test]
-    fn batched_shortcuts_use_protocol_holds_and_tap_gaps() {
-        let key = GestureKey::ShiftLeft;
-        // All events are processed together, with no processing-time delay.
-        for (times, expected) in [
-            ([0, 10, 20, 30], Some(Mode::Hints)),
-            ([0, 251, 260, 270], None),
-            ([0, 10, 400, 410], None),
-            ([100, 110, 120, 119], None),
-        ] {
-            let mut tracker = TapTracker::default();
-            for (i, millis) in times.into_iter().enumerate() {
-                let event = if i % 2 == 0 {
-                    shortcut::Event::Pressed {
-                        tv_sec_hi: 1,
-                        tv_sec_lo: 42,
-                        tv_nsec: millis * 1_000_000,
+            xkb::Keysym::Down => {
+                if self
+                    .overlay
+                    .as_ref()
+                    .is_some_and(|ov| ov.session.show_options_menu())
+                {
+                    Some(Input::MenuDown)
+                } else {
+                    Some(Input::Snap(Cardinal::Down))
+                }
+            }
+            xkb::Keysym::Left => {
+                if self
+                    .overlay
+                    .as_ref()
+                    .is_some_and(|ov| ov.session.show_options_menu())
+                {
+                    Some(Input::MenuLeft)
+                } else {
+                    Some(Input::Snap(Cardinal::Left))
+                }
+            }
+            xkb::Keysym::Right => {
+                if self
+                    .overlay
+                    .as_ref()
+                    .is_some_and(|ov| ov.session.show_options_menu())
+                {
+                    Some(Input::MenuRight)
+                } else {
+                    Some(Input::Snap(Cardinal::Right))
+                }
+            }
+            _ => {
+                let utf8 = xkb_state.key_get_utf8(keycode);
+                let ch_opt = utf8.chars().next().or_else(|| {
+                    let raw = sym.raw();
+                    if (0x20..=0x7e).contains(&raw) {
+                        char::from_u32(raw)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(ch) = ch_opt {
+                    let lower = ch.to_ascii_lowercase();
+                    let typed_empty = self
+                        .overlay
+                        .as_ref()
+                        .is_some_and(|ov| ov.session.typed().is_empty());
+                    if ctrl && !shift && !alt {
+                        match lower {
+                            'w' => Some(Input::ToggleFocusedOnly),
+                            'v' => Some(Input::ToggleDragMode),
+                            'r' => Some(Input::Refresh),
+                            'd' => Some(Input::Scroll { dx: 0, dy: -5 }),
+                            'u' => Some(Input::Scroll { dx: 0, dy: 5 }),
+                            'h' => Some(Input::Snap(Cardinal::Left)),
+                            'j' => Some(Input::Snap(Cardinal::Down)),
+                            'k' => Some(Input::Snap(Cardinal::Up)),
+                            'l' => Some(Input::Snap(Cardinal::Right)),
+                            _ => Some(Input::Char {
+                                ch,
+                                shift,
+                                ctrl,
+                                alt,
+                            }),
+                        }
+                    } else if shift && !ctrl && !alt && typed_empty {
+                        match lower {
+                            'j' => Some(Input::Scroll { dx: 0, dy: -3 }),
+                            'k' => Some(Input::Scroll { dx: 0, dy: 3 }),
+                            'h' => Some(Input::Scroll { dx: -3, dy: 0 }),
+                            'l' => Some(Input::Scroll { dx: 3, dy: 0 }),
+                            _ => Some(Input::Char {
+                                ch,
+                                shift,
+                                ctrl,
+                                alt,
+                            }),
+                        }
+                    } else {
+                        Some(Input::Char {
+                            ch,
+                            shift,
+                            ctrl,
+                            alt,
+                        })
                     }
                 } else {
-                    shortcut::Event::Released {
-                        tv_sec_hi: 1,
-                        tv_sec_lo: 42,
-                        tv_nsec: millis * 1_000_000,
-                    }
-                };
-                assert_eq!(
-                    gesture_event(&mut tracker, key, event),
-                    if i == 3 { expected } else { None }
+                    None
+                }
+            }
+        };
+
+        let Some(input) = input else {
+            return;
+        };
+        let Some(overlay) = self.overlay.as_mut() else {
+            return;
+        };
+
+        match overlay
+            .session
+            .handle_input_with_settings(input, &mut self.settings)
+        {
+            Outcome::Continue => {}
+            Outcome::Redraw => {
+                if let Some(layer) = self.layer.as_mut() {
+                    layer.dirty = true;
+                }
+            }
+            Outcome::SettingsChanged => {
+                if let Ok((targets, dbg, ms)) =
+                    detect_from_mat(&overlay.base_bgr, self.settings.detector)
+                {
+                    overlay.debug_data = Some(dbg);
+                    overlay.session.update_targets(
+                        overlay.base_bgr.cols(),
+                        overlay.base_bgr.rows(),
+                        targets,
+                        None,
+                        ms,
+                    );
+                }
+                if let Some(layer) = self.layer.as_mut() {
+                    layer.dirty = true;
+                }
+            }
+            Outcome::SaveSettings => {
+                let _ = self.settings.save();
+                if let Some(layer) = self.layer.as_mut() {
+                    layer.dirty = true;
+                }
+            }
+            Outcome::Refresh => {
+                self.begin_overlay_re_capture(None, qh);
+            }
+            Outcome::Scroll { dx, dy } => {
+                self.begin_overlay_re_capture(Some((dx, dy)), qh);
+            }
+            Outcome::Cancel => {
+                self.close_overlay();
+            }
+            Outcome::Click { x, y } => {
+                self.schedule_pointer_action(x, y, ClickAction::LeftClick, None, qh);
+            }
+            Outcome::Action { x, y, action } => {
+                self.schedule_pointer_action(x, y, action, None, qh);
+            }
+            Outcome::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            } => {
+                self.schedule_pointer_action(
+                    to_x,
+                    to_y,
+                    ClickAction::LeftClick,
+                    Some((from_x, from_y)),
+                    qh,
                 );
             }
         }
     }
 
-    #[test]
-    fn shortcut_nanoseconds_are_validated_without_normalization() {
-        let mut tracker = TapTracker::default();
-        for nanos in [0, 1_000_000_000, 10] {
-            assert_eq!(
-                gesture_event(
-                    &mut tracker,
-                    GestureKey::ControlLeft,
-                    shortcut::Event::Pressed {
-                        tv_sec_hi: 0,
-                        tv_sec_lo: 0,
-                        tv_nsec: nanos
-                    }
-                ),
-                None
-            );
-            assert_eq!(
-                gesture_event(
-                    &mut tracker,
-                    GestureKey::ControlLeft,
-                    shortcut::Event::Released {
-                        tv_sec_hi: 0,
-                        tv_sec_lo: 0,
-                        tv_nsec: nanos
-                    }
-                ),
-                None
-            );
+    fn schedule_pointer_action(
+        &mut self,
+        x: i32,
+        y: i32,
+        action: ClickAction,
+        drag_from: Option<(i32, i32)>,
+        qh: &QueueHandle<Self>,
+    ) {
+        if self.settings.no_click {
+            self.close_overlay();
+            return;
         }
+        let Some(overlay) = self.overlay.as_ref() else {
+            return;
+        };
+        let (logical_w, logical_h) = overlay.output.resolved_logical_size();
+        let (lx, ly) = overlay
+            .geometry
+            .upright_pixel_to_logical(x, y, logical_w, logical_h);
+        let drag_logical = drag_from.map(|(fx, fy)| {
+            let (fx, fy) = overlay
+                .geometry
+                .upright_pixel_to_logical(fx, fy, logical_w, logical_h);
+            (
+                fx.round().clamp(0.0, f64::from(u32::MAX)) as u32,
+                fy.round().clamp(0.0, f64::from(u32::MAX)) as u32,
+            )
+        });
+        let output_index = self
+            .outputs
+            .iter()
+            .position(|candidate| candidate.global_name == overlay.output.global_name)
+            .unwrap_or(0);
+
+        self.close_overlay();
+        self.pending_click = Some(PendingClick {
+            output_index,
+            logical_width: logical_w.max(1) as u32,
+            logical_height: logical_h.max(1) as u32,
+            x: lx.round().clamp(0.0, f64::from(u32::MAX)) as u32,
+            y: ly.round().clamp(0.0, f64::from(u32::MAX)) as u32,
+            action,
+            drag_from: drag_logical,
+        });
+        let _callback: WlCallback = self.display.sync(qh, ());
+        self.sync_pending = true;
     }
 
-    #[test]
-    fn shortcut_timestamps_cross_seconds_and_recover_after_rejection() {
-        let key = GestureKey::ControlLeft;
-        for invalid in [1_000_000_000, 0] {
-            let mut tracker = TapTracker::default();
-            for (pressed, lo, nanos, expected) in [
-                (true, u32::MAX, 980_000_000, None),
-                (false, u32::MAX, 990_000_000, None),
-                // Invalid nanos or a backward press must discard the first tap.
-                (true, u32::MAX, invalid, None),
-                (false, u32::MAX, 995_000_000, None),
-                (true, 0, 0, None),
-                (false, 0, 10_000_000, None),
-                (true, 0, 20_000_000, None),
-                (false, 0, 30_000_000, Some(Mode::Grid)),
-            ] {
-                let hi = u32::from(lo == 0);
-                let event = if pressed {
-                    shortcut::Event::Pressed {
-                        tv_sec_hi: hi,
-                        tv_sec_lo: lo,
-                        tv_nsec: nanos,
-                    }
-                } else {
-                    shortcut::Event::Released {
-                        tv_sec_hi: hi,
-                        tv_sec_lo: lo,
-                        tv_nsec: nanos,
-                    }
-                };
-                assert_eq!(gesture_event(&mut tracker, key, event), expected);
+    fn emit_virtual_action(&mut self, click: PendingClick, qh: &QueueHandle<Self>) {
+        let pointer: ZwlrVirtualPointerV1 =
+            if let Some(output) = self.outputs.get(click.output_index) {
+                self.virtual_pointer_manager
+                    .create_virtual_pointer_with_output(
+                        self.seat.as_ref(),
+                        Some(&output.wl_output),
+                        qh,
+                        (),
+                    )
+            } else {
+                self.virtual_pointer_manager
+                    .create_virtual_pointer(self.seat.as_ref(), qh, ())
+            };
+
+        if let Some((from_x, from_y)) = click.drag_from {
+            pointer.motion_absolute(
+                0,
+                from_x,
+                from_y,
+                click.logical_width.max(1),
+                click.logical_height.max(1),
+            );
+            pointer.frame();
+            pointer.button(1, BTN_LEFT, wl_pointer::ButtonState::Pressed);
+            pointer.frame();
+            let steps = 8u32;
+            for step in 1..=steps {
+                let ix = ((from_x as i64 * (steps - step) as i64 + click.x as i64 * step as i64)
+                    / steps as i64) as u32;
+                let iy = ((from_y as i64 * (steps - step) as i64 + click.y as i64 * step as i64)
+                    / steps as i64) as u32;
+                pointer.motion_absolute(
+                    step * 8,
+                    ix,
+                    iy,
+                    click.logical_width.max(1),
+                    click.logical_height.max(1),
+                );
+                pointer.frame();
+            }
+            pointer.button(80, BTN_LEFT, wl_pointer::ButtonState::Released);
+            pointer.frame();
+            pointer.destroy();
+            return;
+        }
+
+        pointer.motion_absolute(
+            0,
+            click.x,
+            click.y,
+            click.logical_width.max(1),
+            click.logical_height.max(1),
+        );
+        pointer.frame();
+
+        match click.action {
+            ClickAction::HoverOnly => {}
+            ClickAction::LeftClick => {
+                pointer.button(1, BTN_LEFT, wl_pointer::ButtonState::Pressed);
+                pointer.frame();
+                pointer.button(2, BTN_LEFT, wl_pointer::ButtonState::Released);
+                pointer.frame();
+            }
+            ClickAction::RightClick => {
+                pointer.button(1, BTN_RIGHT, wl_pointer::ButtonState::Pressed);
+                pointer.frame();
+                pointer.button(2, BTN_RIGHT, wl_pointer::ButtonState::Released);
+                pointer.frame();
+            }
+            ClickAction::MiddleClick => {
+                pointer.button(1, BTN_MIDDLE, wl_pointer::ButtonState::Pressed);
+                pointer.frame();
+                pointer.button(2, BTN_MIDDLE, wl_pointer::ButtonState::Released);
+                pointer.frame();
+            }
+            ClickAction::DoubleClick => {
+                pointer.button(1, BTN_LEFT, wl_pointer::ButtonState::Pressed);
+                pointer.frame();
+                pointer.button(2, BTN_LEFT, wl_pointer::ButtonState::Released);
+                pointer.frame();
+                pointer.button(15, BTN_LEFT, wl_pointer::ButtonState::Pressed);
+                pointer.frame();
+                pointer.button(16, BTN_LEFT, wl_pointer::ButtonState::Released);
+                pointer.frame();
             }
         }
+        pointer.destroy();
     }
 
-    #[test]
-    fn cancellation_does_not_wait_for_unobservable_releases() {
-        for keys in [0, 1] {
-            for buttons in [0, 1] {
-                for modifiers in [false, true] {
-                    assert!(ready_to_unmap(false, keys, buttons, modifiers));
-                    assert_eq!(
-                        ready_to_unmap(true, keys, buttons, modifiers),
-                        keys == 0 && buttons == 0 && !modifiers
-                    );
+    fn destroy_capture(&mut self) {
+        if let Some(mut capture) = self.capture.take() {
+            if let Some(buffer) = capture.buffer.take() {
+                buffer.destroy();
+            }
+            capture.frame.destroy();
+        }
+    }
+
+    fn destroy_layer_only(&mut self) {
+        if let Some(mut layer) = self.layer.take() {
+            if let Some(slot) = layer.slot.take() {
+                slot.buffer.destroy();
+            }
+            if let Some(viewport) = layer.viewport.take() {
+                viewport.destroy();
+            }
+            layer.layer_surface.destroy();
+            layer.surface.destroy();
+        }
+    }
+
+    fn close_overlay(&mut self) {
+        self.destroy_capture();
+        self.pending_re_capture = None;
+        self.overlay = None;
+        self.destroy_layer_only();
+    }
+}
+
+fn detector_worker_loop(rx: Receiver<WorkerJob>, tx: Sender<WorkerOutput>) {
+    while let Ok(job) = rx.recv() {
+        let Ok(bgr_mat) = bgr_vec_to_mat(&job.bgr_bytes, job.upright_w, job.upright_h) else {
+            continue;
+        };
+        let started = Instant::now();
+        let Ok((mut targets, debug, _)) = detect_with_debug(&bgr_mat, job.options, true) else {
+            continue;
+        };
+        if job.flat {
+            targets = crate::flatten_leaves(&targets).unwrap_or(targets);
+        }
+        let pipeline_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let frame = PrecomputedFrame {
+            created_at: Instant::now(),
+            output_name: job.output_name,
+            width: job.upright_w,
+            height: job.upright_h,
+            bgr: job.bgr_bytes,
+            targets,
+            debug,
+            pipeline_ms,
+        };
+        let _ = tx.send(WorkerOutput {
+            job_id: job.job_id,
+            purpose: job.purpose,
+            geometry: job.geometry,
+            frame,
+        });
+    }
+}
+
+fn detect_from_mat(
+    bgr: &Mat,
+    options: DetectorOptions,
+) -> Result<(Vec<crate::Target>, DebugData, f64), String> {
+    let t0 = Instant::now();
+    let (targets, dbg, _) =
+        detect_with_debug(bgr, options, true).map_err(|err| format!("detector failed: {err}"))?;
+    Ok((targets, dbg, t0.elapsed().as_secs_f64() * 1000.0))
+}
+
+fn mat_to_bgr_vec(mat: &Mat) -> Result<Vec<u8>, String> {
+    let rows = mat.rows();
+    let cols = mat.cols();
+    let mut out = vec![0u8; (rows as usize) * (cols as usize) * 3];
+    for r in 0..rows {
+        let row = mat
+            .at_row::<opencv::core::Vec3b>(r)
+            .map_err(|err| format!("mat row read failed: {err}"))?;
+        let dst =
+            &mut out[(r as usize) * (cols as usize) * 3..(r as usize + 1) * (cols as usize) * 3];
+        for (c, px) in row.iter().enumerate() {
+            dst[c * 3] = px[0];
+            dst[c * 3 + 1] = px[1];
+            dst[c * 3 + 2] = px[2];
+        }
+    }
+    Ok(out)
+}
+
+fn bgr_vec_to_mat(bytes: &[u8], width: i32, height: i32) -> Result<Mat, String> {
+    let mut mat = Mat::new_rows_cols_with_default(
+        height,
+        width,
+        opencv::core::CV_8UC3,
+        opencv::core::Scalar::all(0.0),
+    )
+    .map_err(|err| format!("failed to allocate Mat: {err}"))?;
+    for r in 0..height {
+        let row = mat
+            .at_row_mut::<opencv::core::Vec3b>(r)
+            .map_err(|err| format!("mat row write failed: {err}"))?;
+        let src =
+            &bytes[(r as usize) * (width as usize) * 3..(r as usize + 1) * (width as usize) * 3];
+        for c in 0..width as usize {
+            row[c] = opencv::core::Vec3b::from([src[c * 3], src[c * 3 + 1], src[c * 3 + 2]]);
+        }
+    }
+    Ok(mat)
+}
+
+impl Dispatch<WlRegistry, GlobalListContents> for DaemonState {
+    fn event(
+        state: &mut Self,
+        registry: &WlRegistry,
+        event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                if interface == WlOutput::interface().name {
+                    let wl_output = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, name);
+                    state.outputs.push(OutputInfo::new(wl_output, name));
                 }
             }
-        }
-    }
-
-    #[test]
-    fn capture_normalizes_every_output_transform_once() {
-        let bytes = [1u32, 2, 3, 4, 5, 6]
-            .into_iter()
-            .flat_map(u32::to_ne_bytes)
-            .collect::<Vec<_>>();
-        let expected = [
-            vec![1, 2, 3, 4, 5, 6],
-            vec![2, 4, 6, 1, 3, 5],
-            vec![6, 5, 4, 3, 2, 1],
-            vec![5, 3, 1, 6, 4, 2],
-            vec![2, 1, 4, 3, 6, 5],
-            vec![1, 3, 5, 2, 4, 6],
-            vec![5, 6, 3, 4, 1, 2],
-            vec![6, 4, 2, 5, 3, 1],
-        ];
-        for (transform, expected) in expected.iter().enumerate() {
-            let image = decode(
-                &bytes,
-                2,
-                3,
-                8,
-                wl_shm::Format::Xrgb8888,
-                false,
-                transform as i32,
-            )
-            .unwrap();
-            assert_eq!(
-                image
-                    .data_bytes()
-                    .unwrap()
-                    .as_chunks::<3>()
-                    .0
-                    .iter()
-                    .map(|p| p[0])
-                    .collect::<Vec<_>>(),
-                *expected
-            );
-            assert_eq!(
-                (image.cols(), image.rows()),
-                if transform % 2 == 0 { (2, 3) } else { (3, 2) }
-            );
-        }
-    }
-
-    #[test]
-    fn capture_honors_row_stride_inversion_and_channel_order() {
-        let bytes = [0x00112233u32, 0xffffffff, 0x00445566, 0xffffffff]
-            .into_iter()
-            .flat_map(u32::to_ne_bytes)
-            .collect::<Vec<_>>();
-        let image = decode(&bytes, 1, 2, 8, wl_shm::Format::Xrgb8888, true, 0).unwrap();
-        assert_eq!(
-            image.data_bytes().unwrap(),
-            &[0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
-        );
-        let image = decode(&bytes, 1, 2, 8, wl_shm::Format::Abgr8888, false, 0).unwrap();
-        assert_eq!(
-            image.data_bytes().unwrap(),
-            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
-        );
-        let word = (1023u32 << 20) | (512 << 10);
-        let image = decode(
-            &word.to_ne_bytes(),
-            1,
-            1,
-            4,
-            wl_shm::Format::Xbgr2101010,
-            false,
-            0,
-        )
-        .unwrap();
-        assert_eq!(image.data_bytes().unwrap(), &[255, 128, 0]);
-    }
-
-    #[test]
-    fn capture_inversion_precedes_every_output_transform() {
-        let bytes = [1u32, 2, 3, 4, 5, 6]
-            .into_iter()
-            .flat_map(u32::to_ne_bytes)
-            .collect::<Vec<_>>();
-        let inverted = [4u32, 5, 6, 1, 2, 3]
-            .into_iter()
-            .flat_map(u32::to_ne_bytes)
-            .collect::<Vec<_>>();
-        for transform in 0..8 {
-            let actual =
-                decode(&bytes, 3, 2, 12, wl_shm::Format::Xrgb8888, true, transform).unwrap();
-            let expected = decode(
-                &inverted,
-                3,
-                2,
-                12,
-                wl_shm::Format::Xrgb8888,
-                false,
-                transform,
-            )
-            .unwrap();
-            assert_eq!(actual.size().unwrap(), expected.size().unwrap());
-            assert_eq!(actual.data_bytes().unwrap(), expected.data_bytes().unwrap());
+            wl_registry::Event::GlobalRemove { name } => {
+                state.outputs.retain(|output| output.global_name != name);
+            }
+            _ => {}
         }
     }
 }
+
+impl Dispatch<WlOutput, u32> for DaemonState {
+    fn event(
+        state: &mut Self,
+        _output: &WlOutput,
+        event: wl_output::Event,
+        global_name: &u32,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let Some(info) = state
+            .outputs
+            .iter_mut()
+            .find(|candidate| candidate.global_name == *global_name)
+        else {
+            return;
+        };
+        match event {
+            wl_output::Event::Geometry {
+                x, y, transform, ..
+            } => {
+                info.x = x;
+                info.y = y;
+                if let WEnum::Value(value) = transform {
+                    info.transform = value;
+                }
+            }
+            wl_output::Event::Mode {
+                flags,
+                width,
+                height,
+                ..
+            } => {
+                if let WEnum::Value(mode_flags) = flags
+                    && mode_flags.contains(wl_output::Mode::Current)
+                {
+                    info.mode_width = width;
+                    info.mode_height = height;
+                }
+            }
+            wl_output::Event::Scale { factor } => {
+                info.scale = factor.max(1);
+            }
+            wl_output::Event::Name { name } => {
+                info.name = Some(name);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlSeat, ()> for DaemonState {
+    fn event(
+        state: &mut Self,
+        seat: &WlSeat,
+        event: wl_seat::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(capabilities),
+        } = event
+            && capabilities.contains(wl_seat::Capability::Keyboard)
+            && state.keyboard.is_none()
+        {
+            state.keyboard = Some(seat.get_keyboard(qh, ()));
+        }
+    }
+}
+
+impl Dispatch<WlKeyboard, ()> for DaemonState {
+    fn event(
+        state: &mut Self,
+        _keyboard: &WlKeyboard,
+        event: wl_keyboard::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_keyboard::Event::Keymap {
+                format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+                fd,
+                size,
+            } => {
+                let keymap = unsafe {
+                    xkb::Keymap::new_from_fd(
+                        &state.xkb_context,
+                        fd,
+                        size as usize,
+                        xkb::KEYMAP_FORMAT_TEXT_V1,
+                        xkb::KEYMAP_COMPILE_NO_FLAGS,
+                    )
+                };
+                if let Ok(Some(keymap)) = keymap {
+                    state.xkb_state = Some(xkb::State::new(&keymap));
+                }
+            }
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
+                if let Some(xkb_state) = state.xkb_state.as_mut() {
+                    xkb_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                }
+            }
+            wl_keyboard::Event::Key {
+                key,
+                state: WEnum::Value(KeyState::Pressed),
+                ..
+            } => {
+                state.handle_key_press(key, qh);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwlrScreencopyFrameV1, ()> for DaemonState {
+    fn event(
+        state: &mut Self,
+        frame: &ZwlrScreencopyFrameV1,
+        event: zwlr_screencopy_frame_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        let Some(capture) = state.capture.as_mut() else {
+            return;
+        };
+        if &capture.frame != frame {
+            return;
+        }
+        match event {
+            zwlr_screencopy_frame_v1::Event::Buffer {
+                format: WEnum::Value(format),
+                width,
+                height,
+                stride,
+            } => {
+                if matches!(
+                    format,
+                    ShmFormat::Argb8888
+                        | ShmFormat::Xrgb8888
+                        | ShmFormat::Abgr8888
+                        | ShmFormat::Xbgr8888
+                ) && capture.spec.is_none()
+                {
+                    let spec = BufferSpec {
+                        format,
+                        width,
+                        height,
+                        stride,
+                    };
+                    let byte_len = (stride as usize) * (height as usize);
+                    match tempfile().and_then(|file| {
+                        file.set_len(byte_len as u64)?;
+                        Ok(file)
+                    }) {
+                        Ok(file) => {
+                            let pool = state.shm.create_pool(file.as_fd(), byte_len as i32, qh, ());
+                            let buffer = pool.create_buffer(
+                                0,
+                                width as i32,
+                                height as i32,
+                                stride as i32,
+                                format,
+                                qh,
+                                (),
+                            );
+                            pool.destroy();
+                            capture.spec = Some(spec);
+                            capture.shm_file = Some(file);
+                            capture.buffer = Some(buffer.clone());
+                            if frame.version() < 3 {
+                                frame.copy(&buffer);
+                            }
+                        }
+                        Err(err) => {
+                            state.last_error =
+                                Some(format!("failed to allocate screencopy shm file: {err}"));
+                            capture.failed = true;
+                        }
+                    }
+                }
+            }
+            zwlr_screencopy_frame_v1::Event::BufferDone => {
+                if let Some(buffer) = &capture.buffer {
+                    frame.copy(buffer);
+                } else {
+                    state.last_error = Some(
+                        "zwlr_screencopy_frame_v1 offered no supported 32-bit SHM format"
+                            .to_string(),
+                    );
+                    capture.failed = true;
+                }
+            }
+            zwlr_screencopy_frame_v1::Event::Flags {
+                flags: WEnum::Value(flags),
+            } => {
+                capture.flags = flags;
+            }
+            zwlr_screencopy_frame_v1::Event::Ready { .. } => {
+                capture.ready = true;
+            }
+            zwlr_screencopy_frame_v1::Event::Failed => {
+                capture.failed = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwlrLayerSurfaceV1, ()> for DaemonState {
+    fn event(
+        state: &mut Self,
+        layer_surface: &ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let Some(layer) = state.layer.as_mut() else {
+            return;
+        };
+        if &layer.layer_surface != layer_surface {
+            return;
+        }
+        match event {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                layer_surface.ack_configure(serial);
+                if width > 0 {
+                    layer.logical_width = width;
+                }
+                if height > 0 {
+                    layer.logical_height = height;
+                }
+                if let Some(overlay) = state.overlay.as_mut() {
+                    overlay.output.logical_width = layer.logical_width as i32;
+                    overlay.output.logical_height = layer.logical_height as i32;
+                }
+                layer.configured = true;
+                layer.dirty = true;
+            }
+            zwlr_layer_surface_v1::Event::Closed => {
+                layer.closed = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<HyprlandGlobalShortcutV1, CommandAction> for DaemonState {
+    fn event(
+        state: &mut Self,
+        _shortcut: &HyprlandGlobalShortcutV1,
+        event: hyprland_global_shortcut_v1::Event,
+        action: &CommandAction,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if matches!(event, hyprland_global_shortcut_v1::Event::Pressed { .. }) {
+            let _ = state.enqueue_command(*action, qh);
+        }
+    }
+}
+
+impl Dispatch<WlCallback, ()> for DaemonState {
+    fn event(
+        state: &mut Self,
+        _callback: &WlCallback,
+        event: wl_callback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if matches!(event, wl_callback::Event::Done { .. }) {
+            state.sync_pending = false;
+        }
+    }
+}
+
+impl Dispatch<WlShm, ()> for DaemonState {
+    fn event(
+        _state: &mut Self,
+        _shm: &WlShm,
+        _event: wl_shm::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WlBuffer, ()> for DaemonState {
+    fn event(
+        _state: &mut Self,
+        _buffer: &WlBuffer,
+        _event: wl_buffer::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<HyprlandGlobalShortcutsManagerV1, ()> for DaemonState {
+    fn event(
+        _state: &mut Self,
+        _manager: &HyprlandGlobalShortcutsManagerV1,
+        _event: hyprland_global_shortcuts_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+delegate_noop!(DaemonState: ignore WlCompositor);
+delegate_noop!(DaemonState: ignore WlSurface);
+delegate_noop!(DaemonState: ignore WlShmPool);
+delegate_noop!(DaemonState: ignore ZwlrLayerShellV1);
+delegate_noop!(DaemonState: ignore ZwlrScreencopyManagerV1);
+delegate_noop!(DaemonState: ignore ZwlrVirtualPointerManagerV1);
+delegate_noop!(DaemonState: ignore ZwlrVirtualPointerV1);
+delegate_noop!(DaemonState: ignore WpViewporter);
+delegate_noop!(DaemonState: ignore WpViewport);

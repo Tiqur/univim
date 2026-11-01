@@ -1,546 +1,849 @@
-//! Logical-pixel overlays. OpenCV draws straight-alpha colors; the export step
-//! premultiplies exactly once for little-endian wl_shm ARGB8888 (B, G, R, A).
-use super::session::{Mode, Session};
-use crate::Target;
-use opencv::{core::*, imgproc};
+use super::{
+    RuntimeSettings,
+    geometry::FrameGeometry,
+    session::{DebugView, Mode, Session},
+};
+use crate::{DebugData, Target};
+use opencv::{
+    core::{CV_8UC3, Mat, Point, Rect, Scalar, Size},
+    imgproc::{self, LINE_AA},
+    prelude::*,
+};
 
-// OpenCV colors are BGR(A). The target outline is muted so the solid neon
-// labels remain the highest-contrast element on the overlay.
-const NEON: Scalar = Scalar::new(20., 255., 40., 255.);
-const BLACK: Scalar = Scalar::new(0., 0., 0., 255.);
-const MUTED: Scalar = Scalar::new(48., 48., 48., 255.);
-const GREEN: Scalar = Scalar::new(70., 220., 70., 255.);
-const GREEN_FILL: Scalar = Scalar::new(70., 220., 70., 48.);
-const DARK: Scalar = Scalar::new(18., 18., 18., 255.);
-const OUTLINE: Scalar = Scalar::new(70., 220., 70., 220.);
+#[derive(Clone, Debug)]
+pub struct RenderedSurface {
+    pub width: i32,
+    pub height: i32,
+    pub argb: Vec<u8>,
+}
 
-const LABEL_FONT: i32 = imgproc::FONT_HERSHEY_SIMPLEX;
-const LABEL_BOLD_FONT: i32 = imgproc::FONT_HERSHEY_DUPLEX;
-const LABEL_SCALE: f64 = 0.48;
-const LABEL_THICKNESS: i32 = 1;
-const LABEL_PAD_X: i32 = 3;
-const LABEL_PAD_Y: i32 = 2;
+pub fn render_session_surface(
+    base_bgr: &Mat,
+    session: &Session,
+    geometry: &FrameGeometry,
+    debug_data: Option<&DebugData>,
+    settings: &RuntimeSettings,
+) -> opencv::Result<RenderedSurface> {
+    let mut canvas =
+        render_debug_stage_canvas(base_bgr, session, debug_data, settings.spotlight_dim)?;
 
-const STATUS_SCALE: f64 = 0.45;
-const STATUS_THICKNESS: i32 = 1;
+    draw_focused_window_And_reticule(&mut canvas, session)?;
 
-/// Bright, high-luminance colors so the black tag text stays readable.
-fn type_color(kind: &str) -> Scalar {
-    let (r, g, b) = match kind {
-        "frame" => (198, 255, 64),        // lime
-        "thumbnail" => (255, 72, 224),    // magenta
-        "desktop_icon" => (255, 194, 64), // amber
-        "inline_link" => (64, 232, 255),  // cyan
-        "text_link" => (92, 176, 255),    // sky
-        "icon" => (255, 136, 64),         // orange
-        "text_block" => (255, 104, 176),  // rose
-        "line" => (255, 236, 84),         // lemon
-        "word" => (202, 128, 255),        // violet
-        "text" => (255, 72, 224),         // magenta fallback
-        _ => (20, 255, 40),               // neon green
+    if settings.show_status_bar || !session.typed().is_empty() || session.show_debug_hud() {
+        draw_status_pill(&mut canvas, session)?;
+    }
+
+    if session.show_debug_hud() {
+        draw_debug_hud(&mut canvas, session, debug_data)?;
+    }
+
+    if session.show_options_menu() {
+        draw_options_modal(&mut canvas, session, settings)?;
+    }
+
+    let raw = geometry.to_compositor_buffer(&canvas)?;
+    Ok(RenderedSurface {
+        width: raw.cols(),
+        height: raw.rows(),
+        argb: bgr_to_argb_bytes(&raw)?,
+    })
+}
+
+fn render_debug_stage_canvas(
+    base_bgr: &Mat,
+    session: &Session,
+    debug_data: Option<&DebugData>,
+    spotlight_dim: bool,
+) -> opencv::Result<Mat> {
+    let Some(dbg) = debug_data else {
+        let mut base = base_bgr.try_clone()?;
+        if spotlight_dim {
+            dim_mat_with_focus(&mut base, session.focused_rect())?;
+        }
+        return render_standard_overlay(&base, session);
     };
-    Scalar::new(b as f64, g as f64, r as f64, 255.)
+
+    match session.debug_view() {
+        DebugView::OverlayHud => {
+            let mut base = base_bgr.try_clone()?;
+            if spotlight_dim {
+                dim_mat_with_focus(&mut base, session.focused_rect())?;
+            }
+            render_standard_overlay(&base, session)
+        }
+        DebugView::RawPhysics => {
+            let mut vis = base_bgr.try_clone()?;
+            dim_mat(&mut vis, 0.72)?;
+            for t in session.targets() {
+                let color = match t.kind.as_str() {
+                    "frame" => Scalar::new(0.0, 220.0, 80.0, 0.0),
+                    "thumbnail" => Scalar::new(255.0, 170.0, 0.0, 0.0),
+                    "icon" | "desktop_icon" => Scalar::new(255.0, 90.0, 220.0, 0.0),
+                    _ => Scalar::new(240.0, 200.0, 40.0, 0.0),
+                };
+                imgproc::rectangle(
+                    &mut vis,
+                    Rect::new(t.x, t.y, t.w, t.h),
+                    color,
+                    1,
+                    imgproc::LINE_8,
+                    0,
+                )?;
+            }
+            Ok(vis)
+        }
+        DebugView::Gradients => {
+            let g_u8 = gray_slice_to_bgr(
+                &dbg.grad_max,
+                dbg.work_w,
+                dbg.work_h,
+                base_bgr.cols(),
+                base_bgr.rows(),
+                [40, 255, 140],
+            )?;
+            render_standard_overlay(&g_u8, session)
+        }
+        DebugView::BarriersFrames => {
+            let b_u8 = gray_slice_to_bgr(
+                &dbg.bar_all,
+                dbg.work_w,
+                dbg.work_h,
+                base_bgr.cols(),
+                base_bgr.rows(),
+                [80, 180, 255],
+            )?;
+            render_standard_overlay(&b_u8, session)
+        }
+        DebugView::StrokesCoarse => {
+            let s_u8 = dual_mask_to_bgr(
+                &dbg.stroke_mask,
+                &dbg.coarse_mask,
+                dbg.work_w,
+                dbg.work_h,
+                base_bgr.cols(),
+                base_bgr.rows(),
+            )?;
+            render_standard_overlay(&s_u8, session)
+        }
+        DebugView::Hierarchy => {
+            let mut vis = base_bgr.try_clone()?;
+            dim_mat(&mut vis, 0.45)?;
+            for t in session.targets() {
+                imgproc::rectangle(
+                    &mut vis,
+                    Rect::new(t.x, t.y, t.w, t.h),
+                    Scalar::new(0.0, 210.0, 90.0, 0.0),
+                    2,
+                    imgproc::LINE_8,
+                    0,
+                )?;
+                for child in &t.children {
+                    let Ok(line) = serde_json::from_value::<Target>(child.clone()) else {
+                        continue;
+                    };
+                    imgproc::rectangle(
+                        &mut vis,
+                        Rect::new(line.x, line.y, line.w, line.h),
+                        Scalar::new(255.0, 190.0, 0.0, 0.0),
+                        1,
+                        imgproc::LINE_8,
+                        0,
+                    )?;
+                    for child in &line.children {
+                        let Ok(word) = serde_json::from_value::<Target>(child.clone()) else {
+                            continue;
+                        };
+                        imgproc::rectangle(
+                            &mut vis,
+                            Rect::new(word.x, word.y, word.w, word.h),
+                            Scalar::new(180.0, 80.0, 255.0, 0.0),
+                            1,
+                            imgproc::LINE_8,
+                            0,
+                        )?;
+                    }
+                }
+            }
+            Ok(vis)
+        }
+    }
 }
 
-fn tinted(color: Scalar, alpha: f64) -> Scalar {
-    Scalar::new(color[0], color[1], color[2], alpha)
+fn render_standard_overlay(base_bgr: &Mat, session: &Session) -> opencv::Result<Mat> {
+    let filtered = visible_targets(session.targets(), session.typed());
+    match session.mode() {
+        // Drill-down sessions already replace their targets with the immediate
+        // children, so the ordinary labelled overlay is the correct surface.
+        Mode::Hints | Mode::Drilldown | Mode::Grid => crate::render::overlay(base_bgr, &filtered),
+    }
 }
 
-fn canvas(width: u32, height: u32) -> Result<Mat, String> {
-    // Bound both dimensions and total storage before handing sizes to OpenCV.
-    if width == 0 || height == 0 || width > 16384 || height > 16384 {
-        return Err("logical dimensions must be between 1 and 16384".into());
-    }
-    if u64::from(width) * u64::from(height) > 16_777_216 {
-        return Err("overlay exceeds the 64 MiB buffer limit".into());
-    }
-    Mat::new_rows_cols_with_default(height as i32, width as i32, CV_8UC4, Scalar::all(0.))
-        .map_err(|e| e.to_string())
-}
+#[allow(non_snake_case)]
+fn draw_focused_window_And_reticule(canvas: &mut Mat, session: &Session) -> opencv::Result<()> {
+    let w = canvas.cols();
+    let h = canvas.rows();
 
-// Clip before constructing Rect: target coordinates may be negative or extreme.
-fn rect(m: &mut Mat, bounds: [i32; 4], color: Scalar, fill: bool) -> opencv::Result<()> {
-    let [x, y, w, h] = bounds;
-    if w <= 0 || h <= 0 {
-        return Ok(());
+    if let Some([fx, fy, fw, fh]) = session.focused_rect() {
+        let rx = fx.clamp(0, (w - 1).max(0));
+        let ry = fy.clamp(0, (h - 1).max(0));
+        let rw = fw.min(w - rx).max(0);
+        let rh = fh.min(h - ry).max(0);
+        if rw > 4 && rh > 4 {
+            let color = if session.focused_only() {
+                Scalar::new(80.0, 230.0, 255.0, 0.0)
+            } else {
+                Scalar::new(180.0, 140.0, 60.0, 0.0)
+            };
+            imgproc::rectangle(
+                canvas,
+                Rect::new(rx, ry, rw, rh),
+                color,
+                if session.focused_only() { 2 } else { 1 },
+                imgproc::LINE_8,
+                0,
+            )?;
+        }
     }
-    let left = x.clamp(0, m.cols());
-    let top = y.clamp(0, m.rows());
-    let right = (i64::from(x) + i64::from(w)).clamp(0, i64::from(m.cols())) as i32;
-    let bottom = (i64::from(y) + i64::from(h)).clamp(0, i64::from(m.rows())) as i32;
-    if right > left && bottom > top {
+
+    if let Some(target) = session.snapped_target() {
+        let pad = 3;
+        let rx = (target.x - pad).max(0);
+        let ry = (target.y - pad).max(0);
+        let rw = (target.w + pad * 2).min(w - rx).max(1);
+        let rh = (target.h + pad * 2).min(h - ry).max(1);
         imgproc::rectangle(
-            m,
-            Rect::new(left, top, right - left, bottom - top),
-            color,
-            if fill { -1 } else { 1 },
-            imgproc::LINE_8,
+            canvas,
+            Rect::new(rx, ry, rw, rh),
+            Scalar::new(0.0, 230.0, 255.0, 0.0),
+            2,
+            LINE_AA,
+            0,
+        )?;
+        let cx = (target.x + target.w / 2).clamp(0, w - 1);
+        let cy = (target.y + target.h / 2).clamp(0, h - 1);
+        imgproc::circle(
+            canvas,
+            Point::new(cx, cy),
+            4,
+            Scalar::new(0.0, 230.0, 255.0, 0.0),
+            -1,
+            LINE_AA,
             0,
         )?;
     }
-    Ok(())
-}
 
-fn sanitize(value: &str) -> String {
-    // Hershey fonts are ASCII-only. Bound work and replace unsupported glyphs
-    // rather than passing arbitrary UTF-8 bytes to OpenCV's text renderer.
-    value
-        .chars()
-        .take(120)
-        .map(|c| {
-            if c.is_ascii_graphic() || c == ' ' {
-                c
-            } else {
-                '?'
-            }
-        })
-        .collect()
-}
-
-fn measure(value: &str) -> opencv::Result<(i32, i32, i32)> {
-    let mut baseline = 0;
-    let size = imgproc::get_text_size(
-        &sanitize(value),
-        LABEL_FONT,
-        LABEL_SCALE,
-        LABEL_THICKNESS,
-        &mut baseline,
-    )?;
-    Ok((size.width, size.height, baseline))
-}
-
-fn label_size(value: &str) -> opencv::Result<(i32, i32)> {
-    let (width, height, baseline) = measure(value)?;
-    Ok((width + LABEL_PAD_X * 2, height + baseline + LABEL_PAD_Y * 2))
-}
-
-fn tag(
-    m: &mut Mat,
-    value: &str,
-    x: i32,
-    y: i32,
-    highlight: usize,
-    color: Scalar,
-) -> opencv::Result<()> {
-    let value = sanitize(value);
-    let (width, height, baseline) = measure(&value)?;
-    let w = width + LABEL_PAD_X * 2;
-    let h = height + baseline + LABEL_PAD_Y * 2;
-    let x = x.clamp(0, (m.cols() - w).max(0));
-    let y = y.clamp(0, (m.rows() - h).max(0));
-    rect(m, [x, y, w, h], color, true)?;
-    let origin = Point::new(x + LABEL_PAD_X, y + height + LABEL_PAD_Y);
-    let highlight = highlight.min(value.chars().count());
-    let color = if highlight == 0 { BLACK } else { MUTED };
-    imgproc::put_text(
-        m,
-        &value,
-        origin,
-        LABEL_FONT,
-        LABEL_SCALE,
-        color,
-        LABEL_THICKNESS,
-        imgproc::LINE_AA,
-        false,
-    )?;
-    // The prefix is laid out at the same origin as the full label. Duplex is a
-    // naturally heavier face, so typed characters stand out without the thick,
-    // hand-drawn look of an extra stroke.
-    if highlight > 0 {
-        let prefix: String = value.chars().take(highlight).collect();
+    if let Some((ax, ay)) = session.drag_anchor() {
+        let cx = ax.clamp(0, w - 1);
+        let cy = ay.clamp(0, h - 1);
+        imgproc::circle(
+            canvas,
+            Point::new(cx, cy),
+            7,
+            Scalar::new(90.0, 90.0, 255.0, 0.0),
+            2,
+            LINE_AA,
+            0,
+        )?;
         imgproc::put_text(
-            m,
-            &prefix,
-            origin,
-            LABEL_BOLD_FONT,
-            LABEL_SCALE,
-            BLACK,
-            LABEL_THICKNESS,
-            imgproc::LINE_AA,
+            canvas,
+            "DRAG START",
+            Point::new((cx + 10).min((w - 90).max(0)), (cy - 6).max(14)),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.40,
+            Scalar::new(110.0, 110.0, 255.0, 0.0),
+            1,
+            LINE_AA,
             false,
         )?;
     }
+
     Ok(())
 }
 
-fn status(m: &mut Mat, value: &str, x: i32, y: i32) -> opencv::Result<()> {
-    let value = sanitize(value);
-    let mut baseline = 0;
-    let size = imgproc::get_text_size(
-        &value,
-        imgproc::FONT_HERSHEY_SIMPLEX,
-        STATUS_SCALE,
-        STATUS_THICKNESS,
-        &mut baseline,
+fn dim_mat_with_focus(mat: &mut Mat, focused_rect: Option<[i32; 4]>) -> opencv::Result<()> {
+    let w = mat.cols();
+    let h = mat.rows();
+    if let Some([fx, fy, fw, fh]) = focused_rect {
+        let rx = fx.clamp(0, w);
+        let ry = fy.clamp(0, h);
+        let rw = fw.min(w - rx).max(0);
+        let rh = fh.min(h - ry).max(0);
+        if rw > 0 && rh > 0 && (rw < w || rh < h) {
+            for r in 0..h {
+                let in_y = r >= ry && r < ry + rh;
+                let row = mat.at_row_mut::<opencv::core::Vec3b>(r)?;
+                for (c, px) in row.iter_mut().enumerate() {
+                    let inside = in_y && c as i32 >= rx && (c as i32) < rx + rw;
+                    if inside {
+                        px[0] = ((px[0] as u16 * 238) >> 8) as u8;
+                        px[1] = ((px[1] as u16 * 238) >> 8) as u8;
+                        px[2] = ((px[2] as u16 * 238) >> 8) as u8;
+                    } else {
+                        px[0] = ((px[0] as u16 * 178) >> 8) as u8;
+                        px[1] = ((px[1] as u16 * 178) >> 8) as u8;
+                        px[2] = ((px[2] as u16 * 178) >> 8) as u8;
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
+    dim_mat(mat, 0.84)
+}
+
+fn dim_mat(mat: &mut Mat, factor: f64) -> opencv::Result<()> {
+    let scale = (factor.clamp(0.1, 1.0) * 256.0) as u16;
+    let rows = mat.rows();
+    for r in 0..rows {
+        let row = mat.at_row_mut::<opencv::core::Vec3b>(r)?;
+        for px in row.iter_mut() {
+            px[0] = ((px[0] as u16 * scale) >> 8) as u8;
+            px[1] = ((px[1] as u16 * scale) >> 8) as u8;
+            px[2] = ((px[2] as u16 * scale) >> 8) as u8;
+        }
+    }
+    Ok(())
+}
+
+fn gray_slice_to_bgr(
+    gray: &[u8],
+    work_w: i32,
+    work_h: i32,
+    out_w: i32,
+    out_h: i32,
+    tint_bgr: [u8; 3],
+) -> opencv::Result<Mat> {
+    let mut small = Mat::new_rows_cols_with_default(work_h, work_w, CV_8UC3, Scalar::all(0.0))?;
+    for r in 0..work_h {
+        let row = small.at_row_mut::<opencv::core::Vec3b>(r)?;
+        let base = (r as usize) * (work_w as usize);
+        for (c, px) in row[..work_w as usize].iter_mut().enumerate() {
+            let v = gray.get(base + c).copied().unwrap_or(0) as u16;
+            px[0] = ((v * tint_bgr[0] as u16) >> 8) as u8;
+            px[1] = ((v * tint_bgr[1] as u16) >> 8) as u8;
+            px[2] = ((v * tint_bgr[2] as u16) >> 8) as u8;
+        }
+    }
+    if work_w == out_w && work_h == out_h {
+        return Ok(small);
+    }
+    let mut out = Mat::default();
+    imgproc::resize(
+        &small,
+        &mut out,
+        Size::new(out_w, out_h),
+        0.0,
+        0.0,
+        imgproc::INTER_NEAREST,
     )?;
-    let w = size.width + 8;
-    let h = size.height + baseline + 6;
-    let x = x.clamp(0, (m.cols() - w).max(0));
-    let y = y.clamp(0, (m.rows() - h).max(0));
-    rect(m, [x, y, w, h], DARK, true)?;
-    imgproc::put_text(
-        m,
-        &value,
-        Point::new(x + 4, y + size.height + 3),
-        imgproc::FONT_HERSHEY_SIMPLEX,
-        STATUS_SCALE,
-        NEON,
-        STATUS_THICKNESS,
-        imgproc::LINE_AA,
-        false,
-    )
+    Ok(out)
 }
 
-/// Keep labels attached to their targets, but move the tag outside when it
-/// would obscure most of a small target. Prefer outside above, then below,
-/// then to the right and left before falling back to the top-left corner.
-fn place_label(target: [i32; 4], label: (i32, i32), cols: i32, rows: i32) -> (i32, i32) {
-    let [x, y, w, h] = target;
-    let (label_w, label_h) = label;
-    let x = x.clamp(0, (cols - label_w).max(0));
-    // Require a comfortable margin so labels do not sit on small targets.
-    if w >= label_w + 24 && h >= label_h + 24 {
-        return (x, y);
-    }
-    let above = y - label_h - 2;
-    if above >= 0 {
-        return (x, above);
-    }
-    let below = y + h + 2;
-    if below + label_h <= rows {
-        return (x, below);
-    }
-    let right = x + w + 2;
-    if right + label_w <= cols {
-        return (right, y);
-    }
-    let left = x - label_w - 2;
-    if left >= 0 {
-        return (left, y);
-    }
-    (x, y)
-}
-
-fn hints(
-    m: &mut Mat,
-    targets: &[Target],
-    prefix: &str,
-    width: i32,
-    height: i32,
-    color_by_type: bool,
-) -> opencv::Result<()> {
-    let sx = f64::from(m.cols()) / f64::from(width);
-    let sy = f64::from(m.rows()) / f64::from(height);
-    for t in targets.iter().filter(|t| t.hint.starts_with(prefix)) {
-        if t.w <= 0 || t.h <= 0 {
-            continue;
-        }
-        let left = (f64::from(t.x) * sx).floor();
-        let top = (f64::from(t.y) * sy).floor();
-        let right = ((f64::from(t.x) + f64::from(t.w)) * sx).ceil();
-        let bottom = ((f64::from(t.y) + f64::from(t.h)) * sy).ceil();
-        if right <= 0. || bottom <= 0. || left >= f64::from(m.cols()) || top >= f64::from(m.rows())
-        {
-            continue;
-        }
-        let x = left.max(0.) as i32;
-        let y = top.max(0.) as i32;
-        let w = right.min(f64::from(m.cols())) as i32 - x;
-        let h = bottom.min(f64::from(m.rows())) as i32 - y;
-        let (tag_color, outline, fill) = if color_by_type {
-            let color = type_color(&t.kind);
-            (color, tinted(color, 220.), tinted(color, 48.))
-        } else {
-            (NEON, OUTLINE, GREEN_FILL)
-        };
-        rect(m, [x, y, w, h], fill, true)?;
-        rect(m, [x, y, w, h], outline, false)?;
-        // Only typed characters are emphasized. With no prefix the whole tag
-        // is black, so the first letter is not special until it is actually used.
-        let highlight = prefix.chars().count();
-        let (lx, ly) = place_label([x, y, w, h], label_size(&t.hint)?, m.cols(), m.rows());
-        tag(m, &t.hint, lx, ly, highlight, tag_color)?;
-    }
-    Ok(())
-}
-
-fn grid(m: &mut Mat, bounds: Rect, count: i32, prefix: &str) -> opencv::Result<()> {
-    for row in 0..count {
-        for col in 0..count {
-            let label = if count == 26 {
-                format!(
-                    "{}{}",
-                    (b'A' + row as u8) as char,
-                    (b'A' + col as u8) as char
-                )
-            } else {
-                let index = (row * 6 + col) as u8;
-                char::from(if index < 26 {
-                    b'A' + index
-                } else {
-                    b'0' + index - 26
-                })
-                .to_string()
-            };
-            let x = bounds.x + col * bounds.width / count;
-            let y = bounds.y + row * bounds.height / count;
-            let w = (col + 1) * bounds.width / count - col * bounds.width / count;
-            let h = (row + 1) * bounds.height / count - row * bounds.height / count;
-            rect(m, [x, y, w, h], OUTLINE, false)?;
-            if label.starts_with(prefix) {
-                let (label_w, label_h) = label_size(&label)?;
-                if w >= label_w + 4 && h >= label_h + 4 {
-                    tag(m, &label, x + 2, y + 2, prefix.chars().count(), NEON)?;
-                }
+fn dual_mask_to_bgr(
+    stroke: &[u8],
+    coarse: &[u8],
+    work_w: i32,
+    work_h: i32,
+    out_w: i32,
+    out_h: i32,
+) -> opencv::Result<Mat> {
+    let mut small = Mat::new_rows_cols_with_default(work_h, work_w, CV_8UC3, Scalar::all(12.0))?;
+    for r in 0..work_h {
+        let row = small.at_row_mut::<opencv::core::Vec3b>(r)?;
+        let base = (r as usize) * (work_w as usize);
+        for (c, px) in row[..work_w as usize].iter_mut().enumerate() {
+            let s = stroke.get(base + c).copied().unwrap_or(0);
+            let k = coarse.get(base + c).copied().unwrap_or(0);
+            if s > 0 {
+                *px = opencv::core::Vec3b::from([60, 245, 255]);
+            } else if k > 0 {
+                *px = opencv::core::Vec3b::from([120, 70, 35]);
             }
         }
     }
-    Ok(())
+    if work_w == out_w && work_h == out_h {
+        return Ok(small);
+    }
+    let mut out = Mat::default();
+    imgproc::resize(
+        &small,
+        &mut out,
+        Size::new(out_w, out_h),
+        0.0,
+        0.0,
+        imgproc::INTER_NEAREST,
+    )?;
+    Ok(out)
 }
 
-fn export(m: &Mat) -> opencv::Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(m.total() * 4);
-    for y in 0..m.rows() {
-        for pixel in m.at_row::<Vec4b>(y)? {
-            let alpha = u16::from(pixel[3]);
-            for channel in &pixel.0[..3] {
-                bytes.push(((u16::from(*channel) * alpha + 127) / 255) as u8);
-            }
-            bytes.push(pixel[3]);
-        }
+fn visible_targets(targets: &[Target], typed: &str) -> Vec<Target> {
+    if typed.is_empty() {
+        return targets.to_vec();
     }
-    Ok(bytes)
+    targets
+        .iter()
+        .filter(|target| target.hint.starts_with(typed))
+        .cloned()
+        .collect()
 }
 
-pub fn render(
-    session: &Session,
-    frame: Option<&Mat>,
-    logical_width: u32,
-    logical_height: u32,
-    color_by_type: bool,
-) -> Result<Vec<u8>, String> {
-    if session.width <= 0 || session.height <= 0 {
-        return Err("screenshot dimensions must be positive".into());
-    }
-    let mut m = canvas(logical_width, logical_height)?;
-    let mut draw = || -> opencv::Result<Vec<u8>> {
-        match session.mode {
-            Mode::Hints => hints(
-                &mut m,
-                &session.targets,
-                &session.prefix,
-                session.width,
-                session.height,
-                color_by_type,
-            )?,
-            Mode::Grid => {
-                let bounds = Rect::new(0, 0, m.cols(), m.rows());
-                if let Some((row, col)) = session.grid_cell {
-                    if row >= 26 || col >= 26 {
-                        return Err(opencv::Error::new(
-                            StsBadArg,
-                            "grid cell is outside 26x26 grid",
-                        ));
-                    }
-                    rect(
-                        &mut m,
-                        [0, 0, bounds.width, bounds.height],
-                        Scalar::new(0., 0., 0., 75.),
-                        true,
-                    )?;
-                    let x = col as i32 * bounds.width / 26;
-                    let y = row as i32 * bounds.height / 26;
-                    let w = (col as i32 + 1) * bounds.width / 26 - x;
-                    let h = (row as i32 + 1) * bounds.height / 26 - y;
-                    rect(&mut m, [x, y, w, h], GREEN_FILL, true)?;
-                    rect(&mut m, [x, y, w, h], GREEN, false)?;
-                    // Integer partitions match the coarse grid, including remainder pixels.
-                    let sx =
-                        col as i32 * (session.width / 26) + col as i32 * (session.width % 26) / 26;
-                    let sy = row as i32 * (session.height / 26)
-                        + row as i32 * (session.height % 26) / 26;
-                    let ex = ((col + 1) as i64 * i64::from(session.width) / 26) as i32;
-                    let ey = ((row + 1) as i64 * i64::from(session.height) / 26) as i32;
-                    if ex > sx && ey > sy {
-                        let scale = (f64::from(bounds.width) * 0.7 / f64::from(ex - sx))
-                            .min(f64::from(bounds.height) * 0.7 / f64::from(ey - sy));
-                        let pw = (f64::from(ex - sx) * scale).round().max(1.) as i32;
-                        let ph = (f64::from(ey - sy) * scale).round().max(1.) as i32;
-                        let panel =
-                            Rect::new((bounds.width - pw) / 2, (bounds.height - ph) / 2, pw, ph);
-                        rect(&mut m, [panel.x, panel.y, pw, ph], DARK, true)?;
-                        if let Some(frame) = frame {
-                            if frame.cols() != session.width
-                                || frame.rows() != session.height
-                                || frame.typ() != CV_8UC3
-                            {
-                                return Err(opencv::Error::new(
-                                    StsBadArg,
-                                    "preview frame must be screenshot-sized CV_8UC3 BGR",
-                                ));
-                            }
-                            let crop = frame.roi(Rect::new(sx, sy, ex - sx, ey - sy))?;
-                            let mut resized = Mat::default();
-                            imgproc::resize(
-                                &crop,
-                                &mut resized,
-                                Size::new(pw, ph),
-                                0.,
-                                0.,
-                                imgproc::INTER_LINEAR,
-                            )?;
-                            let mut bgra = Mat::default();
-                            imgproc::cvt_color_def(&resized, &mut bgra, imgproc::COLOR_BGR2BGRA)?;
-                            bgra.copy_to(&mut m.roi_mut(panel)?)?;
-                        }
-                        grid(&mut m, panel, 6, &session.prefix)?;
-                    }
-                } else {
-                    grid(&mut m, bounds, 26, &session.prefix)?;
-                }
-            }
-        }
-        let mode = match session.mode {
-            Mode::Hints => "Hints",
-            Mode::Grid => "Grid",
-        };
-        status(
-            &mut m,
-            &format!(
-                "{mode} [{}]  Escape cancel / Tab drill {} / Backspace",
-                session.prefix,
-                if session.drill { "on" } else { "off" }
-            ),
-            8,
-            8,
-        )?;
-        export(&m)
+fn draw_status_pill(canvas: &mut Mat, session: &Session) -> opencv::Result<()> {
+    let mode_text = match session.mode() {
+        Mode::Hints => "HINTS",
+        Mode::Drilldown => "DRILL",
+        Mode::Grid => "GRID",
     };
-    draw().map_err(|e| e.to_string())
+    let cache_tag = if session.cached_hit() {
+        "CACHED 0ms"
+    } else if session.pipeline_ms() > 0.0 {
+        "LIVE"
+    } else {
+        "READY"
+    };
+    let focus_tag = if session.focused_only() {
+        " [WIN-ONLY]"
+    } else if session.focused_rect().is_some() {
+        " [WIN-PRIO]"
+    } else {
+        ""
+    };
+    let drag_tag = if session.drag_anchor().is_some() {
+        " [DRAG->DEST]"
+    } else if session.drag_mode() {
+        " [DRAG:PICK]"
+    } else {
+        ""
+    };
+    let loop_tag = if session.auto_loop() { " [LOOP]" } else { "" };
+
+    let typed_part = if session.typed().is_empty() {
+        String::from("-")
+    } else {
+        session.typed().to_string()
+    };
+
+    let status = format!(
+        "{mode_text} [{typed_part}] | {} | {cache_tag}{focus_tag}{drag_tag}{loop_tag} | ;:Act v:Drag r:Ref F6:Loop F1:Opts F2:Dbg",
+        session.action().label()
+    );
+
+    let font = imgproc::FONT_HERSHEY_SIMPLEX;
+    let scale = 0.44;
+    let thickness = 1;
+    let mut baseline = 0;
+    let size = imgproc::get_text_size(&status, font, scale, thickness, &mut baseline)?;
+    let pad_x = 10;
+    let pad_y = 7;
+    let x = 14;
+    let y = 14;
+    let rect = Rect::new(
+        x,
+        y,
+        (size.width + pad_x * 2).min(canvas.cols() - x - 2).max(20),
+        (size.height + pad_y * 2).min(canvas.rows() - y - 2).max(16),
+    );
+
+    imgproc::rectangle(
+        canvas,
+        rect,
+        Scalar::new(20.0, 18.0, 18.0, 0.0),
+        -1,
+        imgproc::LINE_8,
+        0,
+    )?;
+    let border_col = if session.cached_hit() {
+        Scalar::new(80.0, 235.0, 130.0, 0.0)
+    } else {
+        Scalar::new(0.0, 200.0, 255.0, 0.0)
+    };
+    imgproc::rectangle(canvas, rect, border_col, 1, imgproc::LINE_8, 0)?;
+    imgproc::put_text(
+        canvas,
+        &status,
+        Point::new(x + pad_x, y + pad_y + size.height - 1),
+        font,
+        scale,
+        Scalar::new(240.0, 245.0, 250.0, 0.0),
+        thickness,
+        LINE_AA,
+        false,
+    )?;
+    Ok(())
+}
+
+fn draw_debug_hud(
+    canvas: &mut Mat,
+    session: &Session,
+    debug_data: Option<&DebugData>,
+) -> opencv::Result<()> {
+    let panel_w = 385.min(canvas.cols() - 24).max(220);
+    let panel_h = 250.min(canvas.rows() - 24).max(140);
+    let x = (canvas.cols() - panel_w - 14).max(8);
+    let y = 14;
+    let rect = Rect::new(x, y, panel_w, panel_h);
+
+    imgproc::rectangle(
+        canvas,
+        rect,
+        Scalar::new(18.0, 16.0, 22.0, 0.0),
+        -1,
+        imgproc::LINE_8,
+        0,
+    )?;
+    imgproc::rectangle(
+        canvas,
+        rect,
+        Scalar::new(90.0, 210.0, 255.0, 0.0),
+        1,
+        imgproc::LINE_8,
+        0,
+    )?;
+
+    let font = imgproc::FONT_HERSHEY_SIMPLEX;
+    let mut cy = y + 22;
+    let title = format!("PIPELINE INSPECTOR ({})", session.debug_view().label());
+    imgproc::put_text(
+        canvas,
+        &title,
+        Point::new(x + 12, cy),
+        font,
+        0.46,
+        Scalar::new(80.0, 220.0, 255.0, 0.0),
+        1,
+        LINE_AA,
+        false,
+    )?;
+    cy += 18;
+
+    imgproc::put_text(
+        canvas,
+        "Keys [1..6] or [ / ] switch stage | F2 hide",
+        Point::new(x + 12, cy),
+        font,
+        0.38,
+        Scalar::new(175.0, 185.0, 195.0, 0.0),
+        1,
+        LINE_AA,
+        false,
+    )?;
+    cy += 20;
+
+    if let Some(dbg) = debug_data {
+        let p = &dbg.physics;
+        let t = &dbg.timings;
+        let lines = [
+            format!(
+                "Physics: L0={:.1}px  noise={}  flat={}  border={}  stroke={}",
+                p.l0, p.noise_floor, p.flat_thr, p.border_thr, p.stroke_thr
+            ),
+            format!(
+                "Work Res: {}x{} (scale {:.2}) | Targets: {}",
+                dbg.work_w,
+                dbg.work_h,
+                p.scale,
+                session.targets().len()
+            ),
+            format!(
+                "Source: {} | Total: {:.2} ms",
+                if session.cached_hit() {
+                    "1st-Tap Speculative Cache"
+                } else {
+                    "Fresh Capture"
+                },
+                t.total_ms
+            ),
+        ];
+        for line in &lines {
+            imgproc::put_text(
+                canvas,
+                line,
+                Point::new(x + 12, cy),
+                font,
+                0.38,
+                Scalar::new(235.0, 240.0, 245.0, 0.0),
+                1,
+                LINE_AA,
+                false,
+            )?;
+            cy += 17;
+        }
+        cy += 4;
+
+        let stages = [
+            (
+                "S1 Grad+Phys",
+                t.stage1_gradients_ms,
+                Scalar::new(255.0, 190.0, 70.0, 0.0),
+            ),
+            (
+                "S2 Frames",
+                t.stage2_frames_ms,
+                Scalar::new(90.0, 230.0, 110.0, 0.0),
+            ),
+            (
+                "S3 Strokes",
+                t.stage3_strokes_ms,
+                Scalar::new(70.0, 210.0, 255.0, 0.0),
+            ),
+            (
+                "S4 Decomp2D",
+                t.stage4_decompose_ms,
+                Scalar::new(190.0, 110.0, 255.0, 0.0),
+            ),
+            (
+                "S5 Post+NMS",
+                t.stage5_post_ms,
+                Scalar::new(110.0, 140.0, 255.0, 0.0),
+            ),
+        ];
+        let denom = t.total_ms.max(1.0);
+        let bar_max_w = (panel_w - 165).max(40);
+        for (name, ms, col) in stages {
+            let label = format!("{name:<12} {:>5.1}ms", ms);
+            imgproc::put_text(
+                canvas,
+                &label,
+                Point::new(x + 12, cy),
+                font,
+                0.37,
+                Scalar::new(220.0, 225.0, 230.0, 0.0),
+                1,
+                LINE_AA,
+                false,
+            )?;
+            let bw = (((ms / denom) * (bar_max_w as f64)).round() as i32).clamp(2, bar_max_w);
+            imgproc::rectangle(
+                canvas,
+                Rect::new(x + 150, cy - 9, bw, 9),
+                col,
+                -1,
+                imgproc::LINE_8,
+                0,
+            )?;
+            cy += 16;
+        }
+    } else {
+        imgproc::put_text(
+            canvas,
+            "Debug buffers unavailable in Grid mode.",
+            Point::new(x + 12, cy),
+            font,
+            0.40,
+            Scalar::new(200.0, 200.0, 200.0, 0.0),
+            1,
+            LINE_AA,
+            false,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn draw_options_modal(
+    canvas: &mut Mat,
+    session: &Session,
+    settings: &RuntimeSettings,
+) -> opencv::Result<()> {
+    let modal_w = 460.min(canvas.cols() - 24).max(260);
+    let modal_h = 310.min(canvas.rows() - 24).max(200);
+    let x = ((canvas.cols() - modal_w) / 2).max(8);
+    let y = ((canvas.rows() - modal_h) / 2).max(8);
+    let rect = Rect::new(x, y, modal_w, modal_h);
+
+    imgproc::rectangle(
+        canvas,
+        rect,
+        Scalar::new(22.0, 20.0, 26.0, 0.0),
+        -1,
+        imgproc::LINE_8,
+        0,
+    )?;
+    imgproc::rectangle(
+        canvas,
+        rect,
+        Scalar::new(0.0, 215.0, 140.0, 0.0),
+        2,
+        imgproc::LINE_8,
+        0,
+    )?;
+
+    let font = imgproc::FONT_HERSHEY_SIMPLEX;
+    let mut cy = y + 26;
+    imgproc::put_text(
+        canvas,
+        "UNIVIM OPTIONS MENU (j/k select, h/l adjust, s save, Esc close)",
+        Point::new(x + 14, cy),
+        font,
+        0.41,
+        Scalar::new(90.0, 240.0, 160.0, 0.0),
+        1,
+        LINE_AA,
+        false,
+    )?;
+    cy += 24;
+
+    let rows = [
+        (
+            "Min Target Score",
+            format!("{:.2}", settings.detector.min_score),
+        ),
+        (
+            "Include Text Blocks",
+            on_off(settings.detector.include_text),
+        ),
+        (
+            "Fast Half-Resolution",
+            on_off(settings.detector.fast_half_res),
+        ),
+        (
+            "Collapse Paragraphs",
+            on_off(settings.detector.collapse_paragraphs),
+        ),
+        (
+            "Double-Tap Window (ff/Caps)",
+            format!("{} ms", settings.double_tap_ms),
+        ),
+        ("1st-Tap Cache TTL", format!("{} ms", settings.cache_ttl_ms)),
+        ("Spotlight Background Dim", on_off(settings.spotlight_dim)),
+        ("Show Status Pill", on_off(settings.show_status_bar)),
+        ("Evdev Listener (Caps/ff)", on_off(settings.use_evdev)),
+    ];
+
+    for (idx, (label, val)) in rows.iter().enumerate() {
+        let selected = idx == session.selected_option();
+        if selected {
+            imgproc::rectangle(
+                canvas,
+                Rect::new(x + 10, cy - 15, modal_w - 20, 21),
+                Scalar::new(55.0, 50.0, 68.0, 0.0),
+                -1,
+                imgproc::LINE_8,
+                0,
+            )?;
+        }
+        let prefix = if selected { "> " } else { "  " };
+        let text = format!("{prefix}{label}");
+        let color = if selected {
+            Scalar::new(110.0, 250.0, 180.0, 0.0)
+        } else {
+            Scalar::new(225.0, 230.0, 235.0, 0.0)
+        };
+        imgproc::put_text(
+            canvas,
+            &text,
+            Point::new(x + 14, cy),
+            font,
+            0.42,
+            color,
+            1,
+            LINE_AA,
+            false,
+        )?;
+        imgproc::put_text(
+            canvas,
+            val,
+            Point::new(x + modal_w - 115, cy),
+            font,
+            0.42,
+            color,
+            1,
+            LINE_AA,
+            false,
+        )?;
+        cy += 24;
+    }
+
+    Ok(())
+}
+
+fn on_off(v: bool) -> String {
+    if v {
+        "ON".to_string()
+    } else {
+        "OFF".to_string()
+    }
+}
+
+pub fn bgr_to_argb_bytes(bgr: &Mat) -> opencv::Result<Vec<u8>> {
+    let rows = bgr.rows();
+    let cols = bgr.cols();
+    let mut out = vec![0u8; (rows as usize) * (cols as usize) * 4];
+    for r in 0..rows {
+        let row = bgr.at_row::<opencv::core::Vec3b>(r)?;
+        let row_out =
+            &mut out[(r as usize) * (cols as usize) * 4..(r as usize + 1) * (cols as usize) * 4];
+        for (c, px) in row.iter().enumerate() {
+            let idx = c * 4;
+            row_out[idx] = px[0];
+            row_out[idx + 1] = px[1];
+            row_out[idx + 2] = px[2];
+            row_out[idx + 3] = 255;
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{bgr_to_argb_bytes, render_session_surface};
+    use crate::{
+        Target,
+        desktop::{
+            RuntimeSettings,
+            geometry::FrameGeometry,
+            session::{Input, Session},
+        },
+    };
+    use opencv::core::{CV_8UC3, Mat, Scalar};
 
     #[test]
-    fn dimensions_and_buffer_size() {
-        for (w, h) in [(0, 1), (1, 0), (u32::MAX, 2), (16384, 16384)] {
-            assert!(canvas(w, h).is_err());
-        }
-        for (w, h) in [(1, 1), (31, 17), (640, 480)] {
-            assert_eq!(
-                export(&canvas(w, h).unwrap()).unwrap().len(),
-                (w * h * 4) as usize
-            );
-        }
+    fn converts_bgr_pixels_to_little_endian_argb8888() {
+        let mat =
+            Mat::new_rows_cols_with_default(1, 1, CV_8UC3, Scalar::new(10.0, 20.0, 30.0, 0.0))
+                .unwrap();
+        let bytes = bgr_to_argb_bytes(&mat).unwrap();
+        assert_eq!(bytes, vec![10, 20, 30, 255]);
     }
 
     #[test]
-    fn hints_leave_untouched_pixels_transparent() {
-        let mut m = canvas(320, 200).unwrap();
-        let mut t = Target::new(40, 60, 30, 20, 1., "icon", "test");
-        t.hint = "AA".into();
-        hints(&mut m, &[t], "A", 320, 200, false).unwrap();
-        let pixels = export(&m).unwrap();
-        assert_eq!(&pixels[(150 * 320 + 250) * 4..][..4], &[0; 4]);
-        assert!(pixels.iter().any(|&v| v != 0));
-    }
-
-    #[test]
-    fn clipping_unicode_and_premultiplication() {
-        let mut m = canvas(80, 60).unwrap();
-        rect(
-            &mut m,
-            [i32::MIN, i32::MIN, i32::MAX, i32::MAX],
-            OUTLINE,
-            false,
-        )
-        .unwrap();
-        rect(&mut m, [-5, -5, 30, 30], OUTLINE, true).unwrap();
-        tag(&mut m, "é\n界", i32::MAX, i32::MIN, 0, NEON).unwrap();
-        let mut t = Target::new(i32::MAX, i32::MIN, i32::MAX, i32::MAX, 1., "icon", "test");
-        t.hint = "界".into();
-        hints(&mut m, &[t], "", 1, 1, false).unwrap();
-        let bytes = export(&m).unwrap();
-        assert!(
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .all(|p| p[..3].iter().all(|&v| v <= p[3]))
-        );
-        assert!(bytes.as_chunks::<4>().0.iter().any(|p| p[3] == 220));
-    }
-
-    #[test]
-    fn typed_hint_prefix_is_emphasized() {
-        let mut plain = canvas(80, 40).unwrap();
-        let mut typed = canvas(80, 40).unwrap();
-        tag(&mut plain, "MGF", 2, 2, 0, NEON).unwrap();
-        tag(&mut typed, "MGF", 2, 2, 1, NEON).unwrap();
-        assert_ne!(export(&plain).unwrap(), export(&typed).unwrap());
-    }
-
-    #[test]
-    fn labels_are_black_on_solid_neon() {
-        let mut m = canvas(60, 30).unwrap();
-        tag(&mut m, "M", 2, 2, 0, NEON).unwrap();
-        let pixels = export(&m).unwrap();
-        assert!(
-            pixels
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .any(|p| p[0] < 32 && p[1] < 32 && p[2] < 32)
-        );
-        assert!(
-            pixels
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .any(|p| p[3] == 255 && p[1] > p[0] && p[1] > p[2])
-        );
-    }
-
-    #[test]
-    fn small_targets_place_labels_outside() {
-        let label = (20, 14);
-        assert_eq!(place_label([40, 40, 20, 10], label, 200, 100), (40, 24));
-        assert_eq!(place_label([40, 40, 100, 50], label, 200, 100), (40, 40));
-        assert_eq!(place_label([40, 0, 20, 10], label, 200, 100), (40, 12));
-    }
-
-    #[test]
-    fn hint_boxes_use_a_translucent_green_fill() {
-        let mut m = canvas(120, 80).unwrap();
-        let mut t = Target::new(20, 20, 60, 30, 1., "icon", "test");
-        t.hint = "AB".into();
-        hints(&mut m, &[t], "", 120, 80, false).unwrap();
-        let pixels = export(&m).unwrap();
-        let fill = &pixels[((47 * 120) + 70) * 4..][..4];
-        assert!(fill[1] > fill[0] && fill[1] > fill[2]);
-        assert_eq!(fill[3], GREEN_FILL[3] as u8);
-    }
-
-    #[test]
-    fn element_type_colors_are_applied_when_requested() {
-        let lime = type_color("frame");
-        assert!(lime[1] > lime[0] && lime[1] > lime[2]);
-        let magenta = type_color("thumbnail");
-        assert!(magenta[0] > magenta[1] && magenta[2] > magenta[1]);
-
-        let mut m = canvas(160, 80).unwrap();
-        let mut t = Target::new(10, 10, 130, 60, 1., "thumbnail", "control");
-        t.hint = "AB".into();
-        hints(&mut m, &[t], "", 160, 80, true).unwrap();
-        let pixels = export(&m).unwrap();
-        assert!(
-            pixels
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .any(|p| { p[3] == 255 && p[0] > 200 && p[2] > 200 && p[1] < 100 })
-        );
+    fn filtered_session_render_keeps_surface_dimensions() {
+        let base =
+            Mat::new_rows_cols_with_default(60, 80, CV_8UC3, Scalar::new(240.0, 240.0, 240.0, 0.0))
+                .unwrap();
+        let target = Target {
+            x: 12,
+            y: 14,
+            w: 24,
+            h: 18,
+            score: 0.9,
+            kind: "frame".to_string(),
+            hint: "SA".to_string(),
+            level: "control".to_string(),
+            children: Vec::new(),
+        };
+        let mut session = Session::hints(80, 60, vec![target]);
+        let _ = session.handle_input(Input::Char {
+            ch: 's',
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        let geometry = FrameGeometry {
+            output: crate::desktop::geometry::Output {
+                name: "test".into(),
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 60,
+                scale: 1.0,
+                transform: 0,
+            },
+            pixel_width: 80,
+            pixel_height: 60,
+        };
+        let settings = RuntimeSettings::default();
+        let surface = render_session_surface(&base, &session, &geometry, None, &settings).unwrap();
+        assert_eq!((surface.width, surface.height), (80, 60));
+        assert_eq!(surface.argb.len(), 80 * 60 * 4);
     }
 }

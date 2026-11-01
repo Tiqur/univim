@@ -269,11 +269,14 @@ pub fn median(v: &[i32]) -> f64 {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Options {
     pub min_score: f64,
     pub include_text: bool,
     pub turbo: bool,
+    /// Desktop spelling for `turbo`; both request the half-resolution pass.
+    pub fast_half_res: bool,
     pub collapse_paragraphs: bool,
 }
 impl Default for Options {
@@ -282,10 +285,248 @@ impl Default for Options {
             min_score: 0.45,
             include_text: true,
             turbo: false,
+            fast_half_res: false,
             collapse_paragraphs: true,
         }
     }
 }
+
+/// Desktop-facing name for the detector options. The standalone CLI and parity
+/// suite use `Options`, while the interactive daemon historically used this name.
+pub type DetectorOptions = Options;
+
+/// Generate home-row hint labels for a target count.
+pub fn generate_vimium_hints(n: usize, alphabet: &str) -> Vec<String> {
+    hints_with_alphabet(n, alphabet)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DebugPhysics {
+    pub l0: f64,
+    pub noise_floor: i32,
+    pub flat_thr: i32,
+    pub border_thr: i32,
+    pub stroke_thr: i32,
+    pub scale: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DebugTimings {
+    pub stage1_gradients_ms: f64,
+    pub stage2_frames_ms: f64,
+    pub stage3_strokes_ms: f64,
+    pub stage4_decompose_ms: f64,
+    pub stage5_post_ms: f64,
+    pub total_ms: f64,
+}
+
+/// Intermediate pipeline visual artifacts and calibrated physics parameters
+/// used by the interactive Debug Mode (`F2`) inside `univim-desktop`.
+#[derive(Clone)]
+pub struct DebugData {
+    pub grad_bgr: Mat,
+    pub barriers_bgr: Mat,
+    pub strokes_coarse_bgr: Mat,
+    pub hierarchy_bgr: Mat,
+    pub grad_max: Vec<u8>,
+    pub bar_all: Vec<u8>,
+    pub stroke_mask: Vec<u8>,
+    pub coarse_mask: Vec<u8>,
+    pub physics: DebugPhysics,
+    pub timings: DebugTimings,
+    pub l0: f64,
+    pub stroke_thr: i32,
+    pub scale_back: f64,
+    pub work_w: i32,
+    pub work_h: i32,
+    pub frames_count: usize,
+    pub thumbs_count: usize,
+    pub coarse_count: usize,
+}
+
+fn gray_bytes(mat: &Mat) -> opencv::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity((mat.cols() * mat.rows()).max(0) as usize);
+    for y in 0..mat.rows() {
+        out.extend_from_slice(&mat.at_row::<u8>(y)?[..mat.cols() as usize]);
+    }
+    Ok(out)
+}
+
+fn build_debug_data(
+    bgr: &Mat,
+    state: &signals::State,
+    targets: &[Target],
+    timings: DebugTimings,
+) -> opencv::Result<DebugData> {
+    let (orig_w, orig_h) = (bgr.cols(), bgr.rows());
+    let (w, h) = (state.w, state.h);
+
+    // 1. Gradient + Chroma stage visualization (BGR)
+    let mut grad_work = Mat::zeros(h, w, CV_8UC3)?.to_mat()?;
+    for y in 0..h {
+        let g_row = state.grad_max.at_row::<u8>(y)?;
+        let c_row = state.chroma.at_row::<u8>(y)?;
+        let dst = grad_work.at_row_mut::<Vec3b>(y)?;
+        for x in 0..w as usize {
+            let g = g_row[x];
+            let c = c_row[x];
+            dst[x] = Vec3b::from([c.saturating_mul(2), g, g.max(c)]);
+        }
+    }
+    let grad_bgr = if w != orig_w || h != orig_h {
+        resize(&grad_work, orig_w, orig_h, imgproc::INTER_NEAREST)?
+    } else {
+        grad_work
+    };
+
+    // 2. Structural Barriers, Closed Frames (lime), and Thumbnails (magenta)
+    let mut bar_work = Mat::zeros(h, w, CV_8UC3)?.to_mat()?;
+    for y in 0..h {
+        let b_inv = state.barrier_inv.at_row::<u8>(y)?;
+        let f_occ = state.frame_occ.at_row::<u8>(y)?;
+        let t_occ = state.thumb_occ.at_row::<u8>(y)?;
+        let gray = state.gray.at_row::<u8>(y)?;
+        let dst = bar_work.at_row_mut::<Vec3b>(y)?;
+        for x in 0..w as usize {
+            let base = gray[x] / 4;
+            if b_inv[x] == 0 {
+                // Active barrier wall in bright cyan/white
+                dst[x] = Vec3b::from([255, 220, 60]);
+            } else if t_occ[x] > 0 {
+                dst[x] = Vec3b::from([180, 50, 200]);
+            } else if f_occ[x] > 0 {
+                dst[x] = Vec3b::from([60, 180, 120]);
+            } else {
+                dst[x] = Vec3b::from([base, base, base]);
+            }
+        }
+    }
+    for f in &state.frames {
+        rect(
+            &mut bar_work,
+            f.x,
+            f.y,
+            f.w,
+            f.h,
+            Scalar::new(64., 255., 198., 0.),
+            2,
+            imgproc::LINE_8,
+        )?;
+    }
+    for t in &state.thumbs {
+        rect(
+            &mut bar_work,
+            t.x,
+            t.y,
+            t.w,
+            t.h,
+            Scalar::new(224., 72., 255., 0.),
+            2,
+            imgproc::LINE_8,
+        )?;
+    }
+    let barriers_bgr = if w != orig_w || h != orig_h {
+        resize(&bar_work, orig_w, orig_h, imgproc::INTER_NEAREST)?
+    } else {
+        bar_work
+    };
+
+    // 3. Binary Stroke Mask (green), Blue Excess Link Mask (cyan), and Coarse Proposals (amber)
+    let mut stroke_work = Mat::zeros(h, w, CV_8UC3)?.to_mat()?;
+    for y in 0..h {
+        let s_row = state.stroke_01.at_row::<u8>(y)?;
+        let bl_row = state.blue_01.at_row::<u8>(y)?;
+        let gray = state.gray.at_row::<u8>(y)?;
+        let dst = stroke_work.at_row_mut::<Vec3b>(y)?;
+        for x in 0..w as usize {
+            let base = gray[x] / 5;
+            let is_s = s_row[x] > 0;
+            let is_b = bl_row[x] > 0;
+            dst[x] = match (is_s, is_b) {
+                (true, true) => Vec3b::from([255, 255, 80]),
+                (true, false) => Vec3b::from([60, 235, 60]),
+                (false, true) => Vec3b::from([255, 190, 40]),
+                (false, false) => Vec3b::from([base, base, base]),
+            };
+        }
+    }
+    for &(cx, cy, cw, ch) in &state.coarse_boxes {
+        rect(
+            &mut stroke_work,
+            cx,
+            cy,
+            cw,
+            ch,
+            Scalar::new(40., 190., 255., 0.),
+            1,
+            imgproc::LINE_8,
+        )?;
+    }
+    let strokes_coarse_bgr = if w != orig_w || h != orig_h {
+        resize(&stroke_work, orig_w, orig_h, imgproc::INTER_NEAREST)?
+    } else {
+        stroke_work
+    };
+
+    // 4. Full Hierarchy Overlay
+    let hierarchy_bgr = render::hierarchy_overlay(bgr, targets)
+        .unwrap_or_else(|_| bgr.try_clone().unwrap_or_default());
+
+    let bar_all = {
+        let mut out = Vec::with_capacity((w * h).max(0) as usize);
+        for y in 0..h {
+            let row = state.barrier_inv.at_row::<u8>(y)?;
+            out.extend(
+                row[..w as usize]
+                    .iter()
+                    .map(|&v| if v == 0 { 255 } else { 0 }),
+            );
+        }
+        out
+    };
+    let mut coarse_mask = vec![0_u8; (w * h).max(0) as usize];
+    for &(x, y, cw, ch) in &state.coarse_boxes {
+        let x0 = x.clamp(0, w);
+        let y0 = y.clamp(0, h);
+        let x1 = (x + cw).clamp(0, w);
+        let y1 = (y + ch).clamp(0, h);
+        for row in y0..y1 {
+            let base = (row * w) as usize;
+            for col in x0..x1 {
+                coarse_mask[base + col as usize] = 255;
+            }
+        }
+    }
+
+    Ok(DebugData {
+        grad_bgr,
+        barriers_bgr,
+        strokes_coarse_bgr,
+        hierarchy_bgr,
+        grad_max: gray_bytes(&state.grad_max)?,
+        bar_all,
+        stroke_mask: gray_bytes(&state.stroke_01)?,
+        coarse_mask,
+        physics: DebugPhysics {
+            l0: state.l0,
+            noise_floor: state.noise_floor,
+            flat_thr: state.flat_thr,
+            border_thr: state.border_thr,
+            stroke_thr: state.stroke_thr,
+            scale: 1.0 / state.scale_back.max(f64::EPSILON),
+        },
+        timings,
+        l0: state.l0,
+        stroke_thr: state.stroke_thr,
+        scale_back: state.scale_back,
+        work_w: state.w,
+        work_h: state.h,
+        frames_count: state.frames.len(),
+        thumbs_count: state.thumbs.len(),
+        coarse_count: state.coarse_boxes.len(),
+    })
+}
+
 pub fn detect(bgr: &Mat, options: Options) -> opencv::Result<(Vec<Target>, Value)> {
     let start = Instant::now();
     let mut state = signals::prepare(bgr, options)?;
@@ -296,6 +537,33 @@ pub fn detect(bgr: &Mat, options: Options) -> opencv::Result<(Vec<Target>, Value
         targets,
         json!({"signal_ms":state.signal_ms,"frames_ms":state.frames_ms,"coarse_ms":state.coarse_ms,"recursive_ms":total-state.signal_ms-state.frames_ms-state.coarse_ms,"total_ms":total}),
     ))
+}
+
+pub fn detect_with_debug(
+    bgr: &Mat,
+    options: Options,
+    _interactive_only: bool,
+) -> opencv::Result<(Vec<Target>, DebugData, f64)> {
+    let start = Instant::now();
+    let mut state = signals::prepare(bgr, options)?;
+    let (refined, inner) = refine::refine(&mut state, options)?;
+    let targets = compose::compose(&state, refined, inner, options)?;
+    let total = start.elapsed().as_secs_f64() * 1000.;
+    let recursive = (total - state.signal_ms - state.frames_ms - state.coarse_ms).max(0.);
+    let debug = build_debug_data(
+        bgr,
+        &state,
+        &targets,
+        DebugTimings {
+            stage1_gradients_ms: state.signal_ms,
+            stage2_frames_ms: state.frames_ms,
+            stage3_strokes_ms: state.coarse_ms,
+            stage4_decompose_ms: 0.,
+            stage5_post_ms: recursive,
+            total_ms: total,
+        },
+    )?;
+    Ok((targets, debug, total))
 }
 /// Expand detector-produced children, retaining exactly one flattening level.
 /// Externally supplied children must follow the detector's JSON schema; malformed

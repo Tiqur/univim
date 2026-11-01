@@ -36,6 +36,9 @@ pub struct State {
     pub s: f64,
     pub l0: f64,
     pub stroke_thr: i32,
+    pub noise_floor: i32,
+    pub flat_thr: i32,
+    pub border_thr: i32,
     pub scale_back: f64,
     pub signal_ms: f64,
     pub frames_ms: f64,
@@ -43,6 +46,7 @@ pub struct State {
 }
 
 struct Physics {
+    noise_floor: i32,
     flat_thr: i32,
     border_thr: i32,
     stroke_thr: i32,
@@ -148,6 +152,7 @@ fn calibrate(grad_max: &Mat) -> opencv::Result<Physics> {
     l0 = l0.clamp(11.5, 26.0);
     let u = (l0 / 16.0).clamp(0.68, 1.75);
     Ok(Physics {
+        noise_floor,
         flat_thr,
         border_thr,
         stroke_thr,
@@ -335,14 +340,14 @@ pub fn prepare(bgr: &Mat, options: Options) -> opencv::Result<State> {
     let (orig_h, orig_w) = (bgr.rows(), bgr.cols());
     let mut scale_back = 1.0;
     let resized;
-    let bgr = if options.turbo && orig_w > 1600 {
+    let bgr = if (options.turbo || options.fast_half_res) && orig_w > 1600 {
         let work_w = 1280.min(orig_w >> 1);
         let work_h =
             ((orig_h as f64 * (work_w as f64 / orig_w as f64)).round_ties_even() as i32).max(1);
         resized = resize(bgr, work_w, work_h, imgproc::INTER_AREA)?;
         scale_back = orig_w as f64 / work_w as f64;
         &resized
-    } else if !options.turbo && orig_w > 2560 {
+    } else if !(options.turbo || options.fast_half_res) && orig_w > 2560 {
         let work_h = ((orig_h as f64 * (2560.0 / orig_w as f64)).round_ties_even() as i32).max(1);
         resized = resize(bgr, 2560, work_h, imgproc::INTER_AREA)?;
         scale_back = orig_w as f64 / 2560.0;
@@ -938,6 +943,9 @@ pub fn prepare(bgr: &Mat, options: Options) -> opencv::Result<State> {
         s,
         l0,
         stroke_thr: physics.stroke_thr,
+        noise_floor: physics.noise_floor,
+        flat_thr: physics.flat_thr,
+        border_thr: physics.border_thr,
         scale_back,
         signal_ms: t_sig.duration_since(t0).as_secs_f64() * 1000.0,
         frames_ms: t_frames.duration_since(t_sig).as_secs_f64() * 1000.0,

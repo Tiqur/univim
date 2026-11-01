@@ -121,6 +121,32 @@ let
       };
     }
   ];
+  globalOptions = evaluate [
+    (hyprland { })
+    {
+      services.univim = {
+        enable = true;
+        hyprland = {
+          enable = true;
+          hintsBind = "SUPER, semicolon";
+          gridBind = "SUPER, G";
+          doubleTapCapsLock = true;
+          doubleTapF = true;
+          evdev = false;
+        };
+        settings = {
+          minScore = 0.52;
+          fastHalfRes = true;
+          doubleTapMs = 240;
+        };
+      };
+    }
+  ];
+  programsAlias = evaluate [
+    {
+      programs.univim.enable = true;
+    }
+  ];
 
   nativeService = native.systemd.user.services.univim;
   graphicalService = graphical.systemd.user.services.univim;
@@ -132,6 +158,9 @@ let
   luaText = luaBindings.xdg.configFile."hypr/hyprland.lua".text;
   luaDefaultText = luaDefaultBindings.xdg.configFile."hypr/hyprland.lua".text;
   launcher = lib.head allFlags.systemd.user.services.univim.Service.ExecStart;
+  globalValues = globalOptions.wayland.windowManager.hyprland.settings;
+  globalLauncher = lib.head globalOptions.systemd.user.services.univim.Service.ExecStart;
+  globalSettings = globalOptions.xdg.configFile."univim/settings.json".text;
 
   checks = [
     (check "disabled by default" (
@@ -190,19 +219,35 @@ let
     (check "Lua is detected from the Home Manager default" (
       lib.hasInfix "SUPER + F" luaDefaultText && lib.hasInfix "univim-desktop hints" luaDefaultText
     ))
+    (check "global Hyprland hints and grid bindings are opt-in" (
+      lib.elem "SUPER, semicolon, global, univim:hints" globalValues.bind
+      && lib.elem "SUPER, G, global, univim:grid" globalValues.bind
+    ))
+    (check "double-tap CapsLock and f bindings are non-consuming" (
+      lib.elem ", CAPS, global, univim:caps-lock" globalValues.bindn
+      && lib.elem ", f, global, univim:tap-f" globalValues.bindn
+    ))
+    (check "settings configure the daemon and evdev" (
+      lib.hasInfix "\"double_tap_ms\":240" globalSettings
+      && lib.hasInfix "\"use_evdev\":false" globalSettings
+      && lib.hasInfix "\"min_score\":0.52" globalSettings
+    ))
+    (check "programs.univim remains a working alias" programsAlias.services.univim.enable)
   ];
 
   forcedChecks = builtins.deepSeq checks (lib.all (result: result == null) checks);
   launcherCheck = pkgs.runCommand "univim-home-manager-launcher" { } ''
-    ${pkgs.gnugrep}/bin/grep -F -- 'serve' ${launcher}
+    ${pkgs.gnugrep}/bin/grep -F -- 'daemon' ${launcher}
+    ${pkgs.gnugrep}/bin/grep -F -- '--min-score 0.45' ${launcher}
     ${pkgs.gnugrep}/bin/grep -F -- '--output' ${launcher}
     ${pkgs.gnugrep}/bin/grep -F -- 'DP-3' ${launcher}
-    ${pkgs.gnugrep}/bin/grep -F -- '--turbo' ${launcher}
-    ${pkgs.gnugrep}/bin/grep -F -- '--interactive-only' ${launcher}
+    ${pkgs.gnugrep}/bin/grep -F -- '--fast-half-res' ${launcher}
+    ${pkgs.gnugrep}/bin/grep -F -- '--no-text' ${launcher}
     ${pkgs.gnugrep}/bin/grep -F -- '--no-click' ${launcher}
     ${pkgs.gnugrep}/bin/grep -F -- '--flat' ${launcher}
-    ${pkgs.gnugrep}/bin/grep -F -- '--color-by-type' ${launcher}
     ${pkgs.gnugrep}/bin/grep -F -- '--timeout 42' ${launcher}
+    ${pkgs.gnugrep}/bin/grep -F -- '--min-score 0.52' ${globalLauncher}
+    ${pkgs.gnugrep}/bin/grep -F -- '--fast-half-res' ${globalLauncher}
     ${pkgs.coreutils}/bin/touch $out
   '';
 in

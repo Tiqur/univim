@@ -67,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_score: args.min_score,
         include_text: !args.interactive_only,
         turbo: args.turbo,
+        fast_half_res: args.turbo,
         collapse_paragraphs: !args.no_collapse_paragraphs,
     };
     let (targets, timings) = detect(&bgr, options)?;

@@ -11,6 +11,115 @@ use std::{
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
+use wayland_client::protocol::wl_shm;
+
+/// Borrowed screencopy storage plus the metadata needed to convert it into an
+/// owned, upright BGR image.
+pub struct RawCaptureFrame<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub stride: usize,
+    pub format: wl_shm::Format,
+    pub invert_y: bool,
+    pub transform: i32,
+    pub bytes: &'a [u8],
+}
+
+fn supported(format: wl_shm::Format) -> bool {
+    matches!(
+        format,
+        wl_shm::Format::Argb8888
+            | wl_shm::Format::Xrgb8888
+            | wl_shm::Format::Abgr8888
+            | wl_shm::Format::Xbgr8888
+            | wl_shm::Format::Argb2101010
+            | wl_shm::Format::Xrgb2101010
+            | wl_shm::Format::Abgr2101010
+            | wl_shm::Format::Xbgr2101010
+    )
+}
+
+/// Decode a screencopy frame and apply the output transform exactly once.
+pub fn decode_raw_frame_to_bgr(frame: RawCaptureFrame<'_>) -> Result<Mat, String> {
+    let RawCaptureFrame {
+        width: w,
+        height: h,
+        stride,
+        format,
+        invert_y,
+        transform,
+        bytes,
+    } = frame;
+    if !supported(format)
+        || w == 0
+        || h == 0
+        || w > 32768
+        || h > 32768
+        || stride < w as usize * 4
+        || bytes.len() < stride * h as usize
+    {
+        return Err("invalid capture storage".into());
+    }
+    let mut raw =
+        Mat::new_rows_cols_with_default(h as i32, w as i32, core::CV_8UC3, core::Scalar::all(0.))
+            .map_err(|e| e.to_string())?;
+    let bgr = raw.data_bytes_mut().map_err(|e| e.to_string())?;
+    let swapped = matches!(
+        format,
+        wl_shm::Format::Abgr8888
+            | wl_shm::Format::Xbgr8888
+            | wl_shm::Format::Abgr2101010
+            | wl_shm::Format::Xbgr2101010
+    );
+    let ten = matches!(
+        format,
+        wl_shm::Format::Argb2101010
+            | wl_shm::Format::Xrgb2101010
+            | wl_shm::Format::Abgr2101010
+            | wl_shm::Format::Xbgr2101010
+    );
+    for y in 0..h as usize {
+        let sy = if invert_y { h as usize - 1 - y } else { y };
+        let row = &bytes[sy * stride..sy * stride + w as usize * 4];
+        for (x, pixel) in row.as_chunks::<4>().0.iter().enumerate() {
+            let word = u32::from_ne_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+            let (lo, g, hi) = if ten {
+                (
+                    ((word & 1023) * 255 + 511) / 1023,
+                    (((word >> 10) & 1023) * 255 + 511) / 1023,
+                    (((word >> 20) & 1023) * 255 + 511) / 1023,
+                )
+            } else {
+                (word & 255, (word >> 8) & 255, (word >> 16) & 255)
+            };
+            let i = (y * w as usize + x) * 3;
+            bgr[i] = if swapped { hi } else { lo } as u8;
+            bgr[i + 1] = g as u8;
+            bgr[i + 2] = if swapped { lo } else { hi } as u8;
+        }
+    }
+    // Hyprland exports the raw framebuffer with transform metadata; apply it
+    // here exactly once, including square/180-degree outputs.
+    let rotation = match transform {
+        0 | 4 => None,
+        1 | 5 => Some(core::ROTATE_90_COUNTERCLOCKWISE),
+        2 | 6 => Some(core::ROTATE_180),
+        3 | 7 => Some(core::ROTATE_90_CLOCKWISE),
+        _ => return Err("invalid output transform".into()),
+    };
+    let mut upright = Mat::default();
+    if transform >= 4 {
+        core::flip(&raw, &mut upright, 1).map_err(|e| e.to_string())?;
+        raw = upright;
+        upright = Mat::default();
+    }
+    if let Some(rotation) = rotation {
+        core::rotate(&raw, &mut upright, rotation).map_err(|e| e.to_string())?;
+        Ok(upright)
+    } else {
+        Ok(raw)
+    }
+}
 
 pub struct Saved {
     pub number: u32,

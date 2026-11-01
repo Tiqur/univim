@@ -68,6 +68,53 @@ pub fn compose(
         }
         Ok(false)
     };
+    // Pure-gradient projection used by paragraph consolidation. NumPy computes
+    // a boolean mask once; checking membership directly is equivalent and avoids
+    // materializing two full-size masks solely for these barriers.
+    let pure_column_barrier = |x1: i32, y1: i32, x2: i32, y2: i32| -> opencv::Result<bool> {
+        let x1 = slice_end(x1, w);
+        let x2 = slice_end(x2, w);
+        let y1 = slice_end(y1, h);
+        let y2 = slice_end(y2, h);
+        if x2 <= x1 || y2 <= y1 {
+            return Ok(false);
+        }
+        for x in x1..x2 {
+            let mut count = 0;
+            for y in y1..y2 {
+                if *state.dx_gray.at_2d::<u8>(y, x)? >= 4 && *state.dy_gray.at_2d::<u8>(y, x)? <= 2
+                {
+                    count += 1;
+                }
+            }
+            if count as f64 / (y2 - y1) as f64 >= 0.55 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let pure_row_barrier = |x1: i32, y1: i32, x2: i32, y2: i32| -> opencv::Result<bool> {
+        let x1 = slice_end(x1, w);
+        let x2 = slice_end(x2, w);
+        let y1 = slice_end(y1, h);
+        let y2 = slice_end(y2, h);
+        if x2 <= x1 || y2 <= y1 {
+            return Ok(false);
+        }
+        for y in y1..y2 {
+            let mut count = 0;
+            for x in x1..x2 {
+                if *state.dy_gray.at_2d::<u8>(y, x)? >= 4 && *state.dx_gray.at_2d::<u8>(y, x)? <= 2
+                {
+                    count += 1;
+                }
+            }
+            if count as f64 / (x2 - x1) as f64 >= 0.55 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
 
     let mut used_rb = vec![false; refined_boxes.len()];
     let mut used_fr = vec![false; frames.len()];
@@ -400,70 +447,159 @@ pub fn compose(
         }
     }
 
-    // 5D: paragraph membership is fixed before chaining, including eligible link lines.
+    // 5D: structural paragraph engine. First consolidate collinear same-line
+    // fragments, then chain lines whose left edge, height and vertical pitch
+    // agree and whose gutters contain no horizontal divider.
     if options.collapse_paragraphs && options.include_text {
-        let mut indices: Vec<usize> = rem_rbs
+        rem_rbs.sort_by_key(|rb| (rb.y, rb.x));
+        let mut used_consolidated = vec![false; rem_rbs.len()];
+        let mut line_consolidated = Vec::with_capacity(rem_rbs.len());
+        for i in 0..rem_rbs.len() {
+            if used_consolidated[i] {
+                continue;
+            }
+            let first = rem_rbs[i].clone();
+            if !matches!(
+                first.kind.as_str(),
+                "text_block" | "text_link" | "inline_link"
+            ) {
+                line_consolidated.push(first);
+                continue;
+            }
+
+            let mut same_row = vec![i];
+            used_consolidated[i] = true;
+            for j in (i + 1)..rem_rbs.len() {
+                if used_consolidated[j] {
+                    continue;
+                }
+                let candidate = &rem_rbs[j];
+                if !matches!(
+                    candidate.kind.as_str(),
+                    "text_block" | "text_link" | "inline_link"
+                ) {
+                    continue;
+                }
+                let v_overlap = first.bottom().min(candidate.bottom()) - first.y.max(candidate.y);
+                let row_right = same_row
+                    .iter()
+                    .map(|&k| rem_rbs[k].right())
+                    .max()
+                    .unwrap_or(first.right());
+                let h_gap = candidate.x - row_right;
+                let max_gap = 18.max((1.8 * state.l0) as i32);
+                if v_overlap as f64 >= 0.70 * first.h.min(candidate.h) as f64
+                    && (0..=max_gap).contains(&h_gap)
+                {
+                    let y1 = first.y.max(candidate.y);
+                    let y2 = first.bottom().min(candidate.bottom());
+                    let x1 = candidate.x - h_gap;
+                    let x2 = candidate.x;
+                    if !pure_column_barrier(x1, y1, x2, y2)? {
+                        same_row.push(j);
+                        used_consolidated[j] = true;
+                    }
+                }
+            }
+
+            if same_row.len() == 1 {
+                line_consolidated.push(first);
+                continue;
+            }
+            let lx = same_row.iter().map(|&k| rem_rbs[k].x).min().unwrap();
+            let ly = same_row.iter().map(|&k| rem_rbs[k].y).min().unwrap();
+            let lw = same_row.iter().map(|&k| rem_rbs[k].right()).max().unwrap() - lx;
+            let lh = same_row.iter().map(|&k| rem_rbs[k].bottom()).max().unwrap() - ly;
+            let fragment_hints = hints(same_row.len());
+            let mut line = Target::new(lx, ly, lw, lh, 0.85, "text_block", "line");
+            for (&k, hint) in same_row.iter().zip(fragment_hints) {
+                let fragment = &rem_rbs[k];
+                let level = if fragment.kind == "inline_link" {
+                    "control"
+                } else {
+                    "word"
+                };
+                line.children
+                    .push(make_child(fragment, &fragment.kind, level, &hint));
+            }
+            line_consolidated.push(line);
+        }
+        rem_rbs = line_consolidated;
+
+        let mut text_line_indices: Vec<usize> = rem_rbs
             .iter()
             .enumerate()
             .filter_map(|(i, rb)| {
-                (rb.kind == "text_block"
-                    || (rb.kind == "text_link"
-                        && rem_rbs.iter().any(|other| {
-                            other.kind == "text_block"
-                                && (0..=12.max(scaled(14.))).contains(&(rb.y - other.bottom()))
-                                && (rb.x - other.x).abs() <= 10.max(scaled(12.))
-                                && (rb.h - other.h).abs() <= 6
-                        })))
-                .then_some(i)
+                (matches!(rb.kind.as_str(), "text_block" | "text_link")
+                    && rb.w >= (3.5 * state.l0) as i32
+                    && rb.h <= (2.4 * state.l0) as i32)
+                    .then_some(i)
             })
             .collect();
-        indices.sort_by_key(|&i| (rem_rbs[i].y, rem_rbs[i].x));
+        text_line_indices.sort_by_key(|&i| (rem_rbs[i].y, rem_rbs[i].x));
         let mut merged = vec![false; rem_rbs.len()];
         let mut paragraphs = Vec::new();
-        for &idx in &indices {
+
+        for &idx in &text_line_indices {
             if merged[idx] {
                 continue;
             }
             let mut chain = vec![idx];
             merged[idx] = true;
-            let mut curr = &rem_rbs[idx];
-            for &idx2 in &indices {
+            let mut curr = rem_rbs[idx].clone();
+            let mut curr_left = curr.x;
+            let mut curr_h = curr.h;
+            let mut prev_pitch: Option<i32> = None;
+
+            for &idx2 in &text_line_indices {
                 if merged[idx2] {
                     continue;
                 }
-                let cand = &rem_rbs[idx2];
-                if (0..=12.max(scaled(14.))).contains(&(cand.y - curr.bottom()))
-                    && (cand.x - curr.x).abs() <= 12.max(scaled(14.))
+                let candidate = &rem_rbs[idx2];
+                let left_diff = (candidate.x - curr_left).abs();
+                let h_diff = (candidate.h - curr_h).abs();
+                let v_gap = candidate.y - curr.bottom();
+                if left_diff > 9.max((0.48 * state.l0) as i32)
+                    || h_diff > 5.max((0.25 * state.l0) as i32)
+                    || !(1..=14.max((0.78 * state.l0) as i32)).contains(&v_gap)
                 {
-                    chain.push(idx2);
-                    merged[idx2] = true;
-                    curr = cand;
+                    continue;
                 }
+                let pitch = v_gap;
+                if prev_pitch.is_some_and(|previous| {
+                    (pitch - previous).abs() > 4.max((0.24 * state.l0) as i32)
+                }) {
+                    continue;
+                }
+                let x1 = curr.x.min(candidate.x);
+                let x2 = curr.right().min(candidate.right());
+                if pure_row_barrier(x1, curr.bottom(), x2, candidate.y)? {
+                    continue;
+                }
+                chain.push(idx2);
+                merged[idx2] = true;
+                prev_pitch = Some(pitch);
+                curr = candidate.clone();
+                curr_left = {
+                    let mut xs: Vec<i32> = chain.iter().map(|&k| rem_rbs[k].x).collect();
+                    xs.sort_unstable();
+                    median(&xs).round_ties_even() as i32
+                };
+                curr_h = curr.h;
             }
+
             if chain.len() < 2 {
                 paragraphs.push(rem_rbs[idx].clone());
                 continue;
             }
-            let mut paragraph = Target::new(
-                rem_rbs[idx].x,
-                rem_rbs[idx].y,
-                rem_rbs[idx].w,
-                rem_rbs[idx].h,
-                0.80,
-                "text_block",
-                "paragraph",
-            );
-            for &i in &chain {
-                union(&mut paragraph, &rem_rbs[i]);
-            }
-            if rem_rbs.iter().enumerate().any(|(i, rb)| {
-                !chain.contains(&i) && rb.kind != "inline_link" && overlap(&paragraph, rb) > 0
-            }) {
-                paragraphs.extend(chain.iter().map(|&i| rem_rbs[i].clone()));
-                continue;
-            }
-            for (&i, hint) in chain.iter().zip(hints(chain.len())) {
-                let mut line = rem_rbs[i].clone();
+            let px = chain.iter().map(|&k| rem_rbs[k].x).min().unwrap();
+            let py = chain.iter().map(|&k| rem_rbs[k].y).min().unwrap();
+            let pw = chain.iter().map(|&k| rem_rbs[k].right()).max().unwrap() - px;
+            let ph = chain.iter().map(|&k| rem_rbs[k].bottom()).max().unwrap() - py;
+            let line_hints = hints(chain.len());
+            let mut paragraph = Target::new(px, py, pw, ph, 0.82, "text_block", "paragraph");
+            for (&k, hint) in chain.iter().zip(line_hints) {
+                let mut line = rem_rbs[k].clone();
                 line.score = 0.78;
                 paragraph
                     .children
@@ -471,14 +607,15 @@ pub fn compose(
             }
             paragraphs.push(paragraph);
         }
-        let mut is_text = vec![false; rem_rbs.len()];
-        for i in indices {
-            is_text[i] = true;
+
+        let mut is_text_line = vec![false; rem_rbs.len()];
+        for i in text_line_indices {
+            is_text_line[i] = true;
         }
         rem_rbs = rem_rbs
             .into_iter()
             .enumerate()
-            .filter_map(|(i, rb)| (!is_text[i]).then_some(rb))
+            .filter_map(|(i, rb)| (!is_text_line[i]).then_some(rb))
             .chain(paragraphs)
             .collect();
     }

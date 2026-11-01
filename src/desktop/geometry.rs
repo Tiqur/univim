@@ -1,4 +1,5 @@
 //! Geometry for captures normalized to upright output orientation before use.
+use opencv::prelude::MatTraitConst;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -44,6 +45,7 @@ pub struct FrameGeometry {
 impl FrameGeometry {
     /// Coordinates are continuous screenshot pixels in half-open image bounds.
     /// The capture must already be upright; applying the transform again is wrong.
+    #[allow(dead_code)]
     pub fn pixel_to_logical(&self, x: f64, y: f64) -> Result<(f64, f64), String> {
         if self.pixel_width <= 0
             || self.pixel_height <= 0
@@ -63,6 +65,7 @@ impl FrameGeometry {
         ))
     }
 
+    #[allow(dead_code)]
     pub fn pixel_to_global(&self, x: f64, y: f64) -> Result<(f64, f64), String> {
         let (x, y) = self.pixel_to_logical(x, y)?;
         let result = (x + f64::from(self.output.x), y + f64::from(self.output.y));
@@ -70,6 +73,30 @@ impl FrameGeometry {
             return Err("unrepresentable global coordinates".into());
         }
         Ok(result)
+    }
+
+    /// The interactive capture path decodes and rotates frames before rendering,
+    /// so the compositor buffer has the same upright pixel dimensions as the
+    /// already-oriented canvas.
+    pub fn to_compositor_buffer(
+        &self,
+        canvas: &opencv::core::Mat,
+    ) -> opencv::Result<opencv::core::Mat> {
+        canvas.try_clone()
+    }
+
+    /// Map an upright screenshot pixel to surface-local logical coordinates.
+    /// The caller supplies the compositor's resolved logical surface size.
+    pub fn upright_pixel_to_logical(
+        &self,
+        x: i32,
+        y: i32,
+        logical_w: i32,
+        logical_h: i32,
+    ) -> (f64, f64) {
+        let sx = f64::from(logical_w.max(1)) / f64::from(self.pixel_width.max(1));
+        let sy = f64::from(logical_h.max(1)) / f64::from(self.pixel_height.max(1));
+        (f64::from(x) * sx, f64::from(y) * sy)
     }
 }
 

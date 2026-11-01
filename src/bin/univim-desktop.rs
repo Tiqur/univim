@@ -1,215 +1,156 @@
-//! Persistent desktop service and small, permission-scoped control client.
-#[cfg(target_os = "linux")]
-mod linux {
-    use clap::{Parser, Subcommand};
-    use std::{
-        fs,
-        os::unix::{
-            fs::{DirBuilderExt, MetadataExt, PermissionsExt},
-            net::UnixDatagram,
-        },
-        path::{Path, PathBuf},
-        time::Duration,
+use std::{env, path::PathBuf, process};
+use univim::{
+    DetectorOptions,
+    desktop::{
+        CommandAction, RuntimeSettings, capture_snapshot, check, default_socket_path, run_daemon,
+        send_command_or_autospawn,
+    },
+};
+
+fn print_usage() {
+    eprintln!(
+        "Usage: univim-desktop <daemon|snapshot|check|bindings|hints|grid|tap-f|tap-g|tap-caps|debug|options|stop> [options]
+
+Commands:
+  daemon         Run the background Wayland/Hyprland overlay daemon (alias: serve)
+  snapshot       Capture one monitor and save raw, annotated, and JSON artifacts
+  check          Enumerate advertised protocols and outputs (no capture/input)
+  bindings       Print suggested opt-in Hyprland configuration
+  hints          Show full-screen Vimium hints (auto-starts daemon if not running)
+  grid           Show recursive 2-step grid overlay
+  tap-f          Record an 'f' tap (1st tap pre-computes cache, 2nd tap within threshold opens hints in 0ms)
+  tap-g          Record a 'g' tap (2nd tap within threshold opens grid)
+  tap-caps       Record a 'CapsLock' tap (1st tap pre-computes cache, 2nd tap opens hints in 0ms)
+  debug          Toggle the live pipeline inspector HUD (also F2 inside overlay)
+  options        Toggle the live GUI options modal (also F1 / ? inside overlay)
+  stop           Stop the running daemon
+
+Options:
+  --socket PATH              Control socket path (default: $XDG_RUNTIME_DIR/univim/control.sock)
+  --output NAME              Capture a specific output instead of the focused monitor
+  --min-score FLOAT          Minimum target score (default: 0.45)
+  --no-text                  Exclude text block targets
+  --fast-half-res            Run Stage 1-4 at half resolution for ultra-low latency
+  --no-collapse-paragraphs   Keep individual text lines separate
+  --no-click                 Display hints but suppress synthetic pointer actions
+  --flat                     Replace composite targets with their leaf descendants
+  --timeout SECS             Auto-cancel the overlay after SECS (default: 30)
+  --dir PATH                 Snapshot output directory (default: captures)"
+    );
+}
+
+fn main() {
+    let mut args = env::args().skip(1);
+    let Some(subcommand) = args.next() else {
+        print_usage();
+        process::exit(2);
     };
-    use univim::{
-        Options,
-        desktop::{Config, hyprland, snapshot, wayland},
-    };
-
-    #[derive(Parser)]
-    #[command(about = "Native Wayland navigation for Hyprland")]
-    pub struct Args {
-        #[command(subcommand)]
-        command: Command,
-    }
-    #[derive(Subcommand)]
-    enum Command {
-        /// Enumerate capabilities and automatically discovered outputs. No capture/input.
-        Check,
-        /// Print opt-in Hyprland configuration; does not edit your config.
-        Bindings,
-        /// Run persistently without mapping any surface while idle.
-        Serve {
-            #[arg(long)]
-            output: Option<String>,
-            #[arg(long)]
-            turbo: bool,
-            #[arg(long)]
-            interactive_only: bool,
-            /// Display normally, but never inject clicks.
-            #[arg(long)]
-            no_click: bool,
-            /// Show only flattened leaf targets; do not expose parents for drill-down.
-            #[arg(long)]
-            flat: bool,
-            /// Color target boxes and hint tags by element type instead of green.
-            #[arg(long)]
-            color_by_type: bool,
-            #[arg(long,default_value_t=30,value_parser=clap::value_parser!(u64).range(1..=3600))]
-            timeout: u64,
-        },
-        /// Capture one monitor and save numbered raw, annotated and JSON artifacts.
-        #[command(alias = "screenshot", alias = "capture")]
-        Snapshot {
-            #[arg(long)]
-            output: Option<String>,
-            #[arg(long, default_value = "captures")]
-            dir: PathBuf,
-            #[arg(long)]
-            turbo: bool,
-            #[arg(long)]
-            interactive_only: bool,
-            /// Save and render only flattened leaf targets; no parent boxes or drills.
-            #[arg(long)]
-            flat: bool,
-            #[arg(long, default_value_t = 0.45, allow_hyphen_values = true)]
-            min_score: f64,
-        },
-        Hints,
-        Grid,
-        Cancel,
-        Status,
-        Quit,
+    if subcommand == "-h" || subcommand == "--help" {
+        print_usage();
+        return;
     }
 
-    fn private_directory_metadata(is_dir: bool, owner: u32, mode: u32, effective_uid: u32) -> bool {
-        is_dir && owner == effective_uid && mode & 0o077 == 0
-    }
+    let mut socket: PathBuf = default_socket_path();
+    let mut directory = PathBuf::from("captures");
+    let mut options = DetectorOptions::default();
+    let mut output: Option<String> = None;
+    let mut no_click = false;
+    let mut flat = false;
+    let mut timeout_secs: Option<u64> = None;
+    let mut min_score: Option<f64> = None;
+    let mut no_text = false;
+    let mut fast_half_res = false;
+    let mut no_collapse = false;
 
-    fn directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is unset")?;
-        let display = std::env::var("WAYLAND_DISPLAY").map_err(|_| "WAYLAND_DISPLAY is unset")?;
-        if display.contains('/') || display.contains("..") {
-            return Err("unsupported WAYLAND_DISPLAY".into());
-        }
-        let base = PathBuf::from(runtime);
-        // SAFETY: geteuid takes no pointers and has no preconditions.
-        let effective_uid = unsafe { nix::libc::geteuid() };
-        let metadata = fs::symlink_metadata(&base)?;
-        if !private_directory_metadata(
-            metadata.is_dir(),
-            metadata.uid(),
-            metadata.permissions().mode(),
-            effective_uid,
-        ) {
-            return Err("unsafe runtime base directory permissions/ownership".into());
-        }
-        let path = base.join(format!("univim-{display}"));
-        match fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
-        }
-        let metadata = fs::symlink_metadata(&path)?;
-        if !private_directory_metadata(
-            metadata.is_dir(),
-            metadata.uid(),
-            metadata.permissions().mode(),
-            effective_uid,
-        ) {
-            return Err("unsafe UniVim runtime directory permissions/ownership".into());
-        }
-        Ok(path)
-    }
-    struct SocketPath(PathBuf);
-    impl Drop for SocketPath {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-        }
-    }
-
-    fn bind_service(path: &Path) -> Result<UnixDatagram, Box<dyn std::error::Error>> {
-        // Exclusive bind fails closed on live or stale sockets; never unlink
-        // another daemon's address automatically.
-        let socket = UnixDatagram::bind(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        Ok(socket)
-    }
-
-    pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let args = Args::parse();
-        match args.command {
-            Command::Check => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &wayland::check().map_err(std::io::Error::other)?
-                    )?
-                );
-                println!(
-                    "Focused output: {:?}",
-                    hyprland::selected_output(None).map_err(std::io::Error::other)?
-                );
-            }
-            Command::Bindings => {
-                println!(
-                    "# Start once after your Wayland environment is ready.\nexec-once = univim-desktop serve\n# Nonconsuming modifier bindings preserve ordinary modifier events.\nbindn = SHIFT, Shift_L, global, univim:shift-left\nbindn = SHIFT, Shift_R, global, univim:shift-right\nbindn = CTRL, Control_L, global, univim:control-left\nbindn = CTRL, Control_R, global, univim:control-right\n# Anonymous modifier notifications cannot reliably reject intervening chord keys.\n# Optional explicit activation alternatives:\n# bind = SUPER, F, exec, univim-desktop hints\n# bind = SUPER, G, exec, univim-desktop grid"
-                );
-            }
-            Command::Serve {
-                output,
-                turbo,
-                interactive_only,
-                no_click,
-                flat,
-                color_by_type,
-                timeout,
-            } => {
-                opencv::core::set_num_threads(1)?;
-                let path = directory()?.join("control.sock");
-                let socket=bind_service(&path).map_err(|e|format!("{e}; if a prior daemon crashed, remove {} only after verifying it is stopped",path.display()))?;
-                let _cleanup = SocketPath(path);
-                wayland::run(
-                    Config {
-                        output,
-                        options: Options {
-                            turbo,
-                            include_text: !interactive_only,
-                            ..Options::default()
-                        },
-                        no_click,
-                        flat,
-                        color_by_type,
-                        timeout: Duration::from_secs(timeout),
-                    },
-                    socket,
-                )
-                .map_err(std::io::Error::other)?;
-            }
-            Command::Snapshot {
-                output,
-                dir,
-                turbo,
-                interactive_only,
-                flat,
-                min_score,
-            } => {
-                opencv::core::set_num_threads(1)?;
-                let options = Options {
-                    min_score,
-                    include_text: !interactive_only,
-                    turbo,
-                    ..Options::default()
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--socket" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--socket requires a path");
+                    process::exit(2);
                 };
-                let captured =
-                    wayland::capture(output.as_deref(), options).map_err(std::io::Error::other)?;
-                let targets = if flat {
-                    univim::flatten_leaves(&captured.targets).map_err(std::io::Error::other)?
-                } else {
-                    captured.targets.clone()
+                socket = PathBuf::from(value);
+            }
+            "--output" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--output requires a name");
+                    process::exit(2);
                 };
-                let rendered = univim::render::hierarchy_overlay(&captured.image, &targets)
-                    .map_err(std::io::Error::other)?;
-                let saved = snapshot::save(
-                    &captured.image,
-                    &rendered,
-                    &targets,
-                    &captured.output,
-                    &captured.timings,
-                    options,
-                    &dir,
-                )
-                .map_err(std::io::Error::other)?;
+                output = Some(value);
+            }
+            "--dir" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--dir requires a path");
+                    process::exit(2);
+                };
+                directory = PathBuf::from(value);
+            }
+            "--min-score" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--min-score requires a float");
+                    process::exit(2);
+                };
+                min_score = Some(value.parse::<f64>().unwrap_or_else(|_| {
+                    eprintln!("invalid --min-score value: {value}");
+                    process::exit(2);
+                }));
+            }
+            "--timeout" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--timeout requires seconds");
+                    process::exit(2);
+                };
+                timeout_secs = Some(value.parse::<u64>().unwrap_or_else(|_| {
+                    eprintln!("invalid --timeout value: {value}");
+                    process::exit(2);
+                }));
+            }
+            "--no-text" | "--interactive-only" => no_text = true,
+            "--fast-half-res" | "--turbo" => fast_half_res = true,
+            "--color-by-type" => {}
+            "--no-click" => no_click = true,
+            "--no-collapse-paragraphs" => no_collapse = true,
+            "--flat" => flat = true,
+            "-h" | "--help" => {
+                print_usage();
+                return;
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                print_usage();
+                process::exit(2);
+            }
+        }
+    }
+
+    if let Some(value) = min_score {
+        options.min_score = value;
+    }
+    if no_text {
+        options.include_text = false;
+    }
+    if fast_half_res {
+        options.fast_half_res = true;
+    }
+    if no_collapse {
+        options.collapse_paragraphs = false;
+    }
+
+    let result = match subcommand.as_str() {
+        "check" => check().map(|report| {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
+            );
+        }),
+        "bindings" => {
+            println!(
+                "# Start once after your Wayland environment is ready.\nexec-once = univim-desktop daemon\n# Opt-in global shortcuts. `bindn` preserves ordinary key events.\nbind = SUPER, F, global, univim:hints\nbind = SUPER, G, global, univim:grid\nbindn = , CAPS, global, univim:caps-lock\nbindn = , f, global, univim:tap-f\n# Nonconsuming modifier bindings preserve ordinary modifier events.\nbindn = SHIFT, Shift_L, global, univim:shift-left\nbindn = SHIFT, Shift_R, global, univim:shift-right\nbindn = CTRL, Control_L, global, univim:control-left\nbindn = CTRL, Control_R, global, univim:control-right"
+            );
+            Ok(())
+        }
+        "snapshot" | "screenshot" | "capture" => {
+            capture_snapshot(output.as_deref(), &directory, options, flat).map(|saved| {
                 println!(
                     "Saved snapshot #{}: {} | {} | {}",
                     saved.number,
@@ -218,69 +159,65 @@ mod linux {
                     saved.json.display()
                 );
                 println!("{} nodes, {} drill-down groups", saved.nodes, saved.drills);
-            }
-            command => {
-                let directory = directory()?;
-                let reply = directory.join(format!("client-{}.sock", std::process::id()));
-                let socket = UnixDatagram::bind(&reply)?;
-                let _cleanup = SocketPath(reply);
-                socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-                socket.set_write_timeout(Some(Duration::from_secs(2)))?;
-                let command = match command {
-                    Command::Hints => "hints",
-                    Command::Grid => "grid",
-                    Command::Cancel => "cancel",
-                    Command::Status => "status",
-                    Command::Quit => "quit",
-                    _ => unreachable!(),
-                };
-                socket
-                    .connect(directory.join("control.sock"))
-                    .map_err(|e| {
-                        format!(
-                            "desktop service unavailable: {e}; start `univim-desktop serve` first"
-                        )
-                    })?;
-                socket.send(command.as_bytes())?;
-                if command == "status" {
-                    let mut buffer = [0u8; 4096];
-                    let n = socket.recv(&mut buffer)?;
-                    println!("{}", std::str::from_utf8(&buffer[..n])?);
-                }
-            }
+            })
         }
-        Ok(())
+        "daemon" | "serve" => {
+            let mut settings = RuntimeSettings::load_or_init(options);
+            if let Some(value) = min_score {
+                settings.detector.min_score = value;
+            }
+            if no_text {
+                settings.detector.include_text = false;
+            }
+            if fast_half_res {
+                settings.detector.fast_half_res = true;
+            }
+            if no_collapse {
+                settings.detector.collapse_paragraphs = false;
+            }
+            if output.is_some() {
+                settings.output = output;
+            }
+            if no_click {
+                settings.no_click = true;
+            }
+            if flat {
+                settings.flat = true;
+            }
+            if let Some(value) = timeout_secs {
+                settings.timeout_secs = value;
+            }
+            run_daemon(&socket, settings)
+        }
+        "hints" => send_command_or_autospawn(&socket, CommandAction::Hints, options)
+            .map_err(|err| format!("failed to trigger hints on {}: {err}", socket.display())),
+        "grid" => send_command_or_autospawn(&socket, CommandAction::Grid, options)
+            .map_err(|err| format!("failed to trigger grid on {}: {err}", socket.display())),
+        "tap-f" => send_command_or_autospawn(&socket, CommandAction::TapF, options)
+            .map_err(|err| format!("failed to send tap-f on {}: {err}", socket.display())),
+        "tap-g" => send_command_or_autospawn(&socket, CommandAction::TapG, options)
+            .map_err(|err| format!("failed to send tap-g on {}: {err}", socket.display())),
+        "tap-caps" | "caps" => send_command_or_autospawn(&socket, CommandAction::TapCaps, options)
+            .map_err(|err| format!("failed to send tap-caps on {}: {err}", socket.display())),
+        "debug" | "toggle-debug" => {
+            send_command_or_autospawn(&socket, CommandAction::ToggleDebug, options)
+                .map_err(|err| format!("failed to toggle debug on {}: {err}", socket.display()))
+        }
+        "options" | "toggle-options" => {
+            send_command_or_autospawn(&socket, CommandAction::ToggleOptions, options)
+                .map_err(|err| format!("failed to toggle options on {}: {err}", socket.display()))
+        }
+        "stop" => send_command_or_autospawn(&socket, CommandAction::Stop, options)
+            .map_err(|err| format!("failed to stop daemon on {}: {err}", socket.display())),
+        other => {
+            eprintln!("unknown subcommand: {other}");
+            print_usage();
+            process::exit(2);
+        }
+    };
+
+    if let Err(err) = result {
+        eprintln!("univim-desktop: {err}");
+        process::exit(1);
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::private_directory_metadata;
-
-        #[test]
-        fn runtime_directories_require_private_effective_uid_ownership() {
-            assert!(private_directory_metadata(true, 1000, 0o40700, 1000));
-            assert!(private_directory_metadata(true, 0, 0o40700, 0));
-            assert!(!private_directory_metadata(true, 1001, 0o40700, 1000));
-            for mode in [0o40701, 0o40710, 0o40720, 0o40740, 0o40704, 0o40702] {
-                assert!(!private_directory_metadata(true, 1000, mode, 1000));
-            }
-        }
-
-        #[test]
-        fn runtime_directories_reject_symlinks_and_other_non_directories() {
-            for mode in [0o120700, 0o100700, 0o140700] {
-                assert!(!private_directory_metadata(false, 1000, mode, 1000));
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    linux::main()
-}
-#[cfg(not(target_os = "linux"))]
-fn main() {
-    eprintln!("univim-desktop requires Linux/Wayland");
-    std::process::exit(1);
 }

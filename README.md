@@ -144,7 +144,7 @@ home-manager.lib.homeManagerConfiguration {
 
 With the configuration above, `SUPER+F` opens hints and `SUPER+G` opens grid.
 The service starts automatically with the session; do not add an
-`exec-once = univim-desktop serve` line or run `hints`/`grid` from a terminal.
+`exec-once = univim-desktop daemon` line or run `hints`/`grid` from a terminal.
 Apply with your normal command, for example:
 
 ```sh
@@ -191,11 +191,21 @@ services.univim = {
   # Optional service settings:
   output = "DP-3";       # null follows the focused monitor
   flat = true;           # leaf-only hints, no drill-down
-  colorByType = true;    # lime/magenta/... targets by element type
-  turbo = true;
+  turbo = true;          # alias for settings.fastHalfRes
   interactiveOnly = false;
   noClick = false;
   timeout = 30;          # seconds, 1-3600
+
+  # Detector and gesture tuning:
+  settings = {
+    minScore = 0.45;
+    includeText = true;
+    fastHalfRes = false;
+    collapseParagraphs = true;
+    doubleTapMs = 260;
+    cacheTtlMs = 900;
+    spotlightDim = true;
+  };
 
   # Optional declarative bindings:
   keybindings = {
@@ -203,6 +213,16 @@ services.univim = {
     hints = "SUPER, F";
     grid = "SUPER, G";
     modifierGestures = false;
+  };
+
+  # Optional global shortcuts and passive evdev gestures:
+  hyprland = {
+    enable = true;
+    hintsBind = "SUPER, F";
+    gridBind = "SUPER, G";
+    doubleTapCapsLock = false;
+    doubleTapF = false;
+    evdev = true;
   };
 };
 ```
@@ -298,32 +318,33 @@ private permissions. The default `captures/` directory is ignored by Git; avoid
 adding it or committing captured screenshots.
 
 `check` reports capabilities and discovered outputs without capturing or injecting
-input. `serve [--output NAME] [--turbo] [--interactive-only] [--no-click]
-[--flat] [--color-by-type] [--timeout 30]` runs the service. Output discovery is dynamic: each activation
+input. `daemon [--output NAME] [--fast-half-res|--turbo] [--no-text|--interactive-only]
+[--no-click] [--flat] [--timeout 30]` runs the service (`serve` is an alias).
+Output discovery is dynamic: each activation
 uses the currently focused monitor unless `--output NAME` selects a connector.
 Monitor position, scale and transform come from runtime metadata, not a fixed
 layout. Unavailable outputs fail rather than falling back to another monitor.
-`--turbo` and `--interactive-only` configure detection. `--no-click` allows
-selection without injecting clicks; it still captures and takes overlay keyboard
-focus during an active session. `--flat` flattens all composite targets to
-their leaf descendants before hints, so parent hints and drill-down are absent.
-`--color-by-type` colors each target outline and hint tag by element type using
-a bright palette (lime, magenta, cyan, amber, sky, orange, rose, lemon and
-violet) with black tag text.
+`--fast-half-res` (`--turbo`) and `--no-text` (`--interactive-only`) configure
+detection. `--no-click` allows selection without injecting clicks; it still
+captures and takes overlay keyboard focus during an active session. `--flat`
+flattens all composite targets to their leaf descendants before hints, so parent
+hints and drill-down are absent. Target outlines and hint tags are colored by
+element type.
 The session timeout defaults to 30 seconds
-(accepted range 1-3600). `cancel` dismisses selection; `quit` stops the service.
-`status` reports JSON including activity, mode, output and overlay state.
+(accepted range 1-3600). `stop` terminates the daemon.
 
 In hints mode, type a label to select its target and click its center. Labels
-filter as you type without being reassigned. **Tab** toggles drill mode: selecting
-a target with children expands only its immediate children and assigns them
-labels; selecting a leaf still clicks. **Backspace** edits the prefix, or returns
-to the parent when the prefix is empty. **Left** returns to the parent and clears
-the prefix. **Escape** cancels. Grid mode first shows a **26 x 26** grid: type the
-row letter then column letter (A-Z), then select a **6 x 6** subcell using
-`ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789` in row-major order. The third key clicks
-the subcell center. Backspace with an empty prefix or Left returns to the main
-grid.
+filter as you type without being reassigned. Hold **Shift** or **Ctrl** on the
+final hint character to drill into immediate children (Shift) or word fragments
+(Ctrl). **Backspace** edits the prefix, or returns to the parent when the prefix
+is empty. **Escape** cancels. **Arrow keys** or **Ctrl+H/J/K/L** snap a
+reticule to the nearest target; **Enter** clicks it. **;** or **Tab** cycles the
+click action, **v** starts a two-point drag, **Ctrl+W** toggles focused-window
+filtering, **Shift+J/K/H/L** or **Ctrl+D/U** scroll and re-capture, **F5**
+refreshes, **F6** toggles continuous refresh, **F1**/`?` opens live options, and
+**F2** opens the pipeline inspector. Grid mode first shows a 6x4 grid with
+single-character labels; the second label selects one of its 6x4 subcells and
+clicks the center.
 
 ### Opt-In Hotkeys
 
@@ -377,9 +398,9 @@ copy the working directory before that filter is evaluated. Prefer the ordinary
 Git-backed flake once new source files are tracked; `.gitignore` alone cannot
 prevent the initial `path:.` snapshot.
 
-The full differential suite passed **465 exact detection comparisons**, **465
-hint checks**, and **488 pixel-exact overlay comparisons**, including **23
-drill-down cases**. It uses 18 deterministic synthetic fixtures, with light/dark
+The full differential suite passed **513 exact detection comparisons**, **513
+hint checks**, and **538 pixel-exact overlay comparisons**, including **25
+drill-down cases**. It uses 20 deterministic synthetic fixtures, with light/dark
 UI, paragraphs, blue links, controls, textures, noise, dense hints, and widths
 640 through 2880, including resize boundaries. All boolean option combinations
 and score boundaries are exercised. It checks list ordering, all coordinates,

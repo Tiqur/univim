@@ -1,467 +1,1184 @@
-//! Pure selection and modifier-tap state, independent of Wayland event delivery.
-use crate::{Target, drill_down, hints};
-use std::time::Duration;
+use super::RuntimeSettings;
+use crate::{DebugData, Target, drill_down, generate_vimium_hints};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct Session {
+    mode: Mode,
+    screen_w: i32,
+    screen_h: i32,
+    root_targets: Vec<Target>,
+    targets: Vec<Target>,
+    typed: String,
+    grid_step_idx: Option<usize>,
+    action: ClickAction,
+    debug_view: DebugView,
+    show_debug_hud: bool,
+    show_options_menu: bool,
+    selected_option: usize,
+    cached_hit: bool,
+    pipeline_ms: f64,
+    focused_rect: Option<[i32; 4]>,
+    focused_only: bool,
+    snapped_idx: Option<usize>,
+    drag_mode: bool,
+    drag_anchor: Option<(i32, i32)>,
+    auto_loop: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Hints,
+    Drilldown,
     Grid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClickAction {
+    LeftClick,
+    RightClick,
+    DoubleClick,
+    MiddleClick,
+    HoverOnly,
+}
+
+impl ClickAction {
+    pub fn next(self) -> Self {
+        match self {
+            Self::LeftClick => Self::RightClick,
+            Self::RightClick => Self::DoubleClick,
+            Self::DoubleClick => Self::MiddleClick,
+            Self::MiddleClick => Self::HoverOnly,
+            Self::HoverOnly => Self::LeftClick,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LeftClick => "L-Click",
+            Self::RightClick => "R-Click",
+            Self::DoubleClick => "Dbl-Click",
+            Self::MiddleClick => "M-Click",
+            Self::HoverOnly => "Hover",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DebugView {
+    OverlayHud,
+    RawPhysics,
+    Gradients,
+    BarriersFrames,
+    StrokesCoarse,
+    Hierarchy,
+}
+
+impl DebugView {
+    pub fn next(self) -> Self {
+        match self {
+            Self::OverlayHud => Self::RawPhysics,
+            Self::RawPhysics => Self::Gradients,
+            Self::Gradients => Self::BarriersFrames,
+            Self::BarriersFrames => Self::StrokesCoarse,
+            Self::StrokesCoarse => Self::Hierarchy,
+            Self::Hierarchy => Self::OverlayHud,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::OverlayHud => Self::Hierarchy,
+            Self::RawPhysics => Self::OverlayHud,
+            Self::Gradients => Self::RawPhysics,
+            Self::BarriersFrames => Self::Gradients,
+            Self::StrokesCoarse => Self::BarriersFrames,
+            Self::Hierarchy => Self::StrokesCoarse,
+        }
+    }
+
+    pub fn from_number(n: u8) -> Option<Self> {
+        match n {
+            1 => Some(Self::OverlayHud),
+            2 => Some(Self::RawPhysics),
+            3 => Some(Self::Gradients),
+            4 => Some(Self::BarriersFrames),
+            5 => Some(Self::StrokesCoarse),
+            6 => Some(Self::Hierarchy),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OverlayHud => "1:Final Overlay",
+            Self::RawPhysics => "2:Stage0 Physics",
+            Self::Gradients => "3:Stage1 Gradients",
+            Self::BarriersFrames => "4:Stage2 Frames",
+            Self::StrokesCoarse => "5:Stage3 Strokes",
+            Self::Hierarchy => "6:Stage4 Hierarchy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cardinal {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Input {
-    Character(char),
+    Char {
+        ch: char,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+    },
     Backspace,
     Escape,
-    Tab,
-    Parent,
     Enter,
+    ToggleDebugHud,
+    CycleDebugNext,
+    CycleDebugPrev,
+    #[allow(dead_code)]
+    SetDebugStage(u8),
+    ToggleOptionsMenu,
+    CycleClickAction,
+    ToggleFocusedOnly,
+    ToggleDragMode,
+    Refresh,
+    ToggleLoop,
+    Scroll {
+        dx: i32,
+        dy: i32,
+    },
+    Snap(Cardinal),
+    MenuUp,
+    MenuDown,
+    MenuLeft,
+    MenuRight,
+    #[allow(dead_code)]
+    MenuSave,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    None,
-    Changed,
+    Continue,
+    Redraw,
     Cancel,
-    Click { x: f64, y: f64 },
+    Click {
+        x: i32,
+        y: i32,
+    },
+    Action {
+        x: i32,
+        y: i32,
+        action: ClickAction,
+    },
+    Drag {
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+    },
+    Scroll {
+        dx: i32,
+        dy: i32,
+    },
+    Refresh,
+    SettingsChanged,
+    SaveSettings,
 }
 
-pub struct Session {
-    pub mode: Mode,
+/// Speculative background detection cache populated on the first tap of `ff`, `gg`,
+/// or `CapsLock` so that the second tap within `double_tap_ms` renders with zero latency.
+#[derive(Clone)]
+pub struct PrecomputedFrame {
+    pub created_at: Instant,
+    pub output_name: Option<String>,
     pub width: i32,
     pub height: i32,
+    pub bgr: Vec<u8>,
     pub targets: Vec<Target>,
-    pub prefix: String,
-    /// Main-grid (row, column), each in 0..26.
-    pub grid_cell: Option<(usize, usize)>,
-    pub drill: bool,
-    history: Vec<Vec<Target>>,
+    pub debug: DebugData,
+    pub pipeline_ms: f64,
 }
 
-impl Session {
-    pub fn hints(width: i32, height: i32, targets: Vec<Target>) -> Self {
-        let mut session = Self::grid(width, height);
-        session.mode = Mode::Hints;
-        session.targets = session.label_targets(targets);
-        session
-    }
-
-    pub fn grid(width: i32, height: i32) -> Self {
-        Self {
-            mode: Mode::Grid,
-            width,
-            height,
-            targets: vec![],
-            prefix: String::new(),
-            grid_cell: None,
-            drill: false,
-            history: vec![],
+impl PrecomputedFrame {
+    pub fn is_fresh(&self, ttl: Duration, expected_output: Option<&str>) -> bool {
+        if self.created_at.elapsed() > ttl {
+            return false;
         }
-    }
-
-    fn valid_target(&self, t: &Target) -> bool {
-        t.x >= 0
-            && t.y >= 0
-            && t.w > 0
-            && t.h > 0
-            && i64::from(t.x) + i64::from(t.w) <= i64::from(self.width)
-            && i64::from(t.y) + i64::from(t.h) <= i64::from(self.height)
-    }
-
-    fn label_targets(&self, targets: Vec<Target>) -> Vec<Target> {
-        let mut targets: Vec<_> = targets
-            .into_iter()
-            .filter(|t| self.valid_target(t))
-            .collect();
-        let labels = hints(targets.len());
-        for (target, label) in targets.iter_mut().zip(labels) {
-            target.hint = label;
-        }
-        targets
-    }
-
-    /// Filtering never removes targets or regenerates their assigned labels.
-    pub fn visible_targets(&self) -> impl Iterator<Item = &Target> {
-        self.targets.iter().filter(|t| {
-            self.mode == Mode::Hints && self.valid_target(t) && t.hint.starts_with(&self.prefix)
-        })
-    }
-
-    fn parent(&mut self) -> Outcome {
-        self.prefix.clear();
-        if self.mode == Mode::Grid {
-            return if self.grid_cell.take().is_some() {
-                Outcome::Changed
-            } else {
-                Outcome::None
-            };
-        }
-        if let Some(targets) = self.history.pop() {
-            self.targets = targets;
-            Outcome::Changed
-        } else {
-            Outcome::None
-        }
-    }
-
-    fn select(&mut self) -> Outcome {
-        let Some(target) = self
-            .visible_targets()
-            .find(|t| t.hint == self.prefix)
-            .cloned()
-        else {
-            return Outcome::None;
-        };
-        if self.drill && !target.children.is_empty() {
-            let Ok(children) = drill_down(&target, false) else {
-                return Outcome::None;
-            };
-            let children = self.label_targets(children);
-            if children.is_empty() {
-                return Outcome::None;
-            }
-            self.history
-                .push(std::mem::replace(&mut self.targets, children));
-            self.prefix.clear();
-            return Outcome::Changed;
-        }
-        Outcome::Click {
-            x: f64::from(target.x) + f64::from(target.w) / 2.0,
-            y: f64::from(target.y) + f64::from(target.h) / 2.0,
-        }
-    }
-
-    pub fn input(&mut self, input: Input) -> Outcome {
-        match input {
-            Input::Escape => Outcome::Cancel,
-            Input::Tab => {
-                self.drill = !self.drill;
-                Outcome::Changed
-            }
-            Input::Parent => {
-                let had_prefix = !self.prefix.is_empty();
-                let result = self.parent();
-                if had_prefix { Outcome::Changed } else { result }
-            }
-            Input::Backspace => {
-                if self.prefix.pop().is_some() {
-                    Outcome::Changed
-                } else {
-                    self.parent()
-                }
-            }
-            Input::Enter => {
-                if self.mode == Mode::Hints {
-                    self.select()
-                } else {
-                    Outcome::None
-                }
-            }
-            Input::Character(c) => {
-                if !c.is_ascii_alphanumeric() {
-                    return Outcome::None;
-                }
-                let c = c.to_ascii_uppercase();
-                if self.mode == Mode::Hints {
-                    let candidate = format!("{}{c}", self.prefix);
-                    if !self
-                        .visible_targets()
-                        .any(|t| t.hint.starts_with(&candidate))
-                    {
-                        return Outcome::None;
-                    }
-                    self.prefix = candidate;
-                    match self.select() {
-                        Outcome::None => Outcome::Changed,
-                        result => result,
-                    }
-                } else {
-                    if self.width <= 0 || self.height <= 0 {
-                        return Outcome::None;
-                    }
-                    if let Some((row, col)) = self.grid_cell {
-                        if row >= 26 || col >= 26 {
-                            return Outcome::None;
-                        }
-                        let Some(index) = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".find(c) else {
-                            return Outcome::None;
-                        };
-                        Outcome::Click {
-                            x: ((col * 6 + index % 6) as f64 + 0.5) * f64::from(self.width) / 156.0,
-                            y: ((row * 6 + index / 6) as f64 + 0.5) * f64::from(self.height)
-                                / 156.0,
-                        }
-                    } else {
-                        if !c.is_ascii_uppercase() || self.prefix.len() >= 2 {
-                            return Outcome::None;
-                        }
-                        self.prefix.push(c);
-                        if self.prefix.len() == 2 {
-                            let bytes = self.prefix.as_bytes();
-                            self.grid_cell =
-                                Some(((bytes[0] - b'A') as usize, (bytes[1] - b'A') as usize));
-                            self.prefix.clear();
-                        }
-                        Outcome::Changed
-                    }
-                }
-            }
+        match (self.output_name.as_deref(), expected_output) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GestureKey {
-    ShiftLeft,
-    ShiftRight,
-    ControlLeft,
-    ControlRight,
+    F,
+    G,
+    CapsLock,
 }
 
-impl GestureKey {
-    fn index(self) -> usize {
-        self as usize
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapEvent {
+    /// First tap recorded: caller should start background capture + detection warmup.
+    Warmup,
+    /// Second tap arrived within the chord window: caller should immediately present overlay!
+    Activate,
 }
 
-/// Recognizes two short, non-overlapping taps of the exact same modifier key.
-/// Global shortcut events do not reveal arbitrary ordinary chord keys. The
-/// caller must call `reset` on observed chords, focus loss or event-stream loss;
-/// this tracker alone cannot guarantee that a modifier was used without a chord.
+/// Tracks single-tap warmup and double-tap activation across `f`, `g`, and `CapsLock`.
+#[derive(Clone, Debug, Default)]
 pub struct TapTracker {
-    interval: Duration,
-    max_hold: Duration,
-    pressed: [Option<Duration>; 4],
-    invalid: [bool; 4],
-    tapped: [Option<Duration>; 4],
-    last_event: Option<Duration>,
-}
-
-impl Default for TapTracker {
-    fn default() -> Self {
-        Self::new()
-    }
+    last_key: Option<GestureKey>,
+    last_tap_at: Option<Instant>,
 }
 
 impl TapTracker {
     pub fn new() -> Self {
-        Self::with_thresholds(Duration::from_millis(300), Duration::from_millis(250))
+        Self::default()
     }
 
-    /// Interval is measured between tap releases; hold is press to release.
-    pub fn with_thresholds(interval: Duration, max_hold: Duration) -> Self {
+    pub fn on_tap(&mut self, key: GestureKey, threshold: Duration) -> TapEvent {
+        let now = Instant::now();
+        if let (Some(prev_key), Some(prev_at)) = (self.last_key, self.last_tap_at)
+            && prev_key == key
+            && now.saturating_duration_since(prev_at) <= threshold
+        {
+            self.last_key = None;
+            self.last_tap_at = None;
+            return TapEvent::Activate;
+        }
+        self.last_key = Some(key);
+        self.last_tap_at = Some(now);
+        TapEvent::Warmup
+    }
+
+    pub fn on_other_key(&mut self) {
+        self.last_key = None;
+        self.last_tap_at = None;
+    }
+
+    pub fn clear(&mut self) {
+        self.last_key = None;
+        self.last_tap_at = None;
+    }
+}
+
+/// Prioritize targets so that:
+/// 1. Targets inside the focused window (`focused_rect`) receive the shortest, easiest
+///    home-row hint labels (`S`, `A`, `D`, `F`, `J`, `K`, `L`, `E`...).
+/// 2. Within the same focus tier, `level == "control"` targets precede `level == "paragraph"`
+///    / `"line"` blocks so interactive controls always get primary labels before prose.
+pub fn prioritize_targets_for_focus(
+    targets: &mut [Target],
+    focused_rect: Option<[i32; 4]>,
+    alphabet: &str,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    let Some([fx, fy, fw, fh]) = focused_rect else {
+        return;
+    };
+    if fw <= 0 || fh <= 0 {
+        return;
+    }
+
+    let in_focus = |t: &Target| -> bool {
+        let cx = t.x + t.w / 2;
+        let cy = t.y + t.h / 2;
+        cx >= fx && cx < fx + fw && cy >= fy && cy < fy + fh
+    };
+    let is_control = |t: &Target| -> bool { t.level == "control" };
+
+    targets.sort_by(|a, b| {
+        let af = in_focus(a);
+        let bf = in_focus(b);
+        let ac = is_control(a);
+        let bc = is_control(b);
+        bf.cmp(&af)
+            .then_with(|| bc.cmp(&ac))
+            .then_with(|| (a.y / 12).cmp(&(b.y / 12)))
+            .then_with(|| a.x.cmp(&b.x))
+    });
+
+    let hints = generate_vimium_hints(targets.len(), alphabet);
+    for (target, hint) in targets.iter_mut().zip(hints) {
+        target.hint = hint;
+    }
+}
+
+impl Session {
+    #[allow(dead_code)]
+    pub fn hints(width: i32, height: i32, targets: Vec<Target>) -> Self {
+        Self::hints_with_focus(width, height, targets, None)
+    }
+
+    pub fn hints_with_focus(
+        width: i32,
+        height: i32,
+        mut targets: Vec<Target>,
+        focused_rect: Option<[i32; 4]>,
+    ) -> Self {
+        prioritize_targets_for_focus(&mut targets, focused_rect, "sadfjklewcmpgh");
         Self {
-            interval,
-            max_hold,
-            pressed: [None; 4],
-            invalid: [false; 4],
-            tapped: [None; 4],
-            last_event: None,
+            mode: Mode::Hints,
+            screen_w: width.max(1),
+            screen_h: height.max(1),
+            root_targets: targets.clone(),
+            targets,
+            typed: String::new(),
+            grid_step_idx: None,
+            action: ClickAction::LeftClick,
+            debug_view: DebugView::OverlayHud,
+            show_debug_hud: false,
+            show_options_menu: false,
+            selected_option: 0,
+            cached_hit: false,
+            pipeline_ms: 0.0,
+            focused_rect,
+            focused_only: false,
+            snapped_idx: None,
+            drag_mode: false,
+            drag_anchor: None,
+            auto_loop: false,
         }
     }
 
-    pub fn reset(&mut self) {
-        self.pressed = [None; 4];
-        self.invalid = [false; 4];
-        self.tapped = [None; 4];
-        self.last_event = None;
+    /// Replace the live targets and screen dimensions after an in-overlay scroll or pipeline loop refresh
+    /// while preserving all active modal state (debug HUD, focus filter, drag anchor, auto-loop, click action).
+    pub fn update_targets(
+        &mut self,
+        width: i32,
+        height: i32,
+        mut targets: Vec<Target>,
+        focused_rect: Option<[i32; 4]>,
+        pipeline_ms: f64,
+    ) {
+        self.screen_w = width.max(1);
+        self.screen_h = height.max(1);
+        self.focused_rect = focused_rect.or(self.focused_rect);
+        prioritize_targets_for_focus(&mut targets, self.focused_rect, "sadfjklewcmpgh");
+        self.root_targets = targets;
+        self.pipeline_ms = pipeline_ms;
+        self.cached_hit = false;
+        self.rebuild_active_targets();
     }
 
-    fn timestamp(&mut self, now: Duration) -> bool {
-        if self.last_event.is_some_and(|last| now < last) {
-            self.reset();
-            self.last_event = Some(now);
-            return false;
+    fn rebuild_active_targets(&mut self) {
+        if self.focused_only {
+            if let Some([fx, fy, fw, fh]) = self.focused_rect {
+                let mut filtered: Vec<Target> = self
+                    .root_targets
+                    .iter()
+                    .filter(|t| {
+                        let cx = t.x + t.w / 2;
+                        let cy = t.y + t.h / 2;
+                        cx >= fx && cx < fx + fw && cy >= fy && cy < fy + fh
+                    })
+                    .cloned()
+                    .collect();
+                let hints = generate_vimium_hints(filtered.len(), "sadfjklewcmpgh");
+                for (t, h) in filtered.iter_mut().zip(hints) {
+                    t.hint = h;
+                }
+                self.targets = filtered;
+            } else {
+                self.targets = self.root_targets.clone();
+            }
+        } else {
+            self.targets = self.root_targets.clone();
         }
-        self.last_event = Some(now);
-        true
+        if let Some(idx) = self.snapped_idx
+            && idx >= self.targets.len()
+        {
+            self.snapped_idx = if self.targets.is_empty() {
+                None
+            } else {
+                Some(0)
+            };
+        }
     }
 
-    pub fn press(&mut self, key: GestureKey, now: Duration) {
-        if !self.timestamp(now) {
+    pub fn with_telemetry(mut self, cached_hit: bool, pipeline_ms: f64) -> Self {
+        self.cached_hit = cached_hit;
+        self.pipeline_ms = pipeline_ms;
+        self
+    }
+
+    pub fn grid(width: i32, height: i32) -> Self {
+        let mut session = Self {
+            mode: Mode::Grid,
+            screen_w: width.max(1),
+            screen_h: height.max(1),
+            root_targets: Vec::new(),
+            targets: Vec::new(),
+            typed: String::new(),
+            grid_step_idx: Some(0),
+            action: ClickAction::LeftClick,
+            debug_view: DebugView::OverlayHud,
+            show_debug_hud: false,
+            show_options_menu: false,
+            selected_option: 0,
+            cached_hit: false,
+            pipeline_ms: 0.0,
+            focused_rect: None,
+            focused_only: false,
+            snapped_idx: None,
+            drag_mode: false,
+            drag_anchor: None,
+            auto_loop: false,
+        };
+        session.targets = session.make_grid_Step(0, 0, session.screen_w, session.screen_h);
+        session
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn targets(&self) -> &[Target] {
+        &self.targets
+    }
+
+    pub fn typed(&self) -> &str {
+        &self.typed
+    }
+
+    pub fn action(&self) -> ClickAction {
+        self.action
+    }
+
+    pub fn debug_view(&self) -> DebugView {
+        self.debug_view
+    }
+
+    pub fn show_debug_hud(&self) -> bool {
+        self.show_debug_hud
+    }
+
+    pub fn show_options_menu(&self) -> bool {
+        self.show_options_menu
+    }
+
+    pub fn selected_option(&self) -> usize {
+        self.selected_option
+    }
+
+    pub fn cached_hit(&self) -> bool {
+        self.cached_hit
+    }
+
+    pub fn pipeline_ms(&self) -> f64 {
+        self.pipeline_ms
+    }
+
+    pub fn focused_rect(&self) -> Option<[i32; 4]> {
+        self.focused_rect
+    }
+
+    pub fn focused_only(&self) -> bool {
+        self.focused_only
+    }
+
+    pub fn snapped_target(&self) -> Option<&Target> {
+        self.snapped_idx.and_then(|idx| self.targets.get(idx))
+    }
+
+    pub fn drag_mode(&self) -> bool {
+        self.drag_mode
+    }
+
+    pub fn drag_anchor(&self) -> Option<(i32, i32)> {
+        self.drag_anchor
+    }
+
+    pub fn auto_loop(&self) -> bool {
+        self.auto_loop
+    }
+
+    pub fn handle_input(&mut self, input: Input) -> Outcome {
+        let mut dummy = RuntimeSettings::default();
+        self.handle_input_with_settings(input, &mut dummy)
+    }
+
+    pub fn handle_input_with_settings(
+        &mut self,
+        input: Input,
+        settings: &mut RuntimeSettings,
+    ) -> Outcome {
+        if self.show_options_menu {
+            match input {
+                Input::Escape | Input::ToggleOptionsMenu => {
+                    self.show_options_menu = false;
+                    return Outcome::Redraw;
+                }
+                Input::MenuUp => {
+                    self.selected_option = (self.selected_option + RuntimeSettings::OPTION_COUNT
+                        - 1)
+                        % RuntimeSettings::OPTION_COUNT;
+                    return Outcome::Redraw;
+                }
+                Input::MenuDown => {
+                    self.selected_option =
+                        (self.selected_option + 1) % RuntimeSettings::OPTION_COUNT;
+                    return Outcome::Redraw;
+                }
+                Input::MenuLeft => {
+                    settings.adjust_option(self.selected_option, -1);
+                    return Outcome::SettingsChanged;
+                }
+                Input::MenuRight | Input::Enter => {
+                    settings.adjust_option(self.selected_option, 1);
+                    return Outcome::SettingsChanged;
+                }
+                Input::MenuSave => {
+                    return Outcome::SaveSettings;
+                }
+                Input::Char { ch, .. } => match ch.to_ascii_lowercase() {
+                    'j' => {
+                        self.selected_option =
+                            (self.selected_option + 1) % RuntimeSettings::OPTION_COUNT;
+                        return Outcome::Redraw;
+                    }
+                    'k' => {
+                        self.selected_option =
+                            (self.selected_option + RuntimeSettings::OPTION_COUNT - 1)
+                                % RuntimeSettings::OPTION_COUNT;
+                        return Outcome::Redraw;
+                    }
+                    'h' => {
+                        settings.adjust_option(self.selected_option, -1);
+                        return Outcome::SettingsChanged;
+                    }
+                    'l' | ' ' => {
+                        settings.adjust_option(self.selected_option, 1);
+                        return Outcome::SettingsChanged;
+                    }
+                    's' => return Outcome::SaveSettings,
+                    'q' => {
+                        self.show_options_menu = false;
+                        return Outcome::Redraw;
+                    }
+                    _ => return Outcome::Continue,
+                },
+                _ => return Outcome::Continue,
+            }
+        }
+
+        match input {
+            Input::Escape => {
+                if self.drag_anchor.is_some() {
+                    self.drag_anchor = None;
+                    self.typed.clear();
+                    return Outcome::Redraw;
+                }
+                if !self.typed.is_empty() {
+                    self.typed.clear();
+                    return Outcome::Redraw;
+                }
+                Outcome::Cancel
+            }
+            Input::Enter => {
+                if let Some(target) = self.snapped_target().cloned() {
+                    return self.activate_target_point(
+                        target.x + target.w / 2,
+                        target.y + target.h / 2,
+                        self.action,
+                    );
+                }
+                Outcome::Continue
+            }
+            Input::ToggleDebugHud => {
+                self.show_debug_hud = !self.show_debug_hud;
+                Outcome::Redraw
+            }
+            Input::CycleDebugNext => {
+                self.show_debug_hud = true;
+                self.debug_view = self.debug_view.next();
+                Outcome::Redraw
+            }
+            Input::CycleDebugPrev => {
+                self.show_debug_hud = true;
+                self.debug_view = self.debug_view.prev();
+                Outcome::Redraw
+            }
+            Input::SetDebugStage(stage) => {
+                if let Some(view) = DebugView::from_number(stage) {
+                    self.show_debug_hud = true;
+                    self.debug_view = view;
+                    Outcome::Redraw
+                } else {
+                    Outcome::Continue
+                }
+            }
+            Input::ToggleOptionsMenu => {
+                self.show_options_menu = !self.show_options_menu;
+                Outcome::Redraw
+            }
+            Input::CycleClickAction => {
+                self.action = self.action.next();
+                Outcome::Redraw
+            }
+            Input::ToggleFocusedOnly => {
+                if self.focused_rect.is_some() {
+                    self.focused_only = !self.focused_only;
+                    self.typed.clear();
+                    self.rebuild_active_targets();
+                    Outcome::Redraw
+                } else {
+                    Outcome::Continue
+                }
+            }
+            Input::ToggleDragMode => {
+                self.drag_mode = !self.drag_mode;
+                if !self.drag_mode {
+                    self.drag_anchor = None;
+                }
+                Outcome::Redraw
+            }
+            Input::Refresh => Outcome::Refresh,
+            Input::ToggleLoop => {
+                self.auto_loop = !self.auto_loop;
+                Outcome::Redraw
+            }
+            Input::Scroll { dx, dy } => Outcome::Scroll { dx, dy },
+            Input::Snap(dir) => {
+                self.move_snap(dir);
+                Outcome::Redraw
+            }
+            Input::Backspace => {
+                if self.typed.pop().is_some() {
+                    Outcome::Redraw
+                } else if self.mode == Mode::Drilldown {
+                    self.mode = Mode::Hints;
+                    self.rebuild_active_targets();
+                    Outcome::Redraw
+                } else {
+                    Outcome::Continue
+                }
+            }
+            Input::Char {
+                ch,
+                shift,
+                ctrl,
+                alt,
+            } => {
+                if ch == '?' {
+                    self.show_options_menu = !self.show_options_menu;
+                    return Outcome::Redraw;
+                }
+                if ch == ';' {
+                    self.action = self.action.next();
+                    return Outcome::Redraw;
+                }
+                if ch == ']' {
+                    self.show_debug_hud = true;
+                    self.debug_view = self.debug_view.next();
+                    return Outcome::Redraw;
+                }
+                if ch == '[' {
+                    self.show_debug_hud = true;
+                    self.debug_view = self.debug_view.prev();
+                    return Outcome::Redraw;
+                }
+                if ch.is_ascii_digit()
+                    && let Some(view) = DebugView::from_number(ch as u8 - b'0')
+                {
+                    self.show_debug_hud = true;
+                    self.debug_view = view;
+                    return Outcome::Redraw;
+                }
+                // If nothing is typed yet, `v` toggles 2-point drag mode and `r` triggers a live pipeline re-capture.
+                if self.typed.is_empty() && !shift && !ctrl && !alt {
+                    if ch.eq_ignore_ascii_case(&'v') {
+                        self.drag_mode = !self.drag_mode;
+                        if !self.drag_mode {
+                            self.drag_anchor = None;
+                        }
+                        return Outcome::Redraw;
+                    }
+                    if ch.eq_ignore_ascii_case(&'r') {
+                        return Outcome::Refresh;
+                    }
+                }
+                if !ch.is_ascii_alphabetic() {
+                    return Outcome::Continue;
+                }
+                self.push_char(ch.to_ascii_uppercase(), shift, ctrl, alt)
+            }
+            _ => Outcome::Continue,
+        }
+    }
+
+    fn activate_target_point(&mut self, x: i32, y: i32, action: ClickAction) -> Outcome {
+        if self.drag_mode {
+            if let Some((from_x, from_y)) = self.drag_anchor.take() {
+                self.drag_mode = false;
+                return Outcome::Drag {
+                    from_x,
+                    from_y,
+                    to_x: x,
+                    to_y: y,
+                };
+            } else {
+                self.drag_anchor = Some((x, y));
+                self.typed.clear();
+                return Outcome::Redraw;
+            }
+        }
+        if action == ClickAction::LeftClick {
+            Outcome::Click { x, y }
+        } else {
+            Outcome::Action { x, y, action }
+        }
+    }
+
+    fn move_snap(&mut self, dir: Cardinal) {
+        if self.targets.is_empty() {
+            self.snapped_idx = None;
             return;
         }
-        let i = key.index();
-        if self.pressed.iter().any(Option::is_some) {
-            self.tapped = [None; 4];
-            for j in 0..4 {
-                self.invalid[j] |= self.pressed[j].is_some();
-            }
-            self.invalid[i] = true;
+        let Some(cur_idx) = self.snapped_idx.filter(|&i| i < self.targets.len()) else {
+            // Pick target closest to focused window center or screen center
+            let (cx0, cy0) = if let Some([fx, fy, fw, fh]) = self.focused_rect {
+                (fx + fw / 2, fy + fh / 2)
+            } else {
+                (self.screen_w / 2, self.screen_h / 2)
+            };
+            let best = self
+                .targets
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, t)| {
+                    let dx = (t.x + t.w / 2 - cx0) as i64;
+                    let dy = (t.y + t.h / 2 - cy0) as i64;
+                    dx * dx + dy * dy
+                })
+                .map(|(i, _)| i);
+            self.snapped_idx = best;
+            return;
+        };
+
+        let cur = &self.targets[cur_idx];
+        let cx = cur.x + cur.w / 2;
+        let cy = cur.y + cur.h / 2;
+
+        let best = self
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != cur_idx)
+            .filter_map(|(i, t)| {
+                let tx = t.x + t.w / 2;
+                let ty = t.y + t.h / 2;
+                let dx = tx - cx;
+                let dy = ty - cy;
+                let (primary, ortho) = match dir {
+                    Cardinal::Left if dx < -4 => (-dx, dy.abs()),
+                    Cardinal::Right if dx > 4 => (dx, dy.abs()),
+                    Cardinal::Up if dy < -4 => (-dy, dx.abs()),
+                    Cardinal::Down if dy > 4 => (dy, dx.abs()),
+                    _ => return None,
+                };
+                // Weight orthogonal distance by 3x so cardinal navigation stays in the row/column
+                let cost = (primary as i64) + (ortho as i64) * 3;
+                Some((cost, i))
+            })
+            .min_by_key(|&(cost, _)| cost)
+            .map(|(_, i)| i);
+
+        if let Some(next_idx) = best {
+            self.snapped_idx = Some(next_idx);
         }
-        self.pressed[i].get_or_insert(now);
     }
 
-    pub fn release(&mut self, key: GestureKey, now: Duration) -> Option<Mode> {
-        if !self.timestamp(now) {
-            return None;
+    fn push_char(&mut self, ch: char, shift: bool, ctrl: bool, alt: bool) -> Outcome {
+        let candidate = format!("{}{}", self.typed, ch);
+        let matches: Vec<usize> = self
+            .targets
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, target)| target.hint.starts_with(&candidate).then_some(idx))
+            .collect();
+
+        if matches.is_empty() {
+            return Outcome::Continue;
         }
-        let i = key.index();
-        let Some(start) = self.pressed[i].take() else {
-            self.tapped[i] = None;
-            return None;
-        };
-        if std::mem::take(&mut self.invalid[i]) || now - start > self.max_hold {
-            self.tapped[i] = None;
-            return None;
-        }
-        if self.tapped[i]
-            .take()
-            .is_some_and(|last| now - last <= self.interval)
+
+        self.typed = candidate;
+        if let Some(&idx) = matches
+            .iter()
+            .find(|&&idx| self.targets[idx].hint == self.typed)
         {
-            Some(match key {
-                GestureKey::ShiftLeft | GestureKey::ShiftRight => Mode::Hints,
-                GestureKey::ControlLeft | GestureKey::ControlRight => Mode::Grid,
-            })
-        } else {
-            self.tapped[i] = Some(now);
-            None
+            self.snapped_idx = Some(idx);
+            let target = self.targets[idx].clone();
+            let effective_action = if alt {
+                ClickAction::HoverOnly
+            } else if ctrl && shift {
+                ClickAction::DoubleClick
+            } else if ctrl {
+                ClickAction::RightClick
+            } else if shift && (self.mode != Mode::Hints || target.children.is_empty()) {
+                ClickAction::MiddleClick
+            } else {
+                self.action
+            };
+
+            match self.mode {
+                Mode::Hints => {
+                    if (shift || ctrl) && !target.children.is_empty() && !alt {
+                        let Ok(sub) = drill_down(&target, shift) else {
+                            return Outcome::Redraw;
+                        };
+                        if sub.len() <= 1 {
+                            let chosen = sub.first().unwrap_or(&target);
+                            return self.activate_target_point(
+                                chosen.x + chosen.w / 2,
+                                chosen.y + chosen.h / 2,
+                                effective_action,
+                            );
+                        }
+                        self.mode = Mode::Drilldown;
+                        self.targets = sub;
+                        self.typed.clear();
+                        return Outcome::Redraw;
+                    }
+                    return self.activate_target_point(
+                        target.x + target.w / 2,
+                        target.y + target.h / 2,
+                        effective_action,
+                    );
+                }
+                Mode::Drilldown => {
+                    return self.activate_target_point(
+                        target.x + target.w / 2,
+                        target.y + target.h / 2,
+                        effective_action,
+                    );
+                }
+                Mode::Grid => {
+                    let step_idx = self.grid_step_idx.unwrap_or(0);
+                    if step_idx == 0 {
+                        self.grid_step_idx = Some(1);
+                        self.targets = self.make_grid_Step(target.x, target.y, target.w, target.h);
+                        self.typed.clear();
+                        return Outcome::Redraw;
+                    }
+                    return self.activate_target_point(
+                        target.x + target.w / 2,
+                        target.y + target.h / 2,
+                        effective_action,
+                    );
+                }
+            }
         }
+
+        Outcome::Redraw
+    }
+
+    #[allow(non_snake_case)]
+    fn make_grid_Step(&self, rx: i32, ry: i32, rw: i32, rh: i32) -> Vec<Target> {
+        let cols = 6;
+        let rows = 4;
+        // The first grid level must fit in single-character labels so one
+        // keystroke narrows to a cell and the second picks a subcell.
+        let hints = generate_vimium_hints((cols * rows) as usize, "sadfjklewcmpghqwertyuiop");
+        let mut cells = Vec::with_capacity((cols * rows) as usize);
+        let mut idx = 0usize;
+        for row in 0..rows {
+            for col in 0..cols {
+                let x1 = rx + (col * rw) / cols;
+                let y1 = ry + (row * rh) / rows;
+                let x2 = rx + ((col + 1) * rw) / cols;
+                let y2 = ry + ((row + 1) * rh) / rows;
+                cells.push(Target {
+                    x: x1,
+                    y: y1,
+                    w: (x2 - x1).max(1),
+                    h: (y2 - y1).max(1),
+                    score: 1.0,
+                    kind: "grid".to_string(),
+                    hint: hints[idx].clone(),
+                    level: "grid".to_string(),
+                    children: Vec::new(),
+                });
+                idx += 1;
+            }
+        }
+        cells
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        Cardinal, ClickAction, DebugView, GestureKey, Input, Mode, Outcome, Session, TapEvent,
+        TapTracker, prioritize_targets_for_focus,
+    };
+    use crate::Target;
+    use std::time::Duration;
 
-    fn target(x: i32) -> Target {
-        Target::new(x, 10, 10, 10, 1.0, "text", "text")
-    }
-    fn type_text(s: &mut Session, text: &str) -> Outcome {
-        text.chars()
-            .fold(Outcome::None, |_, c| s.input(Input::Character(c)))
-    }
-
-    #[test]
-    fn immutable_labels_editing_and_exact_submit() {
-        let mut s = Session::hints(100, 100, (0..15).map(|_| target(0)).collect());
-        let labels: Vec<_> = s.targets.iter().map(|t| t.hint.clone()).collect();
-        assert_eq!(type_text(&mut s, "s"), Outcome::Changed);
-        assert_eq!(s.visible_targets().count(), 14);
-        assert_eq!(type_text(&mut s, "!z"), Outcome::None);
-        assert_eq!(s.prefix, "S");
-        assert_eq!(s.input(Input::Backspace), Outcome::Changed);
-        assert_eq!(s.visible_targets().count(), 15);
-        assert_eq!(
-            s.targets.iter().map(|t| t.hint.clone()).collect::<Vec<_>>(),
-            labels
-        );
-        assert_eq!(type_text(&mut s, "ss"), Outcome::Click { x: 5.0, y: 15.0 });
-        assert_eq!(s.input(Input::Escape), Outcome::Cancel);
-    }
-
-    #[test]
-    fn drill_is_immediate_and_parent_restores() {
-        let mut child = target(20);
-        child.children = vec![serde_json::to_value(target(40)).unwrap()];
-        let mut root = target(0);
-        root.children = vec![serde_json::to_value(child).unwrap()];
-        let mut s = Session::hints(100, 100, vec![root]);
-        s.input(Input::Tab);
-        assert_eq!(type_text(&mut s, "s"), Outcome::Changed);
-        assert_eq!(s.targets[0].x, 20);
-        assert_eq!(type_text(&mut s, "s"), Outcome::Changed);
-        assert_eq!(s.targets[0].x, 40);
-        assert_eq!(s.input(Input::Backspace), Outcome::Changed);
-        assert_eq!(s.targets[0].x, 20);
-        s.input(Input::Parent);
-        assert_eq!(s.targets[0].x, 0);
-        s.input(Input::Tab);
-        assert_eq!(type_text(&mut s, "s"), Outcome::Click { x: 5.0, y: 15.0 });
-        assert_eq!(s.input(Input::Enter), Outcome::Click { x: 5.0, y: 15.0 });
-    }
-
-    #[test]
-    fn invalid_targets_and_children_are_safe() {
-        let mut bad = target(i32::MAX);
-        bad.w = i32::MAX;
-        let mut root = target(0);
-        root.children = vec![serde_json::json!({"x": "bad"})];
-        let mut s = Session::hints(100, 100, vec![bad, target(-1), root]);
-        assert_eq!(s.targets.len(), 1);
-        s.input(Input::Tab);
-        assert_eq!(type_text(&mut s, "s"), Outcome::Changed);
-        assert_eq!(s.targets[0].x, 0);
-        assert_eq!(s.input(Input::Enter), Outcome::None);
-        assert_eq!(
-            Session::hints(0, 0, vec![target(0)])
-                .visible_targets()
-                .count(),
-            0
-        );
-    }
-
-    #[test]
-    fn grid_row_column_subcells_and_navigation() {
-        let mut s = Session::grid(312, 312);
-        assert_eq!(type_text(&mut s, "a1"), Outcome::None);
-        assert_eq!(s.prefix, "A");
-        s.input(Input::Backspace);
-        type_text(&mut s, "ab");
-        assert_eq!(s.grid_cell, Some((0, 1)));
-        assert_eq!(type_text(&mut s, "a"), Outcome::Click { x: 13.0, y: 1.0 });
-        assert_eq!(type_text(&mut s, "9"), Outcome::Click { x: 23.0, y: 11.0 });
-        s.input(Input::Backspace);
-        assert_eq!(s.grid_cell, None);
-        type_text(&mut s, "zz");
-        assert_eq!(
-            type_text(&mut s, "9"),
-            Outcome::Click { x: 311.0, y: 311.0 }
-        );
-        s.input(Input::Parent);
-        assert_eq!(s.grid_cell, None);
-        assert_eq!(type_text(&mut Session::grid(-1, 1), "aa"), Outcome::None);
-    }
-
-    fn tap(t: &mut TapTracker, key: GestureKey, start: u64, end: u64) -> Option<Mode> {
-        t.press(key, Duration::from_millis(start));
-        t.release(key, Duration::from_millis(end))
-    }
-
-    #[test]
-    fn exact_keys_thresholds_and_modes() {
-        for (key, mode) in [
-            (GestureKey::ShiftLeft, Mode::Hints),
-            (GestureKey::ShiftRight, Mode::Hints),
-            (GestureKey::ControlLeft, Mode::Grid),
-            (GestureKey::ControlRight, Mode::Grid),
-        ] {
-            let mut t = TapTracker::new();
-            assert_eq!(tap(&mut t, key, 0, 10), None);
-            assert_eq!(tap(&mut t, key, 60, 310), Some(mode));
-            assert_eq!(tap(&mut t, key, 320, 330), None);
+    fn sample_target() -> Target {
+        let child = |x, y, w, kind: &str, children: Vec<serde_json::Value>| {
+            serde_json::to_value(Target {
+                x,
+                y,
+                w,
+                h: 20,
+                score: 0.85,
+                kind: kind.to_string(),
+                hint: String::new(),
+                level: kind.to_string(),
+                children,
+            })
+            .unwrap()
+        };
+        Target {
+            x: 100,
+            y: 200,
+            w: 80,
+            h: 40,
+            score: 0.9,
+            kind: "text_block".to_string(),
+            hint: "S".to_string(),
+            level: "paragraph".to_string(),
+            children: vec![
+                child(
+                    100,
+                    200,
+                    35,
+                    "line",
+                    vec![
+                        child(100, 200, 16, "word", Vec::new()),
+                        child(120, 200, 15, "word", Vec::new()),
+                    ],
+                ),
+                child(100, 220, 60, "line", Vec::new()),
+            ],
         }
-        let mut t = TapTracker::default();
-        assert_eq!(tap(&mut t, GestureKey::ShiftLeft, 0, 10), None);
-        assert_eq!(tap(&mut t, GestureKey::ShiftRight, 20, 30), None);
-        assert_eq!(tap(&mut t, GestureKey::ShiftLeft, 400, 410), None);
     }
 
     #[test]
-    fn rejects_repeat_hold_overlap_unmatched_and_reordered_events() {
-        let key = GestureKey::ShiftLeft;
-        let mut t = TapTracker::new();
-        tap(&mut t, key, 0, 10);
-        t.press(key, Duration::from_millis(20));
-        t.press(key, Duration::from_millis(21));
-        assert_eq!(t.release(key, Duration::from_millis(30)), None);
-        assert_eq!(tap(&mut t, key, 40, 50), None);
-        assert_eq!(tap(&mut t, key, 60, 311), None);
-        t.reset();
-        t.press(key, Duration::ZERO);
-        t.press(GestureKey::ControlLeft, Duration::from_millis(1));
-        assert_eq!(t.release(key, Duration::from_millis(2)), None);
+    fn hints_session_clicks_matching_target() {
+        let mut session = Session::hints(800, 600, vec![sample_target()]);
+        let outcome = session.handle_input(Input::Char {
+            ch: 's',
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        assert_eq!(outcome, Outcome::Click { x: 140, y: 220 });
+    }
+
+    #[test]
+    fn shift_drills_down_to_words_and_backspace_returns_to_root() {
+        let mut session = Session::hints(800, 600, vec![sample_target()]);
+        let outcome = session.handle_input(Input::Char {
+            ch: 's',
+            shift: true,
+            ctrl: false,
+            alt: false,
+        });
+        assert_eq!(outcome, Outcome::Redraw);
+        assert_eq!(session.mode(), Mode::Drilldown);
+        assert_eq!(session.targets().len(), 3);
+
+        let outcome = session.handle_input(Input::Backspace);
+        assert_eq!(outcome, Outcome::Redraw);
+        assert_eq!(session.mode(), Mode::Hints);
+        assert_eq!(session.targets().len(), 1);
+    }
+
+    #[test]
+    fn grid_session_refines_then_clicks_subcell() {
+        let mut session = Session::grid(600, 400);
+        let first_hint = session.targets()[0].hint.chars().next().unwrap();
+        let outcome = session.handle_input(Input::Char {
+            ch: first_hint,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        assert_eq!(outcome, Outcome::Redraw);
+
+        let second_hint = session.targets()[0].hint.chars().next().unwrap();
+        let outcome = session.handle_input(Input::Char {
+            ch: second_hint,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        assert_eq!(outcome, Outcome::Click { x: 8, y: 12 });
+    }
+
+    #[test]
+    fn tap_tracker_warms_up_on_first_tap_and_activates_on_second_including_capslock() {
+        let mut tracker = TapTracker::new();
         assert_eq!(
-            t.release(GestureKey::ControlLeft, Duration::from_millis(3)),
-            None
+            tracker.on_tap(GestureKey::CapsLock, Duration::from_millis(250)),
+            TapEvent::Warmup
         );
-        assert_eq!(tap(&mut t, key, 4, 5), None);
-        assert_eq!(t.release(key, Duration::from_millis(6)), None);
-        assert_eq!(tap(&mut t, key, 7, 8), None);
-        t.press(key, Duration::from_millis(100));
-        assert_eq!(t.release(key, Duration::from_millis(90)), None);
-        assert_eq!(tap(&mut t, key, 101, 102), None);
-        t.reset();
-        assert_eq!(tap(&mut t, key, 103, 104), None);
+        assert_eq!(
+            tracker.on_tap(GestureKey::CapsLock, Duration::from_millis(250)),
+            TapEvent::Activate
+        );
+        // Next tap starts a fresh cycle
+        assert_eq!(
+            tracker.on_tap(GestureKey::F, Duration::from_millis(250)),
+            TapEvent::Warmup
+        );
+        tracker.on_other_key();
+        assert_eq!(
+            tracker.on_tap(GestureKey::F, Duration::from_millis(250)),
+            TapEvent::Warmup
+        );
+    }
+
+    #[test]
+    fn debug_and_action_shortcuts_update_session_state() {
+        let mut session = Session::hints(800, 600, vec![sample_target()]);
+        assert_eq!(session.action(), ClickAction::LeftClick);
+        assert_eq!(
+            session.handle_input(Input::CycleClickAction),
+            Outcome::Redraw
+        );
+        assert_eq!(session.action(), ClickAction::RightClick);
+
+        assert!(!session.show_debug_hud());
+        assert_eq!(
+            session.handle_input(Input::SetDebugStage(3)),
+            Outcome::Redraw
+        );
+        assert!(session.show_debug_hud());
+        assert_eq!(session.debug_view(), DebugView::Gradients);
+    }
+
+    #[test]
+    fn focused_window_and_control_targets_are_prioritized_first() {
+        let bg_paragraph = Target {
+            x: 20,
+            y: 20,
+            w: 100,
+            h: 40,
+            score: 0.95,
+            kind: "text_block".to_string(),
+            hint: "S".to_string(),
+            level: "paragraph".to_string(),
+            children: Vec::new(),
+        };
+        let focused_paragraph = Target {
+            x: 500,
+            y: 200,
+            w: 120,
+            h: 40,
+            score: 0.85,
+            kind: "text_block".to_string(),
+            hint: "A".to_string(),
+            level: "paragraph".to_string(),
+            children: Vec::new(),
+        };
+        let focused_control = Target {
+            x: 520,
+            y: 300,
+            w: 80,
+            h: 30,
+            score: 0.90,
+            kind: "frame".to_string(),
+            hint: "D".to_string(),
+            level: "control".to_string(),
+            children: Vec::new(),
+        };
+        let mut targets = vec![bg_paragraph, focused_paragraph, focused_control];
+        prioritize_targets_for_focus(&mut targets, Some([450, 150, 300, 300]), "sadfjklewcmpgh");
+
+        // The control inside the focused window comes first ("S"), followed by the focused paragraph ("A"),
+        // followed by the unfocused background target ("D").
+        assert_eq!(targets[0].level, "control");
+        assert_eq!(targets[0].hint, "S");
+        assert_eq!(targets[1].x, 500);
+        assert_eq!(targets[1].hint, "A");
+        assert_eq!(targets[2].x, 20);
+        assert_eq!(targets[2].hint, "D");
+    }
+
+    #[test]
+    fn snap_and_two_point_drag_mode_work() {
+        let t1 = Target {
+            x: 100,
+            y: 100,
+            w: 40,
+            h: 20,
+            score: 0.9,
+            kind: "frame".to_string(),
+            hint: "S".to_string(),
+            level: "control".to_string(),
+            children: Vec::new(),
+        };
+        let t2 = Target {
+            x: 300,
+            y: 100,
+            w: 40,
+            h: 20,
+            score: 0.9,
+            kind: "frame".to_string(),
+            hint: "A".to_string(),
+            level: "control".to_string(),
+            children: Vec::new(),
+        };
+        let mut session = Session::hints(800, 600, vec![t1, t2]);
+        assert_eq!(
+            session.handle_input(Input::Snap(Cardinal::Right)),
+            Outcome::Redraw
+        );
+        assert!(session.snapped_target().is_some());
+
+        // Toggle drag mode with `v`
+        assert_eq!(
+            session.handle_input(Input::Char {
+                ch: 'v',
+                shift: false,
+                ctrl: false,
+                alt: false
+            }),
+            Outcome::Redraw
+        );
+        assert!(session.drag_mode());
+
+        // First hint selects drag anchor
+        assert_eq!(
+            session.handle_input(Input::Char {
+                ch: 's',
+                shift: false,
+                ctrl: false,
+                alt: false
+            }),
+            Outcome::Redraw
+        );
+        assert_eq!(session.drag_anchor(), Some((120, 110)));
+
+        // Second hint completes the drag
+        assert_eq!(
+            session.handle_input(Input::Char {
+                ch: 'a',
+                shift: false,
+                ctrl: false,
+                alt: false
+            }),
+            Outcome::Drag {
+                from_x: 120,
+                from_y: 110,
+                to_x: 320,
+                to_y: 110
+            }
+        );
     }
 }

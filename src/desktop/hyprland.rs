@@ -1,5 +1,5 @@
 //! Read-only Hyprland IPC. Never changes the user's configuration or focus.
-use super::geometry::Output;
+use super::geometry::{FrameGeometry, Output};
 use serde_json::Value;
 use std::{
     io::{Read, Write},
@@ -64,6 +64,7 @@ fn output(value: &Value) -> Result<Output, String> {
     Ok(result)
 }
 
+#[allow(dead_code)]
 pub fn selected_output(name: Option<&str>) -> Result<Output, String> {
     let monitors = monitors()?;
     let monitor = monitors
@@ -89,6 +90,33 @@ pub struct Context {
     workspaces: Vec<(String, i64, i64)>,
     client: Option<String>,
     visible_clients: Vec<Client>,
+}
+
+impl Context {
+    /// Name of the monitor that currently owns Hyprland's keyboard focus.
+    pub fn focused_monitor(&self) -> Option<&str> {
+        (!self.focused_output.is_empty()).then_some(self.focused_output.as_str())
+    }
+
+    /// Map the focused Hyprland client's global logical bounds `[x, y, w, h]` into
+    /// upright screenshot pixel coordinates `[px, py, pw, ph]` on `geometry`.
+    pub fn focused_pixel_rect(&self, geometry: &FrameGeometry) -> Option<[i32; 4]> {
+        let address = self.client.as_deref()?;
+        let client = self.visible_clients.iter().find(|c| c.address == address)?;
+        let (lw, lh) = geometry.output.logical_size().ok()?;
+        if lw <= 0.0 || lh <= 0.0 || geometry.pixel_width <= 0 || geometry.pixel_height <= 0 {
+            return None;
+        }
+        let sx = f64::from(geometry.pixel_width) / lw;
+        let sy = f64::from(geometry.pixel_height) / lh;
+        let local_x = f64::from(client.at[0] - geometry.output.x);
+        let local_y = f64::from(client.at[1] - geometry.output.y);
+        let px = (local_x * sx).floor() as i32;
+        let py = (local_y * sy).floor() as i32;
+        let pw = (f64::from(client.size[0]) * sx).ceil() as i32;
+        let ph = (f64::from(client.size[1]) * sy).ceil() as i32;
+        (pw > 0 && ph > 0).then_some([px, py, pw, ph])
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -194,6 +222,7 @@ pub fn context() -> Result<Context, String> {
     })
 }
 
+#[allow(dead_code)]
 pub fn still_current(previous: &Context) -> Result<bool, String> {
     let current = context()?;
     // Hyprland may report no active client while a layer owns keyboard focus.
@@ -250,6 +279,7 @@ mod tests {
         assert!(snapshot(serde_json::json!([client])).is_err());
         assert!(snapshot(serde_json::json!({})).is_err());
     }
+
     #[test]
     fn monitor_metadata_is_validated() {
         let m = serde_json::json!({"name":"rotated","x":-1080,"y":0,"width":1920,"height":1080,"scale":1.5,"transform":3});
@@ -258,5 +288,42 @@ mod tests {
         let mut invalid = m;
         invalid["scale"] = serde_json::json!(0);
         assert!(output(&invalid).is_err());
+    }
+
+    #[test]
+    fn focused_pixel_rect_maps_global_logical_to_screenshot_pixels() {
+        let out = Output {
+            name: "DP-1".into(),
+            x: 1000,
+            y: 200,
+            width: 3840,
+            height: 2160,
+            scale: 2.0,
+            transform: 0,
+        };
+        let geom = FrameGeometry {
+            output: out.clone(),
+            pixel_width: 3840,
+            pixel_height: 2160,
+        };
+        let ctx = Context {
+            outputs: vec![(out, true)],
+            focused_output: "DP-1".into(),
+            workspaces: vec![("DP-1".into(), 1, 0)],
+            client: Some("0xabc".into()),
+            visible_clients: vec![Client {
+                address: "0xabc".into(),
+                at: [1100, 250],
+                size: [800, 500],
+                workspace: Workspace { id: 1 },
+                monitor: 0,
+                mapped: true,
+                hidden: false,
+                fullscreen: 0,
+                floating: false,
+                pinned: false,
+            }],
+        };
+        assert_eq!(ctx.focused_pixel_rect(&geom), Some([200, 100, 1600, 1000]));
     }
 }
