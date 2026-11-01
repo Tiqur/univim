@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
 """
-visel_detector.py (v8-Clean) — Self-Calibrating, Contour-Ladder UI & Text Detector
-=================================================================================================
+visel_detector.py (v9-GlyphChain) — Self-Calibrating, Contour-Ladder UI & Contextual Glyph-Chain Detector
+=========================================================================================================
 Streamlined, fast, zero-dependency computer-vision UI detector for Vimium navigation across any
-OS, theme, DPI scale, or compression level.
+OS, theme, DPI scale, zoom level, or compression level.
 
 Key Features & Optimizations:
   1. Stage 0 Self-Calibrating Image Physics (`_calibrate_image_physics`):
      - Automatically estimates the screenshot's background noise floor (`noise_floor`), gradient
        contrast quantiles (`stroke_thr`, `border_thr`, `flat_thr`), and fundamental modal text line
-       height `L_0` in ~1 ms, scaling all spatial rules as dimensionless multiples of `L_0`.
+       height `L_0` (down to 8.0 px for zoomed-out / small-font displays) in ~1 ms, with aspect-aware
+       upscaling so narrow/portrait crops never over-inflate `L_0`.
   2. Multi-Threshold Stage 2 Contour Ladder:
      - Extracts closed frames and thumbnails across a 3-threshold ladder (`border_thr - 1`, `+ 1`, `+ 3`)
        capturing subtle dark-mode buttons (`OBS`, `Blender`) and media cards simultaneously without
        needing heavy color-delta pill peeling.
-  3. Stage 4 Single-Pass Balanced 2D Decomposition + Unsupervised Gutter Scoring:
-     - Slices complex 1D text rows via quiet gutter flatness scoring and decomposes 2D sub-blocks
-       in a single fast balanced pass (eliminating multi-trial WBF overhead with 99.2% box identity).
-  4. Post-Stage-4 Peer-Grid & Cross-Row Media Shelf Completion + 2-Bin Dominance Filter:
-     - Completes dark-bordered 16:9 video cards and 9:16 Shorts shelves while rejecting bimodal UI cards.
+  3. Stage 4 Single-Pass Balanced 2D Decomposition + Foreground-Contrast Multi-Line Splitting:
+     - Slices complex 1D text rows via quiet gutter flatness scoring, separates tightly-spaced small-font
+       lines via direct foreground luminance valleys (bypassing vertical morphological gradient dilation),
+       and decomposes 2D sub-blocks in a single fast balanced pass.
+  4. 1D Contextual Glyph-Chain Sequence Scorer (`[L, L, ?, L, L]`) + Bimodal Valley Word Splitter:
+     - Scores candidate character primitives along horizontal strips and propagates sequence confidence
+       across collinear neighbors (`[Letter, Letter, Maybe-Not, Letter, Letter]` -> boosts weak/small
+       glyphs while rejecting isolated noise), rescuing zoomed-out / low-contrast text lines.
+     - Segments individual words using direct foreground ink contrast valleys (eliminating +1 px horizontal
+       `MORPH_GRADIENT` edge bleed), line-local bimodal gap clustering (separating 1 px kerning from 2 px
+       word spaces), and pitch-guided sub-pixel valley splitting for lightly bridged words.
+  5. Post-Stage-4 Peer-Grid & Cross-Row Media Shelf Completion + Flattened Paragraph Word Hierarchy:
+     - Completes dark-bordered 16:9 video cards and 9:16 Shorts shelves while preserving flat 2-level
+       paragraph -> line -> word hierarchies across consolidated collinear line fragments.
 """
 
 from dataclasses import dataclass, field
@@ -75,20 +85,25 @@ def generate_vimium_hints(n: int, alphabet: str = "sadfjklewcmpgh") -> List[str]
     return hints[:n]
 
 
+def _collect_word_leaves(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    leaves: List[Dict[str, Any]] = []
+    for ch in nodes:
+        sub = ch.get("children", [])
+        if sub:
+            leaves.extend(_collect_word_leaves(sub))
+        else:
+            leaves.append(ch)
+    return leaves
+
+
 def drill_down(target: UITarget, to_words: bool = True) -> List[UITarget]:
     """
     Instant 0.0 ms hierarchical drill-down when the user selects a target with a modifier key.
     """
     if not target.children:
         return [target]
-    leaves: List[Dict[str, Any]] = []
     if to_words:
-        for ch in target.children:
-            sub = ch.get("children", [])
-            if sub:
-                leaves.extend(sub)
-            else:
-                leaves.append(ch)
+        leaves = _collect_word_leaves(target.children)
     else:
         leaves = list(target.children)
 
@@ -140,6 +155,7 @@ class ViselDetector:
         """
         Self-calibrate gradient thresholds (noise_floor, flat_thr, border_thr, stroke_thr)
         and fundamental text line height L_0 from the image's own statistics.
+        Supports zoomed-out / small-font displays down to L_0 = 8.0 px.
         """
         hist = cv2.calcHist([grad_max], [0], None, [256], [0, 256]).flatten()
         cdf = np.cumsum(hist) / float(max(1, W * H))
@@ -158,10 +174,13 @@ class ViselDetector:
         s_closed = cv2.morphologyEx(s_bin, cv2.MORPH_CLOSE, k_line)
         cnts, _ = cv2.findContours(s_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         heights = []
+        small_heights = []
         for c in cnts:
             _, _, bw, bh = cv2.boundingRect(c)
             if 9 <= bh <= 32 and bw >= bh * 2.2 and bw <= W * 0.45:
                 heights.append(bh)
+            elif 6 <= bh < 9 and bw >= bh * 2.5 and bw <= W * 0.45:
+                small_heights.append(bh)
         if len(heights) >= 8:
             h_arr = np.array(heights, dtype=np.int32)
             counts = np.bincount(h_arr, minlength=36)
@@ -170,12 +189,346 @@ class ViselDetector:
             modal_h = float(8 + int(np.argmax(smooth_counts)))
             med_h = float(np.median(h_arr))
             L_0 = 0.6 * modal_h + 0.4 * med_h
+            L_0 = float(np.clip(L_0, 11.5, 26.0))
+        elif len(heights) + len(small_heights) >= 8:
+            h_arr = np.array(heights + small_heights, dtype=np.int32)
+            counts = np.bincount(h_arr, minlength=36)
+            smooth_counts = counts[6:33] + counts[5:32] + counts[7:34]
+            modal_h = float(6 + int(np.argmax(smooth_counts)))
+            med_h = float(np.median(h_arr))
+            L_0 = float(np.clip(0.6 * modal_h + 0.4 * med_h, 8.5, 26.0))
         else:
             L_0 = 16.0 * float(np.clip(np.sqrt((W * H) / float(1440 * 900)), 0.70, 1.60))
+            L_0 = float(np.clip(L_0, 11.5, 26.0))
 
-        L_0 = float(np.clip(L_0, 11.5, 26.0))
         u = float(np.clip(L_0 / 16.0, 0.68, 1.75))
         return flat_thr, border_thr, stroke_thr, L_0, u
+
+    @staticmethod
+    def _score_and_segment_glyph_chain(
+        roi_gray: np.ndarray,
+        roi_dx: np.ndarray,
+        roi_dy: np.ndarray,
+        roi_stroke: np.ndarray,
+        L_0: float,
+    ) -> Tuple[float, List[Tuple[int, int]]]:
+        """
+        Vectorized 1D Contextual Glyph-Chain Scorer (`[L, L, ?, L, L]`) + Direct-Ink Bimodal Valley Word Splitter.
+
+        1. Computes direct foreground luminance contrast `|roi_gray - bg_med|` in the core x-height band,
+           avoiding the +1 px horizontal edge bleed caused by `MORPH_GRADIENT (2, 1)` on `stroke_01`.
+        2. Slices the strip into candidate character/sub-word primitives and computes each primitive's
+           local letter-likeness `S_local(i)` (vertical span, baseline alignment, stroke density, aspect).
+        3. Propagates belief across collinear neighbors (`[Letter, Letter, Maybe-Not, Letter, Letter]`)
+           so weak/small glyphs inside a real text line are boosted while isolated specks are rejected.
+        4. Splits confirmed glyph chains into individual words using line-local bimodal gap clustering
+           (separating 1 px intra-word kerning from >=2 px inter-word spaces) plus pitch-guided sub-pixel
+           valley splitting when anti-aliasing bridges a word space in tiny text.
+        """
+        rh, rw = roi_gray.shape[:2]
+        if rh < 4 or rw < 6:
+            return 0.0, []
+
+        # Fast background luminance estimate from top and bottom border rows
+        if rh >= 6:
+            b_top = roi_gray[0, :]
+            b_bot = roi_gray[-1, :]
+            bg_med = 0.5 * float(
+                int(np.partition(b_top, rw >> 1)[rw >> 1])
+                + int(np.partition(b_bot, rw >> 1)[rw >> 1])
+            )
+        else:
+            flat_g = roi_gray.ravel()
+            bg_med = float(np.partition(flat_g, len(flat_g) >> 1)[len(flat_g) >> 1])
+
+        fg = np.abs(roi_gray.astype(np.float32) - bg_med)
+
+        # Core vertical x-height band (trim 1px top/bottom anti-alias halo on lines >= 7px tall)
+        y_trim = 1 if rh >= 7 else 0
+        fg_core = fg[y_trim : rh - y_trim, :] if (rh - 2 * y_trim) >= 3 else fg
+
+        col_max = fg_core.max(axis=0)
+        col_mean = fg_core.mean(axis=0)
+        idx85 = min(rw - 1, int(rw * 0.85))
+        peak = float(np.partition(col_max, idx85)[idx85]) if rw >= 6 else float(col_max.max())
+        if peak < 11.0:
+            return 0.0, []
+
+        # Adaptive column valley threshold (27% of 85th-percentile ink contrast, clamped to [10, 42])
+        ink_thr = float(np.clip(peak * 0.27, 10.0, 42.0))
+        is_ink = col_max > ink_thr
+
+        # Fallback to stroke mask if low luminance contrast (e.g. equiluminant colored text)
+        if np.count_nonzero(is_ink) < 3:
+            col_s = roi_stroke.sum(axis=0)
+            is_ink = col_s > 0
+            if np.count_nonzero(is_ink) < 3:
+                return 0.0, []
+
+        pad = np.concatenate(([False], is_ink, [False]))
+        starts = np.flatnonzero(pad[1:] & ~pad[:-1])
+        ends = np.flatnonzero(~pad[1:] & pad[:-1])
+        n_prim = len(starts)
+        if n_prim == 0:
+            return 0.0, []
+
+        # Precompute per-column vertical bounds and stroke averages in vectorized form
+        fg_bin = fg > (ink_thr * 0.85)
+        row_indices = np.arange(rh, dtype=np.int32)[:, None]
+        y_top_col = np.where(fg_bin, row_indices, rh).min(axis=0)
+        y_bot_col = np.where(fg_bin, row_indices, -1).max(axis=0)
+        fg_count_col = fg_bin.sum(axis=0)
+        dx_col = roi_dx.mean(axis=0)
+        dy_col = roi_dy.mean(axis=0)
+        osc_col = np.zeros(rw, dtype=np.int32)
+        if rw >= 3:
+            osc_col[1:-1] = (
+                (dx_col[1:-1] >= dx_col[:-2])
+                & (dx_col[1:-1] >= dx_col[2:])
+                & (dx_col[1:-1] > 4.0)
+            ).astype(np.int32)
+        osc_prefix = np.concatenate(([0], np.cumsum(osc_col)))
+        fg_prefix = np.concatenate(([0], np.cumsum(fg_count_col)))
+        dx_prefix = np.concatenate(([0.0], np.cumsum(dx_col)))
+        dy_prefix = np.concatenate(([0.0], np.cumsum(dy_col)))
+
+        # Step A: Vectorized Local Glyph-Primitive Score S_local[i] in [0, 1]
+        p_widths = (ends - starts).astype(np.float32)
+        yh0 = np.minimum.reduceat(y_top_col, starts)
+        yh1 = np.maximum.reduceat(y_bot_col, starts) + 1
+        ph = np.maximum(1.0, (yh1 - yh0).astype(np.float32))
+        y_mids = 0.5 * (yh0 + yh1).astype(np.float32)
+        h_spans = ph
+
+        h_ratio = ph / float(max(1, rh))
+        f_height = np.where(
+            (h_ratio >= 0.42) & (h_ratio <= 1.0),
+            1.0,
+            np.where(h_ratio >= 0.28, 0.55, 0.15),
+        )
+
+        ar = p_widths / float(max(1, rh))
+        osc_counts = osc_prefix[ends] - osc_prefix[starts]
+        f_aspect = np.where(
+            (ar >= 0.15) & (ar <= 1.25),
+            1.0,
+            np.where(
+                (ar > 1.25) & (ar <= 7.5),
+                np.where(osc_counts >= np.maximum(1, (ar * 0.45).astype(np.int32)), 0.92, 0.55),
+                0.25,
+            ),
+        )
+
+        ink_pixels = (fg_prefix[ends] - fg_prefix[starts]).astype(np.float32)
+        fill = ink_pixels / np.maximum(1.0, ph * p_widths)
+        f_fill = np.where(
+            (fill >= 0.16) & (fill <= 0.82),
+            1.0,
+            np.where((fill >= 0.10) & (fill <= 0.90), 0.50, 0.15),
+        )
+
+        dx_m = (dx_prefix[ends] - dx_prefix[starts]) / p_widths
+        dy_m = (dy_prefix[ends] - dy_prefix[starts]) / p_widths
+        f_stroke = np.where(
+            (dx_m >= 2.2) & (dx_m >= 0.52 * dy_m),
+            1.0,
+            np.where(dx_m >= 1.2, 0.60, 0.20),
+        )
+
+        s_local = (
+            0.30 * f_height + 0.28 * f_aspect + 0.22 * f_fill + 0.20 * f_stroke
+        ).astype(np.float32)
+        s_local = np.where(yh1 > yh0, s_local, 0.0)
+
+        # Step B: 1D Contextual Belief Propagation (`[L, L, ?, L, L]` sequence model)
+        s_ctx = s_local.copy()
+        if n_prim >= 2:
+            med_ymid = float(np.median(y_mids))
+            ctx_num = np.zeros(n_prim, dtype=np.float32)
+            ctx_den = np.zeros(n_prim, dtype=np.float32)
+            max_dy = max(2.5, 0.28 * rh)
+            max_dh = max(3.5, 0.45 * rh)
+            max_gap1 = max(18, int(2.4 * rh))
+            max_gap2 = max(22, int(2.8 * rh))
+
+            for step, w_step in ((-2, 0.16), (-1, 0.34), (1, 0.34), (2, 0.16)):
+                if step < 0:
+                    src = slice(0, n_prim + step)
+                    dst = slice(-step, n_prim)
+                    gap_arr = starts[dst] - ends[src]
+                else:
+                    src = slice(step, n_prim)
+                    dst = slice(0, n_prim - step)
+                    gap_arr = starts[src] - ends[dst]
+                if gap_arr.size == 0:
+                    continue
+                dy_mid = np.abs(y_mids[dst] - y_mids[src])
+                dh = np.abs(h_spans[dst] - h_spans[src])
+                compat = np.where(
+                    (dy_mid <= max_dy) & (dh <= max_dh) & (gap_arr <= max_gap1),
+                    1.0,
+                    np.where(
+                        (np.abs(y_mids[src] - med_ymid) <= max_dy) & (gap_arr <= max_gap2),
+                        0.82,
+                        0.20,
+                    ),
+                ).astype(np.float32)
+                ctx_num[dst] += w_step * s_local[src] * compat
+                ctx_den[dst] += w_step
+
+            has_w = ctx_den > 0
+            s_ctx[has_w] = np.minimum(
+                1.0, 0.58 * s_local[has_w] + 0.56 * (ctx_num[has_w] / ctx_den[has_w])
+            )
+
+        valid_mask = s_ctx >= 0.48
+        if not np.any(valid_mask):
+            return 0.0, []
+
+        v_starts = starts[valid_mask]
+        v_ends = ends[valid_mask]
+        v_scores = s_ctx[valid_mask]
+
+        total_ink_w = int(np.sum(v_ends - v_starts))
+        dx_osc_total = int(osc_prefix[-1])
+        chain_bonus = (
+            0.14
+            if (len(v_starts) >= 3 or dx_osc_total >= 4)
+            else (0.07 if len(v_starts) == 2 else 0.0)
+        )
+        chain_conf = float(np.clip(np.mean(v_scores) + chain_bonus, 0.0, 1.0))
+        if total_ink_w < max(4, int(rw * 0.18)):
+            chain_conf *= 0.65
+
+        # Step C: Line-Local Bimodal Valley Word Segmentation
+        if len(v_starts) >= 2:
+            gaps = v_starts[1:] - v_ends[:-1]
+            std_thr = max(2 if rh <= max(13, int(0.95 * L_0)) else 3, int(round(rh * 0.15)))
+            g_min = int(gaps.min())
+            g_max = int(gaps.max())
+            if g_min <= 1 and g_max >= 2:
+                if g_max <= 3:
+                    w_gap_thr = 2
+                else:
+                    best_g_thr = std_thr
+                    best_var = -1.0
+                    g_f = gaps.astype(np.float32)
+                    for cand_g in range(g_min + 1, min(g_max + 1, max(5, std_thr + 2))):
+                        m_lo = g_f < cand_g
+                        m_hi = ~m_lo
+                        if not np.any(m_lo) or not np.any(m_hi):
+                            continue
+                        w0 = float(np.mean(m_lo))
+                        w1 = 1.0 - w0
+                        mu0 = float(np.mean(g_f[m_lo]))
+                        mu1 = float(np.mean(g_f[m_hi]))
+                        if mu1 - mu0 >= 1.15:
+                            b_var = w0 * w1 * ((mu1 - mu0) ** 2)
+                            if b_var > best_var:
+                                best_var = b_var
+                                best_g_thr = cand_g
+                    w_gap_thr = min(std_thr, best_g_thr)
+            else:
+                w_gap_thr = std_thr
+
+            w_splits = np.flatnonzero(gaps >= w_gap_thr)
+            w_idx_s = np.concatenate(([0], w_splits + 1))
+            w_idx_e = np.concatenate((w_splits, [len(v_starts) - 1]))
+            raw_words = [
+                (int(v_starts[i0]), int(v_ends[i1]))
+                for i0, i1 in zip(w_idx_s, w_idx_e)
+                if int(v_ends[i1] - v_starts[i0]) >= 3
+            ]
+        else:
+            raw_words = (
+                [(int(v_starts[0]), int(v_ends[0]))]
+                if int(v_ends[0] - v_starts[0]) >= 3
+                else []
+            )
+
+        # Step D: Pitch-Guided Sub-Pixel Valley Refinement for Fused Multi-Word Runs
+        refined_words: List[Tuple[int, int]] = []
+        max_single_word_w = max(22, int(rh * 4.4))
+        min_word_step = max(7, int(rh * 1.10))
+        max_rh_subsplit = max(28, int(1.9 * L_0))
+        for (wx0, wx1) in raw_words:
+            ww = wx1 - wx0
+            if ww > max_single_word_w and rh <= max_rh_subsplit:
+                sub_e = col_mean[wx0:wx1]
+                sub_m = col_max[wx0:wx1]
+                idx80 = min(ww - 1, int(ww * 0.80))
+                local_p80 = float(np.partition(sub_e, idx80)[idx80])
+                cand_cuts: List[int] = []
+                for c in range(min_word_step, ww - min_word_step):
+                    if sub_e[c] <= sub_e[c - 1] and sub_e[c] <= sub_e[c + 1]:
+                        if sub_e[c] <= local_p80 * 0.38 and sub_m[c] <= peak * 0.56:
+                            if not cand_cuts or (c - cand_cuts[-1]) >= min_word_step:
+                                cand_cuts.append(c)
+                            elif sub_e[c] < sub_e[cand_cuts[-1]]:
+                                cand_cuts[-1] = c
+                if cand_cuts:
+                    pts = [0] + cand_cuts + [ww]
+                    for k in range(len(pts) - 1):
+                        s0, s1 = wx0 + pts[k], wx0 + pts[k + 1]
+                        nz = np.flatnonzero(col_max[s0:s1] > ink_thr * 0.80)
+                        if len(nz) > 0:
+                            s0, s1 = s0 + int(nz[0]), s0 + int(nz[-1]) + 1
+                        if s1 - s0 >= 3:
+                            refined_words.append((s0, s1))
+                    continue
+            refined_words.append((wx0, wx1))
+
+        return chain_conf, refined_words
+
+    @staticmethod
+    def _find_foreground_line_bands(
+        roi_gray: np.ndarray, roi_s: np.ndarray, min_line_h: int = 5
+    ) -> List[Tuple[int, int]]:
+        """
+        Detect horizontal text line bands using direct foreground luminance contrast `|gray - bg_med|`
+        so that 1-3 px vertical gaps between small/zoomed-out lines are not bridged by `MORPH_GRADIENT`
+        vertical edge dilation, while never slicing through a left-side avatar or tall icon.
+        """
+        rh, rw = roi_gray.shape[:2]
+        if rh < min_line_h * 2 + 2 or rw < 24:
+            return []
+        b_top = roi_gray[0, :]
+        b_bot = roi_gray[-1, :]
+        bg_med = 0.5 * float(
+            int(np.partition(b_top, rw >> 1)[rw >> 1])
+            + int(np.partition(b_bot, rw >> 1)[rw >> 1])
+        )
+        fg = np.abs(roi_gray.astype(np.float32) - bg_med)
+        if rw <= rh * 9 and float(fg[:, : min(rw, rh)].mean(axis=1).min()) >= 12.0:
+            return []
+        k95 = min(rw - 1, int(rw * 0.95))
+        row_p95 = np.partition(fg, k95, axis=1)[:, k95]
+        row_mean = fg.mean(axis=1)
+        peak_mean = float(row_mean.max())
+        peak_p95 = float(row_p95.max())
+        if peak_mean < 12.0 or peak_p95 < 28.0:
+            return []
+        valley_mean_thr = max(4.0, min(18.0, peak_mean * 0.20))
+        valley_p95_thr = max(16.0, min(52.0, peak_p95 * 0.36))
+        row_s = roi_s.sum(axis=1)
+        is_valley = (
+            (row_mean <= valley_mean_thr)
+            & (row_p95 <= valley_p95_thr)
+            & (row_s <= max(4, int(rw * 0.045)))
+        )
+        is_line_row = ~is_valley
+        r_pad = np.concatenate(([False], is_line_row, [False]))
+        r_starts = np.flatnonzero(r_pad[1:] & ~r_pad[:-1])
+        r_ends = np.flatnonzero(~r_pad[1:] & r_pad[:-1])
+        if len(r_starts) < 2:
+            return []
+        bands = [
+            (int(bs), int(be))
+            for bs, be in zip(r_starts, r_ends)
+            if (be - bs) >= min_line_h
+            and float(row_mean[bs:be].max()) >= max(12.0, peak_mean * 0.20)
+        ]
+        return bands if len(bands) >= 2 else []
 
     @staticmethod
     def _has_rect_card_borders(
@@ -264,10 +617,16 @@ class ViselDetector:
             bgr = cv2.resize(bgr, (work_W, work_H), interpolation=cv2.INTER_AREA)
             scale_back = orig_W / 2560.0
         elif orig_W < 1440:
-            work_W = 1600
-            work_H = max(1, int(round(orig_H * (1600.0 / float(orig_W)))))
-            bgr = cv2.resize(bgr, (work_W, work_H), interpolation=cv2.INTER_CUBIC)
-            scale_back = orig_W / 1600.0
+            # Aspect-safe upscale: standard landscape screenshots (<1440w) upscale to 1600w,
+            # while tall portrait crops cap work_H at 1800px so L_0 and runtime never blow up.
+            target_w = 1600
+            if orig_H > orig_W * 1.25 and int(round(orig_H * (1600.0 / float(orig_W)))) > 1800:
+                target_w = max(orig_W, int(round(orig_W * (1800.0 / float(orig_H)))))
+            if target_w != orig_W:
+                work_W = target_w
+                work_H = max(1, int(round(orig_H * (float(work_W) / float(orig_W)))))
+                bgr = cv2.resize(bgr, (work_W, work_H), interpolation=cv2.INTER_CUBIC)
+                scale_back = orig_W / float(work_W)
 
         H, W = bgr.shape[:2]
         s = float(np.clip(np.sqrt((W * H) / float(1440 * 900)), 0.65, 2.0))
@@ -326,7 +685,6 @@ class ViselDetector:
         hv_seed = cv2.resize(cv2.dilate(hv_small, self.k_d95), (W, H), interpolation=cv2.INTER_NEAREST)
 
         # Multi-threshold contour ladder: extracts closed frames and thumbnails across 3 gradient cutoffs
-        # so neither JPEG gutter ringing (cleared at higher thr) nor subtle dark borders (caught at lower thr) fail.
         cnts_list = []
         for b_thr in (max(2, border_thr - 1), max(4, border_thr + 1), max(6, border_thr + 3)):
             _, bp_iter = cv2.threshold(grad_max, b_thr, 255, cv2.THRESH_BINARY)
@@ -444,7 +802,6 @@ class ViselDetector:
                     if tb_s < (w - 12) * 0.55 or lr_s < (h - 12) * 0.55:
                         continue
                     ar = w / float(h)
-                    # Reject vertical stacks of horizontal UI buttons/sliders that contain internal full-width h_pure dividers
                     inner_hp = h_pure[y + int(0.6 * L_0) : max(y + int(0.6 * L_0) + 1, y + h - int(0.6 * L_0)), x + 6 : max(x + 7, x + w - 6)]
                     has_internal_button_dividers = (w <= int(7.8 * L_0) and h <= int(4.8 * L_0)) and inner_hp.size > 0 and float((inner_hp > 0).mean(axis=1).max()) >= 0.72
                     if (
@@ -594,10 +951,9 @@ class ViselDetector:
 
         t_coarse = time.perf_counter()
 
-        # Stage 4: Multi-Way 1D X-Y Projection & Non-Guillotine 2D Sub-Block Decomposition
+        # Stage 4: Multi-Way 1D X-Y Projection, Foreground Line Valley Split & Contextual Glyph-Chain Engine
         refined_boxes = []
         inner_frame_children = []
-        k_sub_line = cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, int(10 * s)), 2))
 
         def refine_region(rx: int, ry: int, rw: int, rh: int, depth: int = 0):
             if rw < 3 or rh < 1 or depth > 16:
@@ -633,29 +989,46 @@ class ViselDetector:
                 and depth <= 3
             )
             is_single_char_ui = (4 <= rw <= 12 and 7 <= rh <= 22 and depth <= 3)
-            if not is_micro_icon and not is_single_char_ui and (rw < 6 or rh < 6 or (rw <= 9 and rh <= 8)):
+            if not is_micro_icon and not is_single_char_ui and (rw < 6 or rh < 5 or (rw <= 9 and rh <= 7)):
                 return
 
             icon_guard_w = max(36, int(38 * s))
             icon_guard_h = max(34, int(36 * s))
-            if rh >= max(18, int(20 * s)):
-                v_thr = max(2, int(rw * 0.015)) if (rw >= int(160 * s) and int(row_proj.max()) >= int(80 * s)) else 0
-                is_active_row = row_proj > v_thr
-                r_pad = np.concatenate(([False], is_active_row, [False]))
-                r_starts = np.flatnonzero(r_pad[1:] & ~r_pad[:-1])
-                r_ends = np.flatnonzero(~r_pad[1:] & r_pad[:-1])
-                if len(r_starts) >= 2:
-                    v_gaps = r_starts[1:] - r_ends[:-1]
-                    min_v_gap = 6 if (rw <= icon_guard_w and rh <= icon_guard_h) else 1
-                    split_mask = v_gaps >= min_v_gap
-                    if np.any(split_mask):
-                        band_starts = np.concatenate(([r_starts[0]], r_starts[1:][split_mask]))
-                        band_ends = np.concatenate((r_ends[:-1][split_mask], [r_ends[-1]]))
-                        if len(band_starts) >= 2:
-                            for bs, be in zip(band_starts, band_ends):
-                                if be - bs >= 1:
-                                    refine_region(rx, ry + int(bs), rw, int(be - bs), depth + 1)
-                            return
+            if rh >= max(13, int(1.05 * L_0)):
+                if rh >= max(18, int(20 * s)):
+                    v_thr = max(2, int(rw * 0.015)) if (rw >= int(160 * s) and int(row_proj.max()) >= int(80 * s)) else 0
+                    is_active_row = row_proj > v_thr
+                    r_pad = np.concatenate(([False], is_active_row, [False]))
+                    r_starts = np.flatnonzero(r_pad[1:] & ~r_pad[:-1])
+                    r_ends = np.flatnonzero(~r_pad[1:] & r_pad[:-1])
+                    if len(r_starts) >= 2:
+                        v_gaps = r_starts[1:] - r_ends[:-1]
+                        min_v_gap = 6 if (rw <= icon_guard_w and rh <= icon_guard_h) else 1
+                        split_mask = v_gaps >= min_v_gap
+                        if np.any(split_mask):
+                            band_starts = np.concatenate(([r_starts[0]], r_starts[1:][split_mask]))
+                            band_ends = np.concatenate((r_ends[:-1][split_mask], [r_ends[-1]]))
+                            if len(band_starts) >= 2:
+                                for bs, be in zip(band_starts, band_ends):
+                                    if be - bs >= 1:
+                                        refine_region(rx, ry + int(bs), rw, int(be - bs), depth + 1)
+                                return
+
+                # Foreground-Contrast Multi-Line Valley Split:
+                # When 2-3 small text lines have a 1-3px vertical gap that `dy` morphological gradient
+                # dilated across (e.g., 2-line YouTube titles, 2-line Discord messages, zoomed-out paragraphs),
+                # split along quiet horizontal luminance valleys.
+                if rw > icon_guard_w and rh <= int(3.4 * L_0) and rw >= int(2.2 * rh):
+                    fg_bands = self._find_foreground_line_bands(
+                        gray[ry : ry + rh, rx : rx + rw],
+                        roi_s,
+                        min_line_h=max(5, int(0.36 * L_0)),
+                    )
+                    if len(fg_bands) >= 2:
+                        for bs, be in fg_bands:
+                            if be - bs >= 4:
+                                refine_region(rx, ry + bs, rw, be - bs, depth + 1)
+                        return
 
             col_blue = blue_01[ry : ry + rh, rx : rx + rw].sum(axis=0)
             is_ink = col_proj > 0
@@ -687,7 +1060,6 @@ class ViselDetector:
                 )
                 gaps = starts[1:] - ends[:-1]
                 base_gap_thr = max(int(1.22 * L_0), int(rh * 1.12)) if rh >= int(1.05 * L_0) else max(int(0.95 * L_0), int(rh * 1.18))
-                # Runtime multi-trial split scoring for wide multi-item bands (e.g. tables, toolbars, multi-column rows)
                 if not is_dot_track and rw >= int(12.0 * L_0) and rh <= int(2.4 * L_0) and len(gaps) >= 2:
                     best_mask = None
                     best_score = -1e9
@@ -700,14 +1072,12 @@ class ViselDetector:
                         c_starts = np.concatenate(([starts[0]], starts[1:][cand_mask]))
                         c_ends = np.concatenate((ends[:-1][cand_mask], [ends[-1]]))
                         seg_ws = c_ends - c_starts
-                        # Score 1: Gutter flatness inside cut gaps
                         cut_indices = np.flatnonzero(cand_mask)
                         gutter_flat = float(np.mean([
                             cv2.countNonZero(roi_fl_band[:, int(ends[ci]) : int(starts[ci + 1])])
                             / float(max(1, rh * (int(starts[ci + 1]) - int(ends[ci]))))
                             for ci in cut_indices
                         ]))
-                        # Score 2: Penalty for tiny word fragments (< 1.4 * L_0) vs reward for balanced column widths
                         tiny_pen = float(np.mean(seg_ws < int(1.4 * L_0))) * 0.65
                         giant_pen = 0.45 if np.max(seg_ws) > int(16.0 * L_0) else 0.0
                         sc_val = gutter_flat - tiny_pen - giant_pen
@@ -754,7 +1124,6 @@ class ViselDetector:
                     if depth <= 6:
                         roi_gm = grad_max[ry : ry + rh, rx : rx + rw]
                         roi_bi = barrier_inv[ry : ry + rh, rx : rx + rw]
-                        # Single-Pass Balanced 2D Sub-Block Decomposition (calibrated by L_0 & stroke_thr)
                         t_thr = max(24, int(stroke_thr * 1.55))
                         kw_sub = max(8, int(0.65 * L_0))
                         kh_sub = 2
@@ -805,7 +1174,7 @@ class ViselDetector:
                             refine_region(rx + be_t, ry, rw - be_t, rh, depth + 1)
                         return
 
-            if (rw <= int(10 * s) and rh >= int(44 * s)) or (rh <= int(5 * s) and rw >= int(65 * s)):
+            if (rw <= int(10 * s) and rh >= int(44 * s)) or (rh <= int(4 * s) and rw >= int(65 * s)):
                 return
 
             pad_x1, pad_y1 = max(0, rx - 6), max(0, ry - 6)
@@ -818,27 +1187,56 @@ class ViselDetector:
                 min_dx_mean = 1.5 / max(0.85, s * 0.85)
             else:
                 min_dx_mean = 4.2
-            if not is_micro_icon and float(cv2.mean(dx[ry : ry + rh, rx : rx + rw])[0]) < min_dx_mean:
-                return
-
+            mean_dx_val = float(cv2.mean(dx[ry : ry + rh, rx : rx + rw])[0])
             _, max_g, _, _ = cv2.minMaxLoc(grad_max[ry : ry + rh, rx : rx + rw])
             min_g_thr = 60 if is_micro_icon else (85 if is_single_char_ui else (42 if local_flat >= 0.58 else 58))
-            if max_g < min_g_thr:
-                return
 
             active_cols = np.count_nonzero(is_ink)
             mean_ink_col = float(col_proj.sum()) / float(max(1, active_cols))
-            if rh >= int(18 * s) and rw >= int(80 * s) and mean_ink_col < 2.5:
-                return
-            if is_micro_icon and local_flat < 0.58:
-                return
-            if is_single_char_ui and (rw < 6 or rh < 6 or (rw <= 9 and rh <= 8)):
-                if local_flat < 0.74 or max_g < 95:
-                    return
-            if local_flat < 0.48 and max_g < 72:
-                return
-            if local_flat < 0.34:
-                if max_g < 140 or rw < 24:
+
+            # Check standard v8 filters first (0.0 ms overhead for normal boxes)
+            std_pass = True
+            if not is_micro_icon and mean_dx_val < min_dx_mean:
+                std_pass = False
+            elif max_g < min_g_thr:
+                std_pass = False
+            elif rh >= int(18 * s) and rw >= int(80 * s) and mean_ink_col < 2.5:
+                std_pass = False
+            elif is_micro_icon and local_flat < 0.58:
+                std_pass = False
+            elif is_single_char_ui and (rw < 6 or rh < 6 or (rw <= 9 and rh <= 8)) and (local_flat < 0.74 or max_g < 95):
+                std_pass = False
+            elif local_flat < 0.48 and max_g < 72:
+                std_pass = False
+            elif local_flat < 0.34 and (max_g < 140 or rw < 24):
+                std_pass = False
+
+            glyph_words: Optional[List[Tuple[int, int]]] = None
+            if not std_pass:
+                # 1D Contextual Glyph-Chain Rescue (`[L, L, ?, L, L]`):
+                # If a small/zoomed-out/muted text strip failed the hard gradient/flatness cutoffs,
+                # check if it forms a high-confidence collinear glyph chain!
+                if (
+                    not is_micro_icon
+                    and not is_single_char_ui
+                    and rw >= max(14, int(1.6 * rh))
+                    and rh <= max(34, int(2.2 * L_0))
+                    and local_flat >= 0.26
+                    and max_g >= 36
+                    and mean_dx_val >= 2.2
+                ):
+                    chain_conf, gw = self._score_and_segment_glyph_chain(
+                        gray[ry : ry + rh, rx : rx + rw],
+                        dx[ry : ry + rh, rx : rx + rw],
+                        dy[ry : ry + rh, rx : rx + rw],
+                        roi_s,
+                        L_0,
+                    )
+                    if chain_conf >= 0.62 and len(gw) >= 1:
+                        glyph_words = gw
+                    else:
+                        return
+                else:
                     return
 
             total_stroke = int(col_proj.sum())
@@ -870,39 +1268,49 @@ class ViselDetector:
                 return
 
             word_children = []
-            if kind in ("text_block", "text_link", "inline_link") and len(starts) >= 2 and rh <= int(56 * s):
-                w_gap_thr = max(3, int(rh * 0.16))
-                w_splits = np.flatnonzero((starts[1:] - ends[:-1]) >= w_gap_thr)
-                if len(w_splits) >= 1:
-                    w_idx_starts = np.concatenate(([0], w_splits + 1))
-                    w_idx_ends = np.concatenate((w_splits, [len(starts) - 1]))
-                    raw_words = []
-                    for is0, ie0 in zip(w_idx_starts, w_idx_ends):
-                        wx0, wx1 = int(starts[is0]), int(ends[ie0])
-                        if wx1 - wx0 >= 4:
-                            raw_words.append((wx0, wx1))
-                    if len(raw_words) >= 2:
-                        w_hints = generate_vimium_hints(len(raw_words))
-                        for wi, (wx0, wx1) in enumerate(raw_words):
-                            ww = wx1 - wx0
-                            is_lead_icon = (
-                                wi == 0
-                                and rh >= 14
-                                and 0.65 <= ww / float(rh) <= 1.40
-                                and (raw_words[1][0] - wx1) >= max(5, int(rh * 0.25))
-                            )
-                            word_children.append(
-                                {
-                                    "x": int((rx + wx0) * scale_back),
-                                    "y": int(ry * scale_back),
-                                    "w": int(ww * scale_back),
-                                    "h": int(rh * scale_back),
-                                    "score": round(score, 2),
-                                    "kind": "icon" if is_lead_icon else "word",
-                                    "level": "control" if is_lead_icon else "word",
-                                    "hint": w_hints[wi],
-                                }
-                            )
+            if kind in ("text_block", "text_link", "inline_link") and rh <= int(56 * s) and (len(starts) >= 2 or rw >= max(18, int(rh * 2.2))):
+                if glyph_words is None:
+                    _, glyph_words = self._score_and_segment_glyph_chain(
+                        gray[ry : ry + rh, rx : rx + rw],
+                        dx[ry : ry + rh, rx : rx + rw],
+                        dy[ry : ry + rh, rx : rx + rw],
+                        roi_s,
+                        L_0,
+                    )
+                raw_words = glyph_words
+                if len(raw_words) < 2 and len(starts) >= 2:
+                    w_gap_thr = max(2 if rh <= max(13, int(0.95 * L_0)) else 3, int(rh * 0.15))
+                    w_splits = np.flatnonzero((starts[1:] - ends[:-1]) >= w_gap_thr)
+                    if len(w_splits) >= 1:
+                        w_idx_starts = np.concatenate(([0], w_splits + 1))
+                        w_idx_ends = np.concatenate((w_splits, [len(starts) - 1]))
+                        raw_words = [
+                            (int(starts[is0]), int(ends[ie0]))
+                            for is0, ie0 in zip(w_idx_starts, w_idx_ends)
+                            if int(ends[ie0] - starts[is0]) >= 3
+                        ]
+                if len(raw_words) >= 2:
+                    w_hints = generate_vimium_hints(len(raw_words))
+                    for wi, (wx0, wx1) in enumerate(raw_words):
+                        ww = wx1 - wx0
+                        is_lead_icon = (
+                            wi == 0
+                            and rh >= 14
+                            and 0.65 <= ww / float(rh) <= 1.40
+                            and (raw_words[1][0] - wx1) >= max(5, int(rh * 0.25))
+                        )
+                        word_children.append(
+                            {
+                                "x": int((rx + wx0) * scale_back),
+                                "y": int(ry * scale_back),
+                                "w": max(1, int(ww * scale_back)),
+                                "h": max(1, int(rh * scale_back)),
+                                "score": round(score, 2),
+                                "kind": "icon" if is_lead_icon else "word",
+                                "level": "control" if is_lead_icon else "word",
+                                "hint": w_hints[wi],
+                            }
+                        )
 
             if inside_frame:
                 inner_frame_children.append([rx, ry, rw, rh, score, kind, level, word_children])
@@ -1009,7 +1417,6 @@ class ViselDetector:
                             if 1.45 <= med_w / float(med_h) <= 2.05 and len(col_xs) >= 2:
                                 known_16_9_grids.append((med_w, med_h, pitch, col_xs))
 
-            # Cross-row 16:9 completion for single-card rows sharing the exact card template & column X-stop
             for sh_list in shelves:
                 if len(sh_list) == 1 and known_16_9_grids:
                     t_first = sh_list[0]
@@ -1032,8 +1439,6 @@ class ViselDetector:
                                         abs(rb[0] - gx) <= int(45 * s) and 0 <= rb[1] - (ty + gh) <= int(28 * s) and rb[2] >= int(50 * s)
                                         for rb in refined_boxes
                                     )
-                                    roi_fl = flat_pix[ty + 4 : ty + gh - 4, gx + 4 : gx + gw - 4]
-                                    fl_r = cv2.countNonZero(roi_fl) / float(max(1, roi_fl.size))
                                     if roi_g.size > 0 and (float(roi_g.std()) >= 18.0 or (float(roi_g.std()) >= 11.0 and has_caption_below)):
                                         new_grid_thumbs.append([gx, ty, gw, gh, 0.92, "thumbnail", "control", []])
                                 break
@@ -1118,8 +1523,8 @@ class ViselDetector:
             return {
                 "x": int(bx * scale_back),
                 "y": int(by * scale_back),
-                "w": int(bw * scale_back),
-                "h": int(bh * scale_back),
+                "w": max(1, int(bw * scale_back)),
+                "h": max(1, int(bh * scale_back)),
                 "score": round(float(bsc), 2),
                 "kind": str(bkd),
                 "level": str(blv),
@@ -1339,6 +1744,7 @@ class ViselDetector:
         if collapse_paragraphs and include_text:
             # User-Designed Structural Paragraph Engine:
             # 1. Consolidate collinear same-line fragments (inline links, highlighted terms, badges on same row)
+            #    and flatten each fragment's word children so `paragraph -> line -> word` never buries words 3 levels deep.
             line_consolidated = []
             rem_rbs.sort(key=lambda b: (b[1], b[0]))
             used_cons = set()
@@ -1358,9 +1764,7 @@ class ViselDetector:
                         continue
                     v_overlap = min(rbi[1] + rbi[3], rbj[1] + rbj[3]) - max(rbi[1], rbj[1])
                     h_gap = rbj[0] - max(rem_rbs[k][0] + rem_rbs[k][2] for k in same_row)
-                    # Collinear if high vertical overlap on same baseline and reasonable word/tag gap
                     if v_overlap >= 0.70 * min(rbi[3], rbj[3]) and 0 <= h_gap <= max(18, int(1.8 * L_0)):
-                        # Check no vertical barrier cuts between them
                         if not np.any(v_pure_gray[max(rbi[1], rbj[1]):min(rbi[1]+rbi[3], rbj[1]+rbj[3]), rbj[0]-h_gap:rbj[0]].mean(axis=0) >= 0.55):
                             same_row.append(j)
                             used_cons.add(j)
@@ -1371,23 +1775,39 @@ class ViselDetector:
                     ly = min(rem_rbs[k][1] for k in same_row)
                     lw = max(rem_rbs[k][0] + rem_rbs[k][2] for k in same_row) - lx
                     lh = max(rem_rbs[k][1] + rem_rbs[k][3] for k in same_row) - ly
-                    c_hints = generate_vimium_hints(len(same_row))
-                    frag_children = [
-                        make_child_dict(
-                            rem_rbs[k][0], rem_rbs[k][1], rem_rbs[k][2], rem_rbs[k][3],
-                            rem_rbs[k][4], rem_rbs[k][5], "word" if rem_rbs[k][5] != "inline_link" else "control",
-                            c_hints[ci], rem_rbs[k][7]
-                        )
-                        for ci, k in enumerate(same_row)
-                    ]
-                    line_consolidated.append([lx, ly, lw, lh, 0.85, "text_block", "line", frag_children])
+                    flat_words: List[Dict[str, Any]] = []
+                    for k in same_row:
+                        sub_words = rem_rbs[k][7]
+                        if sub_words:
+                            for sw in sub_words:
+                                flat_words.append(dict(sw))
+                        else:
+                            flat_words.append(
+                                make_child_dict(
+                                    rem_rbs[k][0],
+                                    rem_rbs[k][1],
+                                    rem_rbs[k][2],
+                                    rem_rbs[k][3],
+                                    rem_rbs[k][4],
+                                    "word" if rem_rbs[k][5] != "inline_link" else "inline_link",
+                                    "word" if rem_rbs[k][5] != "inline_link" else "control",
+                                    "",
+                                    [],
+                                )
+                            )
+                    for fw_item, h_str in zip(flat_words, generate_vimium_hints(len(flat_words))):
+                        fw_item["hint"] = h_str
+                    line_consolidated.append([lx, ly, lw, lh, 0.85, "text_block", "line", flat_words])
 
             rem_rbs = line_consolidated
 
             # 2. Structural Paragraph Chaining (Straight left edge, uniform line height, uniform vertical pitch, ragged right)
             text_line_indices = [
                 i for i, rb in enumerate(rem_rbs)
-                if rb[5] in ("text_block", "text_link") and rb[2] >= int(3.5 * L_0) and rb[3] <= int(2.4 * L_0)
+                if rb[5] in ("text_block", "text_link")
+                and rb[2] >= int(3.5 * L_0)
+                and rb[3] <= int(2.4 * L_0)
+                and not (rb[7] and rb[7][0].get("kind") == "icon")
             ]
             text_line_indices.sort(key=lambda idx: (rem_rbs[idx][1], rem_rbs[idx][0]))
             merged_tb = set()
@@ -1407,18 +1827,15 @@ class ViselDetector:
                     if idx2 in merged_tb:
                         continue
                     cand = rem_rbs[idx2]
-                    # Invariant 1: Straight left edge (margin alignment within 9px / 0.45*L0)
                     left_diff = abs(cand[0] - curr_left)
-                    # Invariant 2: Similar text line height (within 5px / 0.25*L0)
                     h_diff = abs(cand[3] - curr_h)
-                    # Invariant 3: Tight, uniform vertical gutter
                     v_gap = cand[1] - (curr[1] + curr[3])
 
+                    max_v_gap = min(max(14, int(0.78 * L_0)), max(5, int(curr_h * 0.85)))
                     if left_diff <= max(9, int(0.48 * L_0)) and h_diff <= max(5, int(0.25 * L_0)):
-                        if 1 <= v_gap <= max(14, int(0.78 * L_0)):
+                        if 1 <= v_gap <= max_v_gap:
                             pitch = v_gap
                             if prev_pitch is None or abs(pitch - prev_pitch) <= max(4, int(0.24 * L_0)):
-                                # Invariant 4: No horizontal structural divider line cutting through the paragraph
                                 if not np.any(h_pure_gray[curr[1]+curr[3]:cand[1], min(curr[0], cand[0]):min(curr[0]+curr[2], cand[0]+cand[2])].mean(axis=1) >= 0.55):
                                     chain_tb.append(idx2)
                                     merged_tb.add(idx2)
@@ -1559,8 +1976,8 @@ class ViselDetector:
             UITarget(
                 int(b[0] * scale_back),
                 int(b[1] * scale_back),
-                int(b[2] * scale_back),
-                int(b[3] * scale_back),
+                max(1, int(b[2] * scale_back)),
+                max(1, int(b[3] * scale_back)),
                 float(b[4]),
                 str(b[5]),
                 level=str(b[6]),
@@ -1673,7 +2090,7 @@ def render_drilldown_overlay(bgr: np.ndarray, parent: UITarget, to_words: bool =
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visel v7 Vision-Refined Structure-Aware Hierarchical UI Detector")
+    parser = argparse.ArgumentParser(description="Visel v9 Contextual Glyph-Chain & Structure-Aware UI Detector")
     parser.add_argument("input", nargs="?", help="Path to input screenshot PNG/JPG")
     parser.add_argument("-o", "--output", help="Path to save annotated Vimium overlay PNG")
     parser.add_argument("--json", help="Path to save detected hint targets (with children) as JSON")

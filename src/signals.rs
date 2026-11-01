@@ -122,13 +122,20 @@ fn calibrate(grad_max: &Mat) -> opencv::Result<Physics> {
     let s_bin = threshold(grad_max, stroke_thr as f64, 255.0, false)?;
     let s_closed = morph(&s_bin, imgproc::MORPH_CLOSE, &kernel(12, 2)?)?;
     let mut heights = Vec::new();
+    let mut small_heights = Vec::new();
     for c in contours(&s_closed, imgproc::RETR_EXTERNAL)? {
         let bb = imgproc::bounding_rect(&c)?;
         let (bw, bh) = (bb.width, bb.height);
         if (9..=32).contains(&bh) && bw as f64 >= bh as f64 * 2.2 && bw as f64 <= w as f64 * 0.45 {
             heights.push(bh);
+        } else if (6..9).contains(&bh)
+            && bw as f64 >= bh as f64 * 2.5
+            && bw as f64 <= w as f64 * 0.45
+        {
+            small_heights.push(bh);
         }
     }
+    let small_mode = heights.len() < 8 && heights.len() + small_heights.len() >= 8;
     let mut l0 = if heights.len() >= 8 {
         let mut counts = vec![0_u64; 36];
         for &bh in &heights {
@@ -146,10 +153,28 @@ fn calibrate(grad_max: &Mat) -> opencv::Result<Physics> {
         let modal_h = (8 + best) as f64;
         let med_h = median(&heights);
         0.6 * modal_h + 0.4 * med_h
+    } else if heights.len() + small_heights.len() >= 8 {
+        let mut all = heights;
+        all.extend(small_heights);
+        let mut counts = [0_u64; 36];
+        for &bh in &all {
+            counts[bh as usize] += 1;
+        }
+        let best = (0..27)
+            .max_by_key(|&i| {
+                (
+                    counts[6 + i] + counts[5 + i] + counts[7 + i],
+                    std::cmp::Reverse(i),
+                )
+            })
+            .unwrap();
+        (0.6 * (6 + best) as f64 + 0.4 * median(&all)).clamp(8.5, 26.0)
     } else {
         16.0 * ((w * h) as f64 / (1440.0 * 900.0)).sqrt().clamp(0.70, 1.60)
     };
-    l0 = l0.clamp(11.5, 26.0);
+    if !small_mode {
+        l0 = l0.clamp(11.5, 26.0);
+    }
     let u = (l0 / 16.0).clamp(0.68, 1.75);
     Ok(Physics {
         noise_floor,
@@ -353,10 +378,22 @@ pub fn prepare(bgr: &Mat, options: Options) -> opencv::Result<State> {
         scale_back = orig_w as f64 / 2560.0;
         &resized
     } else if orig_w < 1440 {
-        let work_h = ((orig_h as f64 * (1600.0 / orig_w as f64)).round_ties_even() as i32).max(1);
-        resized = resize(bgr, 1600, work_h, imgproc::INTER_CUBIC)?;
-        scale_back = orig_w as f64 / 1600.0;
-        &resized
+        let mut work_w = 1600;
+        if orig_h as f64 > orig_w as f64 * 1.25
+            && (orig_h as f64 * (1600.0 / orig_w as f64)).round_ties_even() as i32 > 1800
+        {
+            work_w =
+                orig_w.max((orig_w as f64 * (1800.0 / orig_h as f64)).round_ties_even() as i32);
+        }
+        if work_w != orig_w {
+            let work_h =
+                ((orig_h as f64 * (work_w as f64 / orig_w as f64)).round_ties_even() as i32).max(1);
+            resized = resize(bgr, work_w, work_h, imgproc::INTER_CUBIC)?;
+            scale_back = orig_w as f64 / work_w as f64;
+            &resized
+        } else {
+            bgr
+        }
     } else {
         bgr
     };

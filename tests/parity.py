@@ -202,6 +202,17 @@ def fixtures(quick):
     texture(340, 400, 240, 135)
     texture(600, 400, 240, 135)
     yield "media-shelf", shelf
+    # Portrait input must not inflate a narrow crop to a 1600px-wide working image.
+    portrait = np.full((1200, 400, 3), 246, np.uint8)
+    for row in range(18):
+        text(portrait, "Narrow words in a portrait view", 20, 32 + row * 46, 0.43)
+    yield "portrait-small-text", portrait
+    # Closely spaced small-font lines exercise direct-ink valleys and line bands.
+    tiny = np.full((900, 1440, 3), 38, np.uint8)
+    for row in range(12):
+        text(tiny, "Small glyph chain with words and spacing", 140, 110 + row * 16,
+             0.31, (158, 158, 158))
+    yield "tiny-glyph-chain", tiny
 
 
 @dataclass(frozen=True)

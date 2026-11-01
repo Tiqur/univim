@@ -510,17 +510,23 @@ pub fn compose(
             let ly = same_row.iter().map(|&k| rem_rbs[k].y).min().unwrap();
             let lw = same_row.iter().map(|&k| rem_rbs[k].right()).max().unwrap() - lx;
             let lh = same_row.iter().map(|&k| rem_rbs[k].bottom()).max().unwrap() - ly;
-            let fragment_hints = hints(same_row.len());
             let mut line = Target::new(lx, ly, lw, lh, 0.85, "text_block", "line");
-            for (&k, hint) in same_row.iter().zip(fragment_hints) {
+            for &k in &same_row {
                 let fragment = &rem_rbs[k];
-                let level = if fragment.kind == "inline_link" {
-                    "control"
+                if !fragment.children.is_empty() {
+                    line.children.extend(fragment.children.iter().cloned());
                 } else {
-                    "word"
-                };
-                line.children
-                    .push(make_child(fragment, &fragment.kind, level, &hint));
+                    let (kind, level) = if fragment.kind == "inline_link" {
+                        ("inline_link", "control")
+                    } else {
+                        ("word", "word")
+                    };
+                    line.children.push(make_child(fragment, kind, level, ""));
+                }
+            }
+            let labels = hints(line.children.len());
+            for (item, label) in line.children.iter_mut().zip(labels) {
+                item["hint"] = serde_json::json!(label);
             }
             line_consolidated.push(line);
         }
@@ -532,8 +538,14 @@ pub fn compose(
             .filter_map(|(i, rb)| {
                 (matches!(rb.kind.as_str(), "text_block" | "text_link")
                     && rb.w >= (3.5 * state.l0) as i32
-                    && rb.h <= (2.4 * state.l0) as i32)
-                    .then_some(i)
+                    && rb.h <= (2.4 * state.l0) as i32
+                    && rb
+                        .children
+                        .first()
+                        .and_then(|c| c.get("kind"))
+                        .and_then(|v| v.as_str())
+                        != Some("icon"))
+                .then_some(i)
             })
             .collect();
         text_line_indices.sort_by_key(|&i| (rem_rbs[i].y, rem_rbs[i].x));
@@ -561,7 +573,10 @@ pub fn compose(
                 let v_gap = candidate.y - curr.bottom();
                 if left_diff > 9.max((0.48 * state.l0) as i32)
                     || h_diff > 5.max((0.25 * state.l0) as i32)
-                    || !(1..=14.max((0.78 * state.l0) as i32)).contains(&v_gap)
+                    || !(1..=14
+                        .max((0.78 * state.l0) as i32)
+                        .min(5.max((curr_h as f64 * 0.85) as i32)))
+                        .contains(&v_gap)
                 {
                     continue;
                 }
@@ -747,8 +762,8 @@ pub fn compose(
         .map(|mut t| {
             t.x = (t.x as f64 * scale_back) as i32;
             t.y = (t.y as f64 * scale_back) as i32;
-            t.w = (t.w as f64 * scale_back) as i32;
-            t.h = (t.h as f64 * scale_back) as i32;
+            t.w = ((t.w as f64 * scale_back) as i32).max(1);
+            t.h = ((t.h as f64 * scale_back) as i32).max(1);
             t
         })
         .collect();

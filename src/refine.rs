@@ -129,7 +129,7 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
                 && (10.max((12. * s) as i32)..=34.max((40. * s) as i32)).contains(&rh)))
             && depth <= 3;
         let is_single_char_ui = (4..=12).contains(&rw) && (7..=22).contains(&rh) && depth <= 3;
-        if !is_micro_icon && !is_single_char_ui && (rw < 6 || rh < 6 || (rw <= 9 && rh <= 8)) {
+        if !is_micro_icon && !is_single_char_ui && (rw < 6 || rh < 5 || (rw <= 9 && rh <= 7)) {
             return Ok(());
         }
 
@@ -137,55 +137,82 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
         // a sustained blank run to avoid cutting through internal detail.
         let icon_guard_w = 36.max((38. * s) as i32);
         let icon_guard_h = 34.max((36. * s) as i32);
-        if rh >= 18.max((20. * s) as i32) {
-            let v_thr = if rw >= (160. * s) as i32
-                && *row_proj.iter().max().unwrap() >= (80. * s) as i32 as u64
-            {
-                2.max((rw as f64 * 0.015) as i32)
-            } else {
-                0
-            };
-            let active: Vec<bool> = row_proj.iter().map(|&v| v > v_thr as u64).collect();
-            let regions = runs(&active);
-            if regions.len() >= 2 {
-                let min_v_gap = if rw <= icon_guard_w && rh <= icon_guard_h {
-                    6
+        if rh >= 13.max((1.05 * l0) as i32) {
+            if rh >= 18.max((20. * s) as i32) {
+                let v_thr = if rw >= (160. * s) as i32
+                    && *row_proj.iter().max().unwrap() >= (80. * s) as i32 as u64
+                {
+                    2.max((rw as f64 * 0.015) as i32)
                 } else {
-                    1
+                    0
                 };
-                let split: Vec<bool> = regions
-                    .windows(2)
-                    .map(|pair| pair[1].0 - pair[0].1 >= min_v_gap as usize)
-                    .collect();
-                if split.iter().any(|&v| v) {
-                    let mut band_starts = vec![regions[0].0];
-                    band_starts.extend(
-                        regions[1..]
+                let active: Vec<bool> = row_proj.iter().map(|&v| v > v_thr as u64).collect();
+                let regions = runs(&active);
+                if regions.len() >= 2 {
+                    let min_v_gap = if rw <= icon_guard_w && rh <= icon_guard_h {
+                        6
+                    } else {
+                        1
+                    };
+                    let split: Vec<bool> = regions
+                        .windows(2)
+                        .map(|pair| pair[1].0 - pair[0].1 >= min_v_gap as usize)
+                        .collect();
+                    if split.iter().any(|&v| v) {
+                        let mut band_starts = vec![regions[0].0];
+                        band_starts.extend(
+                            regions[1..]
+                                .iter()
+                                .zip(&split)
+                                .filter_map(|(region, &cut)| cut.then_some(region.0)),
+                        );
+                        let mut band_ends: Vec<usize> = regions[..regions.len() - 1]
                             .iter()
                             .zip(&split)
-                            .filter_map(|(region, &cut)| cut.then_some(region.0)),
-                    );
-                    let mut band_ends: Vec<usize> = regions[..regions.len() - 1]
-                        .iter()
-                        .zip(&split)
-                        .filter_map(|(region, &cut)| cut.then_some(region.1))
-                        .collect();
-                    band_ends.push(regions.last().unwrap().1);
-                    if band_starts.len() >= 2 {
-                        for (&bs, &be) in band_starts.iter().zip(&band_ends) {
-                            if be > bs {
-                                refine_region(
-                                    state,
-                                    options,
-                                    (rx, ry + bs as i32, rw, (be - bs) as i32),
-                                    depth + 1,
-                                    refined,
-                                    inner,
-                                )?;
+                            .filter_map(|(region, &cut)| cut.then_some(region.1))
+                            .collect();
+                        band_ends.push(regions.last().unwrap().1);
+                        if band_starts.len() >= 2 {
+                            for (&bs, &be) in band_starts.iter().zip(&band_ends) {
+                                if be > bs {
+                                    refine_region(
+                                        state,
+                                        options,
+                                        (rx, ry + bs as i32, rw, (be - bs) as i32),
+                                        depth + 1,
+                                        refined,
+                                        inner,
+                                    )?;
+                                }
                             }
+                            return Ok(());
                         }
-                        return Ok(());
                     }
+                }
+            }
+            if rw > icon_guard_w && rh <= (3.4 * l0) as i32 && rw >= (2.2 * rh as f64) as i32 {
+                let bands = crate::glyph::foreground_line_bands(
+                    state,
+                    rx,
+                    ry,
+                    rw,
+                    rh,
+                    5.max((0.36 * l0) as i32),
+                )?;
+                if bands.len() >= 2 {
+                    for (bs, be) in bands {
+                        if be - bs >= 4 {
+                            refine_region(
+                                state,
+                                options,
+                                (rx, ry + bs, rw, be - bs),
+                                depth + 1,
+                                refined,
+                                inner,
+                            )?;
+                        }
+                    }
+                    return Ok(());
                 }
             }
         }
@@ -540,7 +567,7 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
         }
 
         if (rw <= (10. * s) as i32 && rh >= (44. * s) as i32)
-            || (rh <= (5. * s) as i32 && rw >= (65. * s) as i32)
+            || (rh <= (4. * s) as i32 && rw >= (65. * s) as i32)
         {
             return Ok(());
         }
@@ -557,15 +584,10 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
             } else {
                 4.2
             };
-        if !is_micro_icon
-            && core::mean(
-                &Mat::roi(&state.dx, core::Rect::new(rx, ry, rw, rh))?,
-                &core::no_array(),
-            )?[0]
-                < min_dx_mean
-        {
-            return Ok(());
-        }
+        let mean_dx = core::mean(
+            &Mat::roi(&state.dx, core::Rect::new(rx, ry, rw, rh))?,
+            &core::no_array(),
+        )?[0];
         let max_g = crate::max_roi(&state.grad_max, rx, ry, rw, rh)?;
         let min_g_thr = if is_micro_icon {
             60.
@@ -576,29 +598,35 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
         } else {
             58.
         };
-        if max_g < min_g_thr {
-            return Ok(());
-        }
         let active_cols = is_ink.iter().filter(|&&v| v).count();
         let total_stroke = col_proj.iter().sum::<u64>();
         let mean_ink_col = total_stroke as f64 / active_cols.max(1) as f64;
-        if rh >= (18. * s) as i32 && rw >= (80. * s) as i32 && mean_ink_col < 2.5 {
-            return Ok(());
-        }
-        if is_micro_icon && local_flat < 0.58 {
-            return Ok(());
-        }
-        if is_single_char_ui
-            && (rw < 6 || rh < 6 || (rw <= 9 && rh <= 8))
-            && (local_flat < 0.74 || max_g < 95.)
-        {
-            return Ok(());
-        }
-        if local_flat < 0.48 && max_g < 72. {
-            return Ok(());
-        }
-        if local_flat < 0.34 && (max_g < 140. || rw < 24) {
-            return Ok(());
+        let std_pass = (is_micro_icon || mean_dx >= min_dx_mean)
+            && max_g >= min_g_thr
+            && !(rh >= (18. * s) as i32 && rw >= (80. * s) as i32 && mean_ink_col < 2.5)
+            && (!is_micro_icon || local_flat >= 0.58)
+            && !(is_single_char_ui
+                && (rw < 6 || rh < 6 || (rw <= 9 && rh <= 8))
+                && (local_flat < 0.74 || max_g < 95.))
+            && !(local_flat < 0.48 && max_g < 72.)
+            && !(local_flat < 0.34 && (max_g < 140. || rw < 24));
+        let mut glyph_words = None;
+        if !std_pass {
+            if is_micro_icon
+                || is_single_char_ui
+                || rw < 14.max((1.6 * rh as f64) as i32)
+                || rh > 34.max((2.2 * l0) as i32)
+                || local_flat < 0.26
+                || max_g < 36.
+                || mean_dx < 2.2
+            {
+                return Ok(());
+            }
+            let (confidence, words) = crate::glyph::score_and_segment(state, rx, ry, rw, rh)?;
+            if confidence < 0.62 || words.is_empty() {
+                return Ok(());
+            }
+            glyph_words = Some(words);
         }
 
         let is_accent = total_blue >= 8.max((total_stroke as f64 * 0.22) as u64) && rw >= 24;
@@ -625,45 +653,56 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
         // Word children describe gaps within an accepted text target rather
         // than independent detections; only their serialized geometry is scaled.
         if matches!(kind, "text_block" | "text_link" | "inline_link")
-            && ink_runs.len() >= 2
             && rh <= (56. * s) as i32
+            && (ink_runs.len() >= 2 || rw >= 18.max((rh as f64 * 2.2) as i32))
         {
-            let w_gap_thr = 3.max((rh as f64 * 0.16) as i32) as usize;
-            let splits: Vec<usize> = (0..ink_runs.len() - 1)
-                .filter(|&i| ink_runs[i + 1].0 - ink_runs[i].1 >= w_gap_thr)
-                .collect();
-            if !splits.is_empty() {
-                let mut raw_words = Vec::new();
-                let mut start = 0;
-                for end in splits
-                    .into_iter()
-                    .chain(std::iter::once(ink_runs.len() - 1))
-                {
-                    let (wx0, wx1) = (ink_runs[start].0, ink_runs[end].1);
-                    if wx1 - wx0 >= 4 {
-                        raw_words.push((wx0, wx1));
+            let mut raw_words = if let Some(words) = glyph_words {
+                words
+            } else {
+                crate::glyph::score_and_segment(state, rx, ry, rw, rh)?.1
+            };
+            if raw_words.len() < 2 && ink_runs.len() >= 2 {
+                let w_gap_thr = (if rh <= 13.max((0.95 * l0) as i32) {
+                    2
+                } else {
+                    3
+                })
+                .max((rh as f64 * 0.15) as i32) as usize;
+                let splits: Vec<_> = (0..ink_runs.len() - 1)
+                    .filter(|&i| ink_runs[i + 1].0 - ink_runs[i].1 >= w_gap_thr)
+                    .collect();
+                if !splits.is_empty() {
+                    raw_words.clear();
+                    let mut start = 0;
+                    for end in splits
+                        .into_iter()
+                        .chain(std::iter::once(ink_runs.len() - 1))
+                    {
+                        if ink_runs[end].1 - ink_runs[start].0 >= 3 {
+                            raw_words.push((ink_runs[start].0 as i32, ink_runs[end].1 as i32));
+                        }
+                        start = end + 1;
                     }
-                    start = end + 1;
                 }
-                if raw_words.len() >= 2 {
-                    let word_hints = hints(raw_words.len());
-                    for (wi, &(wx0, wx1)) in raw_words.iter().enumerate() {
-                        let ww = wx1 - wx0;
-                        let is_lead_icon = wi == 0
-                            && rh >= 14
-                            && (0.65..=1.40).contains(&(ww as f64 / rh as f64))
-                            && raw_words[1].0 - wx1 >= 5.max((rh as f64 * 0.25) as i32) as usize;
-                        target.children.push(json!({
-                            "x": ((rx + wx0 as i32) as f64 * state.scale_back) as i32,
-                            "y": (ry as f64 * state.scale_back) as i32,
-                            "w": (ww as f64 * state.scale_back) as i32,
-                            "h": (rh as f64 * state.scale_back) as i32,
-                            "score": score,
-                            "kind": if is_lead_icon { "icon" } else { "word" },
-                            "level": if is_lead_icon { "control" } else { "word" },
-                            "hint": word_hints[wi],
-                        }));
-                    }
+            }
+            if raw_words.len() >= 2 {
+                let word_hints = hints(raw_words.len());
+                for (wi, &(wx0, wx1)) in raw_words.iter().enumerate() {
+                    let ww = wx1 - wx0;
+                    let is_lead_icon = wi == 0
+                        && rh >= 14
+                        && (0.65..=1.40).contains(&(ww as f64 / rh as f64))
+                        && raw_words[1].0 - wx1 >= 5.max((rh as f64 * 0.25) as i32);
+                    target.children.push(json!({
+                        "x": ((rx + wx0) as f64 * state.scale_back) as i32,
+                        "y": (ry as f64 * state.scale_back) as i32,
+                        "w": ((ww as f64 * state.scale_back) as i32).max(1),
+                        "h": ((rh as f64 * state.scale_back) as i32).max(1),
+                        "score": score,
+                        "kind": if is_lead_icon { "icon" } else { "word" },
+                        "level": if is_lead_icon { "control" } else { "word" },
+                        "hint": word_hints[wi],
+                    }));
                 }
             }
         }

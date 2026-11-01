@@ -3,7 +3,8 @@
 A native Rust/OpenCV port of the hierarchical screenshot navigation detector in
 `python.py`. It detects controls, text, thumbnails, icon-label compounds and
 paragraphs, generates Vimium-style hints, and keeps children for instant drill-down.
-The Rust executable does not invoke Python. The original Python file is unchanged.
+The Rust executable does not invoke Python. `python.py` remains the behavior
+reference; the v9 detector changes are implemented natively in Rust.
 
 ## Development
 
@@ -475,16 +476,18 @@ copy the working directory before that filter is evaluated. Prefer the ordinary
 Git-backed flake once new source files are tracked; `.gitignore` alone cannot
 prevent the initial `path:.` snapshot.
 
-The full differential suite passed **513 exact detection comparisons**, **513
-hint checks**, and **538 pixel-exact overlay comparisons**, including **25
-drill-down cases**. It uses 20 deterministic synthetic fixtures, with light/dark
-UI, paragraphs, blue links, controls, textures, noise, dense hints, and widths
-640 through 2880, including resize boundaries. All boolean option combinations
-and score boundaries are exercised. It checks list ordering, all coordinates,
-scores, kinds, levels, hints, nested children, and missing versus empty child keys.
-Timing fields are intentionally excluded. Nine detector unit tests additionally
-cover convolution alignment, runs, scaling, deduplication, hints and both
-drill-down modes. There are no numeric tolerances in detection/image comparisons.
+The full differential suite passed **561 exact detection comparisons**, **561
+hint checks**, and **585 pixel-exact overlay comparisons**, including **24
+drill-down cases**. It uses 22 deterministic synthetic fixtures, with light/dark
+UI, paragraphs, blue links, controls, textures, noise, dense hints, a portrait
+crop, a tiny glyph chain, and widths 640 through 2880, including resize
+boundaries. All boolean option combinations and score boundaries are exercised.
+It checks list ordering, all coordinates, scores, kinds, levels, hints, nested
+children, and missing versus empty child keys. Timing fields are intentionally
+excluded. Library unit tests additionally cover hint generation, both drill-down
+modes, flattening, and malformed externally supplied children; desktop modules
+have separate unit tests. There are no numeric tolerances in detection/image
+comparisons.
 
 These fixtures demonstrate exact agreement on the tested inputs, **not proof of
 equivalence for every real-world screenshot**. No real screenshot corpus was

@@ -8,6 +8,7 @@ use std::time::Instant;
 pub mod compose;
 #[cfg(target_os = "linux")]
 pub mod desktop;
+mod glyph;
 pub mod refine;
 pub mod render;
 pub mod signals;
@@ -99,7 +100,7 @@ pub fn hints_with_alphabet(n: usize, alphabet: &str) -> Vec<String> {
 pub fn child(t: &Target, scale: f64, kind: &str, level: &str, hint: &str) -> Value {
     // Decimal formatting rounds the represented binary value as Python round(x, 2).
     json!({"x":(t.x as f64*scale) as i32,"y":(t.y as f64*scale) as i32,
-        "w":(t.w as f64*scale) as i32,"h":(t.h as f64*scale) as i32,
+        "w":((t.w as f64*scale) as i32).max(1),"h":((t.h as f64*scale) as i32).max(1),
         "score":format!("{:.2}",t.score).parse::<f64>().unwrap(),"kind":kind,"level":level,"hint":hint,"children":t.children})
 }
 pub fn zeros(h: i32, w: i32) -> opencv::Result<Mat> {
@@ -565,24 +566,29 @@ pub fn detect_with_debug(
     )?;
     Ok((targets, debug, total))
 }
-/// Expand detector-produced children, retaining exactly one flattening level.
+/// Expand detector-produced children, recursively collecting leaves for word mode.
 /// Externally supplied children must follow the detector's JSON schema; malformed
 /// children return a deserialization error rather than panicking.
 pub fn drill_down(target: &Target, to_words: bool) -> Result<Vec<Target>, serde_json::Error> {
     if target.children.is_empty() {
         return Ok(vec![target.clone()]);
     }
-    let mut leaves = vec![];
-    for c in &target.children {
-        if to_words
-            && c.get("children")
-                .and_then(Value::as_array)
-                .is_some_and(|v| !v.is_empty())
-        {
-            leaves.extend(c["children"].as_array().unwrap().iter().cloned())
-        } else {
-            leaves.push(c.clone())
+    fn collect(nodes: &[Value], leaves: &mut Vec<Value>) {
+        for node in nodes {
+            if let Some(children) = node.get("children").and_then(Value::as_array)
+                && !children.is_empty()
+            {
+                collect(children, leaves);
+            } else {
+                leaves.push(node.clone());
+            }
         }
+    }
+    let mut leaves = vec![];
+    if to_words {
+        collect(&target.children, &mut leaves);
+    } else {
+        leaves.extend(target.children.iter().cloned());
     }
     let mut out = vec![];
     for mut c in leaves {
@@ -650,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn drilldown_flattens_exactly_one_level_and_applies_defaults() {
+    fn drilldown_collects_word_leaves_and_applies_defaults() {
         let leaf = json!({"x":1,"y":2,"w":3,"h":4});
         let mut parent = Target::new(0, 0, 100, 100, 0.9, "frame", "control");
         let mut line = leaf.clone();
@@ -661,8 +667,8 @@ mod tests {
         assert_eq!(immediate[0].x, 1);
         let words = drill_down(&parent, true).unwrap();
         assert_eq!(words.len(), 2);
-        assert_eq!(words[0].x, 5);
-        assert_eq!(words[0].children.len(), 1);
+        assert_eq!(words[0].x, 1);
+        assert!(words[0].children.is_empty());
         assert_eq!(words[1].kind, "word");
         assert_eq!(words[1].level, "word");
         assert_eq!(words[1].score, 0.85);
