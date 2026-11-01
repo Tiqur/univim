@@ -24,6 +24,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
@@ -77,8 +78,33 @@ const BTN_MIDDLE: u32 = 0x112;
 /// Interval between automatic pipeline re-captures when `F6` Continuous Loop mode is active.
 const AUTO_LOOP_INTERVAL: Duration = Duration::from_millis(650);
 
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_shutdown(_: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Install graceful SIGTERM/SIGINT handling before worker threads are spawned.
+/// Systemd restarts and logout otherwise terminate the process without running
+/// the socket cleanup at the end of `run_daemon`.
+fn install_shutdown_handlers() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    // SAFETY: the handler only performs an async-signal-safe atomic store.
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+    }
+}
+
 pub fn run_daemon(socket_path: &Path, settings: RuntimeSettings) -> Result<(), String> {
     ensure_wayland_and_hyprland_env();
+    install_shutdown_handlers();
 
     if let Some(parent) = socket_path.parent() {
         fs::DirBuilder::new()
@@ -272,7 +298,7 @@ fn daemon_loop(
     listener: &UnixListener,
     state: &mut DaemonState,
 ) -> Result<(), String> {
-    while !state.should_exit {
+    while !state.should_exit && !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
         event_queue
             .dispatch_pending(state)
             .map_err(|err| format!("Wayland dispatch failed: {err}"))?;
