@@ -221,7 +221,6 @@ services.univim = {
     hintsBind = "SUPER, F";
     gridBind = "SUPER, G";
     doubleTapCapsLock = false;
-    doubleTapF = false;
     evdev = true;
   };
 };
@@ -343,7 +342,10 @@ reticule to the nearest target; **Enter** clicks it. **;** or **Tab** cycles the
 click action, **v** starts a two-point drag, **Ctrl+W** toggles focused-window
 filtering, **Shift+J/K/H/L** or **Ctrl+D/U** scroll and re-capture, **F5**
 refreshes, **F6** toggles continuous refresh, **F1**/`?` opens live options, and
-**F2** opens the pipeline inspector. Grid mode first shows a 6x4 grid with
+**F2** opens the pipeline inspector. Its diagnostic views omit hint labels so
+the underlying image remains visible. With the evdev listener enabled, double-tap
+CapsLock for hints, hold Shift while double-tapping CapsLock for grid, or hold Alt
+while double-tapping CapsLock for the pipeline inspector. Grid mode first shows a 6x4 grid with
 single-character labels; the second label selects one of its 6x4 subcells and
 clicks the center.
 

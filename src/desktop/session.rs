@@ -193,8 +193,7 @@ pub enum Outcome {
     SaveSettings,
 }
 
-/// Speculative background detection cache populated on the first tap of `ff`, `gg`,
-/// or `CapsLock` so that the second tap within `double_tap_ms` renders with zero latency.
+/// Speculative detection cache populated on the first CapsLock tap.
 #[derive(Clone)]
 pub struct PrecomputedFrame {
     pub created_at: Instant,
@@ -221,9 +220,9 @@ impl PrecomputedFrame {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GestureKey {
-    F,
-    G,
     CapsLock,
+    Grid,
+    Debug,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,7 +233,7 @@ pub enum TapEvent {
     Activate,
 }
 
-/// Tracks single-tap warmup and double-tap activation across `f`, `g`, and `CapsLock`.
+/// Tracks modifier-specific CapsLock double taps.
 #[derive(Clone, Debug, Default)]
 pub struct TapTracker {
     last_key: Option<GestureKey>,
@@ -1033,12 +1032,20 @@ mod tests {
         );
         // Next tap starts a fresh cycle
         assert_eq!(
-            tracker.on_tap(GestureKey::F, Duration::from_millis(250)),
+            tracker.on_tap(GestureKey::Grid, Duration::from_millis(250)),
             TapEvent::Warmup
+        );
+        assert_eq!(
+            tracker.on_tap(GestureKey::Debug, Duration::from_millis(250)),
+            TapEvent::Warmup
+        );
+        assert_eq!(
+            tracker.on_tap(GestureKey::Debug, Duration::from_millis(250)),
+            TapEvent::Activate
         );
         tracker.on_other_key();
         assert_eq!(
-            tracker.on_tap(GestureKey::F, Duration::from_millis(250)),
+            tracker.on_tap(GestureKey::Grid, Duration::from_millis(250)),
             TapEvent::Warmup
         );
     }

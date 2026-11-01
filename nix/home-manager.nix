@@ -91,18 +91,12 @@ let
       ])
     );
   doubleTapBindings =
-    lib.optionals (cfg.hyprland.enable && (cfg.hyprland.doubleTapCapsLock || cfg.hyprland.doubleTapF)) (
+    lib.optionals (cfg.hyprland.enable && cfg.hyprland.doubleTapCapsLock) (
       (lib.optional cfg.hyprland.doubleTapCapsLock (
         if luaConfiguration then
           luaGestureBind ", Caps_Lock" "hl.dsp.global(\"univim:caps-lock\")"
         else
           ", CAPS, global, univim:caps-lock"
-      ))
-      ++ (lib.optional cfg.hyprland.doubleTapF (
-        if luaConfiguration then
-          luaGestureBind ", f" "hl.dsp.global(\"univim:tap-f\")"
-        else
-          ", f, global, univim:tap-f"
       ))
     );
 
@@ -250,7 +244,7 @@ in
       doubleTapMs = lib.mkOption {
         type = lib.types.int;
         default = 260;
-        description = "Maximum interval in milliseconds between the two taps of `ff` / `CapsLock`.";
+        description = "Maximum interval in milliseconds between CapsLock taps.";
       };
 
       cacheTtlMs = lib.mkOption {
@@ -289,16 +283,10 @@ in
         description = "Bind non-consuming CapsLock taps for instant hints on double-tap.";
       };
 
-      doubleTapF = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Bind non-consuming `f` taps for instant hints on double-tap.";
-      };
-
       evdev = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Listen passively on /dev/input/event* for chord-aware ff/gg/CapsLock gestures.";
+        description = "Listen passively on /dev/input/event* for modifier-aware CapsLock gestures.";
       };
     };
 

@@ -1,15 +1,5 @@
-//! Optional passive Linux `/dev/input/event*` listener for chord-aware `ff` / `gg`,
-//! double-tap `CapsLock`, and rolling `fd` / `jk` detection, plus `/dev/uinput`
-//! backspace cleanup and scroll wheel injection.
-//!
-//! Why this exists:
-//! - Double-tapping `CapsLock` (Linux `KEY_CAPSLOCK = 58`) is the ideal zero-side-effect
-//!   trigger: tapping `CapsLock` twice toggles CapsLock ON then immediately OFF, and emits
-//!   zero printable characters into the active window.
-//! - For `ff` / `gg`, tracking all keyboard keys allows a 250 ms pre-typing pause filter
-//!   so typing words like *"coffee"*, *"buffer"*, or *"diff"* never triggers hints, and if
-//!   `ff` is pressed intentionally from idle, `UinputEmitter::emit_backspaces(2)` can
-//!   erase the two `f` characters before the overlay appears.
+//! Optional passive Linux keyboard listener for double-CapsLock gestures and
+//! `/dev/uinput` scroll wheel injection.
 use super::session::{GestureKey, TapEvent, TapTracker};
 use std::{
     fs::{self, File, OpenOptions},
@@ -19,7 +9,7 @@ use std::{
         unix::fs::OpenOptionsExt,
     },
     path::PathBuf,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const EV_SYN: u16 = 0x00;
@@ -29,7 +19,6 @@ const SYN_REPORT: u16 = 0x00;
 const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
 
-const KEY_BACKSPACE: u16 = 14;
 const KEY_LEFTSHIFT: u16 = 42;
 const KEY_RIGHTSHIFT: u16 = 54;
 const KEY_LEFTCTRL: u16 = 29;
@@ -39,20 +28,7 @@ const KEY_RIGHTALT: u16 = 100;
 const KEY_LEFTMETA: u16 = 125;
 const KEY_RIGHTMETA: u16 = 126;
 
-const KEY_D: u16 = 32;
-const KEY_F: u16 = 33;
-const KEY_G: u16 = 34;
-const KEY_J: u16 = 36;
-const KEY_K: u16 = 37;
 const KEY_CAPSLOCK: u16 = 58;
-
-/// Minimum quiet period (no other alphanumeric keys pressed) required before the
-/// first `f` or `g` tap can start a double-tap sequence. Prevents mid-word double
-/// letters (`"coffee"`, `"office"`, `"buffer"`, `"egg"`) from triggering hints.
-const PRE_TAP_TYPING_COOLDOWN: Duration = Duration::from_millis(250);
-
-/// Maximum interval between `f` -> `d` or `j` -> `k` for rolling home-row chords.
-const ROLLING_CHORD_WINDOW: Duration = Duration::from_millis(120);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -70,8 +46,6 @@ pub struct EvdevKeyboardSet {
     ctrl_down: u8,
     alt_down: u8,
     meta_down: u8,
-    last_other_key_at: Option<Instant>,
-    pending_chord_lead: Option<(u16, Instant)>,
     uinput: Option<UinputEmitter>,
 }
 
@@ -95,8 +69,6 @@ impl EvdevKeyboardSet {
             ctrl_down: 0,
             alt_down: 0,
             meta_down: 0,
-            last_other_key_at: None,
-            pending_chord_lead: None,
             uinput: UinputEmitter::open().ok(),
         }
     }
@@ -111,14 +83,6 @@ impl EvdevKeyboardSet {
 
     pub fn files(&self) -> &[File] {
         &self.devices
-    }
-
-    /// Emit synthetic `KEY_BACKSPACE` taps via `/dev/uinput` to erase characters typed
-    /// during a bare `ff`, `fd`, or `jk` trigger in an unfocused text input.
-    pub fn emit_cleanup_backspaces(&mut self, count: usize) {
-        if let Some(uinput) = self.uinput.as_mut() {
-            let _ = uinput.emit_backspaces(count);
-        }
     }
 
     /// Emit synthetic mouse wheel scroll ticks via `/dev/uinput` (`REL_WHEEL` / `REL_HWHEEL`).
@@ -140,7 +104,6 @@ impl EvdevKeyboardSet {
         let mut out = Vec::new();
         let event_size = std::mem::size_of::<RawInputEvent>();
         let mut buf = [0u8; std::mem::size_of::<RawInputEvent>() * 16];
-        let mut cleanup_backspaces = 0usize;
 
         for file in &mut self.devices {
             loop {
@@ -182,144 +145,21 @@ impl EvdevKeyboardSet {
                                 (KEY_LEFTMETA | KEY_RIGHTMETA, 0) => {
                                     self.meta_down = self.meta_down.saturating_sub(1);
                                 }
-                                // Double-tap CapsLock: works immediately with zero typing cooldown
-                                // and never emits characters that need backspacing!
-                                (KEY_CAPSLOCK, 1)
-                                    if self.ctrl_down == 0
-                                        && self.alt_down == 0
-                                        && self.meta_down == 0 =>
-                                {
-                                    self.pending_chord_lead = None;
-                                    let ev = tap_tracker.on_tap(
-                                        GestureKey::CapsLock,
-                                        Duration::from_millis(double_tap_ms.max(40)),
-                                    );
-                                    out.push((GestureKey::CapsLock, ev));
-                                }
-                                // Bare `f` or `g` press
-                                (KEY_F, 1)
-                                    if self.shift_down == 0
-                                        && self.ctrl_down == 0
-                                        && self.alt_down == 0
-                                        && self.meta_down == 0 =>
-                                {
-                                    let now = Instant::now();
-                                    let in_typing_stream =
-                                        self.last_other_key_at.is_some_and(|t| {
-                                            now.saturating_duration_since(t)
-                                                < PRE_TAP_TYPING_COOLDOWN
-                                        });
-                                    if in_typing_stream {
-                                        tap_tracker.on_other_key();
-                                        self.pending_chord_lead = None;
-                                        self.last_other_key_at = Some(now);
+                                (KEY_CAPSLOCK, 1) if self.ctrl_down == 0 && self.meta_down == 0 => {
+                                    let key = if self.alt_down > 0 {
+                                        GestureKey::Debug
+                                    } else if self.shift_down > 0 {
+                                        GestureKey::Grid
                                     } else {
-                                        self.pending_chord_lead = Some((KEY_F, now));
-                                        let ev = tap_tracker.on_tap(
-                                            GestureKey::F,
-                                            Duration::from_millis(double_tap_ms.max(40)),
-                                        );
-                                        if ev == TapEvent::Activate {
-                                            cleanup_backspaces = 2;
-                                            self.pending_chord_lead = None;
-                                        }
-                                        out.push((GestureKey::F, ev));
-                                    }
+                                        GestureKey::CapsLock
+                                    };
+                                    let ev = tap_tracker
+                                        .on_tap(key, Duration::from_millis(double_tap_ms.max(40)));
+                                    out.push((key, ev));
                                 }
-                                (KEY_G, 1)
-                                    if self.shift_down == 0
-                                        && self.ctrl_down == 0
-                                        && self.alt_down == 0
-                                        && self.meta_down == 0 =>
-                                {
-                                    let now = Instant::now();
-                                    let in_typing_stream =
-                                        self.last_other_key_at.is_some_and(|t| {
-                                            now.saturating_duration_since(t)
-                                                < PRE_TAP_TYPING_COOLDOWN
-                                        });
-                                    self.pending_chord_lead = None;
-                                    if in_typing_stream {
-                                        tap_tracker.on_other_key();
-                                        self.last_other_key_at = Some(now);
-                                    } else {
-                                        let ev = tap_tracker.on_tap(
-                                            GestureKey::G,
-                                            Duration::from_millis(double_tap_ms.max(40)),
-                                        );
-                                        if ev == TapEvent::Activate {
-                                            cleanup_backspaces = 2;
-                                        }
-                                        out.push((GestureKey::G, ev));
-                                    }
-                                }
-                                // Rolling `fd` chord: `f` (which already triggered Warmup) followed within 120ms by `d`
-                                (KEY_D, 1)
-                                    if self.shift_down == 0
-                                        && self.ctrl_down == 0
-                                        && self.alt_down == 0
-                                        && self.meta_down == 0 =>
-                                {
-                                    let now = Instant::now();
-                                    if let Some((KEY_F, lead_at)) = self.pending_chord_lead.take()
-                                        && now.saturating_duration_since(lead_at)
-                                            <= ROLLING_CHORD_WINDOW
-                                    {
-                                        tap_tracker.clear();
-                                        cleanup_backspaces = 2;
-                                        out.push((GestureKey::F, TapEvent::Activate));
-                                        continue;
-                                    }
-                                    tap_tracker.on_other_key();
-                                    self.last_other_key_at = Some(now);
-                                }
-                                // Rolling `jk` chord: `j` followed within 120ms by `k`
-                                (KEY_J, 1)
-                                    if self.shift_down == 0
-                                        && self.ctrl_down == 0
-                                        && self.alt_down == 0
-                                        && self.meta_down == 0 =>
-                                {
-                                    let now = Instant::now();
-                                    let in_typing_stream =
-                                        self.last_other_key_at.is_some_and(|t| {
-                                            now.saturating_duration_since(t)
-                                                < PRE_TAP_TYPING_COOLDOWN
-                                        });
-                                    tap_tracker.on_other_key();
-                                    if !in_typing_stream {
-                                        self.pending_chord_lead = Some((KEY_J, now));
-                                        out.push((GestureKey::F, TapEvent::Warmup));
-                                    } else {
-                                        self.pending_chord_lead = None;
-                                        self.last_other_key_at = Some(now);
-                                    }
-                                }
-                                (KEY_K, 1)
-                                    if self.shift_down == 0
-                                        && self.ctrl_down == 0
-                                        && self.alt_down == 0
-                                        && self.meta_down == 0 =>
-                                {
-                                    let now = Instant::now();
-                                    if let Some((KEY_J, lead_at)) = self.pending_chord_lead.take()
-                                        && now.saturating_duration_since(lead_at)
-                                            <= ROLLING_CHORD_WINDOW
-                                    {
-                                        tap_tracker.clear();
-                                        cleanup_backspaces = 2;
-                                        out.push((GestureKey::F, TapEvent::Activate));
-                                        continue;
-                                    }
-                                    tap_tracker.on_other_key();
-                                    self.last_other_key_at = Some(now);
-                                }
-                                // Any other non-modifier key down cancels pending double-tap state
-                                // and updates the typing stream timestamp.
+                                // Ordinary typing cancels a pending CapsLock sequence.
                                 (_, 1) => {
                                     tap_tracker.on_other_key();
-                                    self.pending_chord_lead = None;
-                                    self.last_other_key_at = Some(Instant::now());
                                 }
                                 _ => {}
                             }
@@ -330,10 +170,6 @@ impl EvdevKeyboardSet {
                     Err(_) => break,
                 }
             }
-        }
-
-        if cleanup_backspaces > 0 {
-            self.emit_cleanup_backspaces(cleanup_backspaces);
         }
 
         out
@@ -371,16 +207,12 @@ impl UinputEmitter {
 
         // Constants from <linux/uinput.h>
         const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
-        const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
         const UI_SET_RELBIT: libc::c_ulong = 0x4004_5566;
         const UI_DEV_SETUP: libc::c_ulong = 0x405c_5503;
         const UI_DEV_CREATE: libc::c_ulong = 0x5501;
 
         unsafe {
             if libc::ioctl(fd, UI_SET_EVBIT, libc::c_int::from(EV_KEY)) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::ioctl(fd, UI_SET_KEYBIT, libc::c_int::from(KEY_BACKSPACE)) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if libc::ioctl(fd, UI_SET_EVBIT, libc::c_int::from(EV_REL)) < 0 {
@@ -427,16 +259,6 @@ impl UinputEmitter {
             )
         };
         self.file.write_all(bytes)
-    }
-
-    fn emit_backspaces(&mut self, count: usize) -> std::io::Result<()> {
-        for _ in 0..count {
-            self.write_event(EV_KEY, KEY_BACKSPACE, 1)?;
-            self.write_event(EV_SYN, SYN_REPORT, 0)?;
-            self.write_event(EV_KEY, KEY_BACKSPACE, 0)?;
-            self.write_event(EV_SYN, SYN_REPORT, 0)?;
-        }
-        Ok(())
     }
 
     fn emit_wheel(&mut self, dx: i32, dy: i32) -> std::io::Result<()> {

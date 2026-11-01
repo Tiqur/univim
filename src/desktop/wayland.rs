@@ -457,7 +457,7 @@ struct WorkerOutput {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CapturePurpose {
-    /// Silent background capture triggered on the 1st tap of `ff` / `gg` / `CapsLock`.
+    /// Silent background capture triggered on the first CapsLock tap.
     SpeculativeWarmup,
     /// Immediate overlay presentation (either direct `hints` or promoted 2nd tap).
     PresentOverlay(Mode),
@@ -494,6 +494,7 @@ struct DaemonState {
     last_error: Option<String>,
     tap_tracker: TapTracker,
     cached_frame: Option<PrecomputedFrame>,
+    debug_on_present: bool,
     next_job_id: u64,
     inflight_job: Option<(u64, CapturePurpose)>,
     worker_tx: Sender<WorkerJob>,
@@ -716,6 +717,7 @@ impl DaemonState {
             last_error: None,
             tap_tracker: TapTracker::new(),
             cached_frame: None,
+            debug_on_present: false,
             next_job_id: 1,
             inflight_job: None,
             worker_tx,
@@ -747,24 +749,6 @@ impl DaemonState {
                 qh,
                 CommandAction::Grid,
             );
-            let tap_f = manager.register_shortcut(
-                "tap-f".to_string(),
-                "univim".to_string(),
-                "Double-tap f trigger (speculative warmup on 1st tap, instant hints on 2nd)"
-                    .to_string(),
-                "Warm up detection cache on 1st f press and open hints immediately on 2nd f press"
-                    .to_string(),
-                qh,
-                CommandAction::TapF,
-            );
-            let tap_g = manager.register_shortcut(
-                "tap-g".to_string(),
-                "univim".to_string(),
-                "Double-tap g trigger (instant grid on 2nd tap)".to_string(),
-                "Open recursive grid mode on double-tap g".to_string(),
-                qh,
-                CommandAction::TapG,
-            );
             let tap_caps = manager.register_shortcut(
                 "caps-lock".to_string(),
                 "univim".to_string(),
@@ -773,7 +757,7 @@ impl DaemonState {
                 qh,
                 CommandAction::TapCaps,
             );
-            self.shortcuts.extend([hints, grid, tap_f, tap_g, tap_caps]);
+            self.shortcuts.extend([hints, grid, tap_caps]);
         }
         Ok(())
     }
@@ -837,7 +821,7 @@ impl DaemonState {
         qh: &QueueHandle<Self>,
     ) -> Result<(), String> {
         match (key, tap_ev) {
-            (GestureKey::F | GestureKey::CapsLock, TapEvent::Warmup) => {
+            (GestureKey::CapsLock | GestureKey::Debug, TapEvent::Warmup) => {
                 let ttl = Duration::from_millis(self.settings.cache_ttl_ms);
                 let has_fresh_cache = self
                     .cached_frame
@@ -847,11 +831,12 @@ impl DaemonState {
                     let _ = self.start_capture(CapturePurpose::SpeculativeWarmup, qh);
                 }
             }
-            (GestureKey::F | GestureKey::CapsLock, TapEvent::Activate) => {
+            (GestureKey::CapsLock | GestureKey::Debug, TapEvent::Activate) => {
+                self.debug_on_present = key == GestureKey::Debug;
                 self.activate_hints_with_cache(qh)?;
             }
-            (GestureKey::G, TapEvent::Warmup) => {}
-            (GestureKey::G, TapEvent::Activate) => {
+            (GestureKey::Grid, TapEvent::Warmup) => {}
+            (GestureKey::Grid, TapEvent::Activate) => {
                 self.enqueue_command(CommandAction::Grid, qh)?;
             }
         }
@@ -933,28 +918,6 @@ impl DaemonState {
                     }
                 }
                 return Ok(());
-            }
-            CommandAction::TapF => {
-                if self.overlay.is_some() {
-                    self.close_overlay();
-                    return Ok(());
-                }
-                let ev = self.tap_tracker.on_tap(
-                    GestureKey::F,
-                    Duration::from_millis(self.settings.double_tap_ms.max(40)),
-                );
-                return self.handle_tap_event(GestureKey::F, ev, qh);
-            }
-            CommandAction::TapG => {
-                if self.overlay.is_some() {
-                    self.close_overlay();
-                    return Ok(());
-                }
-                let ev = self.tap_tracker.on_tap(
-                    GestureKey::G,
-                    Duration::from_millis(self.settings.double_tap_ms.max(40)),
-                );
-                return self.handle_tap_event(GestureKey::G, ev, qh);
             }
             CommandAction::TapCaps => {
                 if self.overlay.is_some() {
@@ -1271,9 +1234,13 @@ impl DaemonState {
         qh: &QueueHandle<Self>,
     ) -> Result<(), String> {
         let base_bgr = bgr_vec_to_mat(&frame.bgr, frame.width, frame.height)?;
-        let session =
+        let mut session =
             Session::hints_with_focus(frame.width, frame.height, frame.targets, focused_rect)
                 .with_telemetry(cached_hit, frame.pipeline_ms);
+        if std::mem::take(&mut self.debug_on_present) {
+            let _ = session.handle_input(Input::ToggleDebugHud);
+            let _ = session.handle_input(Input::CycleDebugNext);
+        }
 
         let (logical_w, logical_h) = output.resolved_logical_size();
         self.overlay = Some(ActiveOverlay {

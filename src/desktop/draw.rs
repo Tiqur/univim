@@ -101,7 +101,7 @@ fn render_debug_stage_canvas(
                 base_bgr.rows(),
                 [40, 255, 140],
             )?;
-            render_standard_overlay(&g_u8, session)
+            Ok(g_u8)
         }
         DebugView::BarriersFrames => {
             let b_u8 = gray_slice_to_bgr(
@@ -112,7 +112,7 @@ fn render_debug_stage_canvas(
                 base_bgr.rows(),
                 [80, 180, 255],
             )?;
-            render_standard_overlay(&b_u8, session)
+            Ok(b_u8)
         }
         DebugView::StrokesCoarse => {
             let s_u8 = dual_mask_to_bgr(
@@ -123,7 +123,7 @@ fn render_debug_stage_canvas(
                 base_bgr.cols(),
                 base_bgr.rows(),
             )?;
-            render_standard_overlay(&s_u8, session)
+            Ok(s_u8)
         }
         DebugView::Hierarchy => {
             let mut vis = base_bgr.try_clone()?;
@@ -700,13 +700,13 @@ fn draw_options_modal(
             on_off(settings.detector.collapse_paragraphs),
         ),
         (
-            "Double-Tap Window (ff/Caps)",
+            "Double-Tap Window (Caps)",
             format!("{} ms", settings.double_tap_ms),
         ),
         ("1st-Tap Cache TTL", format!("{} ms", settings.cache_ttl_ms)),
         ("Spotlight Background Dim", on_off(settings.spotlight_dim)),
         ("Show Status Pill", on_off(settings.show_status_bar)),
-        ("Evdev Listener (Caps/ff)", on_off(settings.use_evdev)),
+        ("Evdev Listener (Caps)", on_off(settings.use_evdev)),
     ];
 
     for (idx, (label, val)) in rows.iter().enumerate() {

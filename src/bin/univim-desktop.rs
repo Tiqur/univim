@@ -9,7 +9,7 @@ use univim::{
 
 fn print_usage() {
     eprintln!(
-        "Usage: univim-desktop <daemon|snapshot|check|bindings|hints|grid|tap-f|tap-g|tap-caps|debug|options|stop> [options]
+        "Usage: univim-desktop <daemon|snapshot|check|bindings|hints|grid|tap-caps|debug|options|stop> [options]
 
 Commands:
   daemon         Run the background Wayland/Hyprland overlay daemon (alias: serve)
@@ -18,8 +18,6 @@ Commands:
   bindings       Print suggested opt-in Hyprland configuration
   hints          Show full-screen Vimium hints (auto-starts daemon if not running)
   grid           Show recursive 2-step grid overlay
-  tap-f          Record an 'f' tap (1st tap pre-computes cache, 2nd tap within threshold opens hints in 0ms)
-  tap-g          Record a 'g' tap (2nd tap within threshold opens grid)
   tap-caps       Record a 'CapsLock' tap (1st tap pre-computes cache, 2nd tap opens hints in 0ms)
   debug          Toggle the live pipeline inspector HUD (also F2 inside overlay)
   options        Toggle the live GUI options modal (also F1 / ? inside overlay)
@@ -145,7 +143,7 @@ fn main() {
         }),
         "bindings" => {
             println!(
-                "# Start once after your Wayland environment is ready.\nexec-once = univim-desktop daemon\n# Opt-in global shortcuts. `bindn` preserves ordinary key events.\nbind = SUPER, F, global, univim:hints\nbind = SUPER, G, global, univim:grid\nbindn = , CAPS, global, univim:caps-lock\nbindn = , f, global, univim:tap-f\n# Nonconsuming modifier bindings preserve ordinary modifier events.\nbindn = SHIFT, Shift_L, global, univim:shift-left\nbindn = SHIFT, Shift_R, global, univim:shift-right\nbindn = CTRL, Control_L, global, univim:control-left\nbindn = CTRL, Control_R, global, univim:control-right"
+                "# Start once after your Wayland environment is ready.\nexec-once = univim-desktop daemon\n# Opt-in global shortcuts.\nbind = SUPER, F, global, univim:hints\nbind = SUPER, G, global, univim:grid\nbindn = , CAPS, global, univim:caps-lock\n# Nonconsuming modifier bindings preserve ordinary modifier events.\nbindn = SHIFT, Shift_L, global, univim:shift-left\nbindn = SHIFT, Shift_R, global, univim:shift-right\nbindn = CTRL, Control_L, global, univim:control-left\nbindn = CTRL, Control_R, global, univim:control-right"
             );
             Ok(())
         }
@@ -193,10 +191,6 @@ fn main() {
             .map_err(|err| format!("failed to trigger hints on {}: {err}", socket.display())),
         "grid" => send_command_or_autospawn(&socket, CommandAction::Grid, options)
             .map_err(|err| format!("failed to trigger grid on {}: {err}", socket.display())),
-        "tap-f" => send_command_or_autospawn(&socket, CommandAction::TapF, options)
-            .map_err(|err| format!("failed to send tap-f on {}: {err}", socket.display())),
-        "tap-g" => send_command_or_autospawn(&socket, CommandAction::TapG, options)
-            .map_err(|err| format!("failed to send tap-g on {}: {err}", socket.display())),
         "tap-caps" | "caps" => send_command_or_autospawn(&socket, CommandAction::TapCaps, options)
             .map_err(|err| format!("failed to send tap-caps on {}: {err}", socket.display())),
         "debug" | "toggle-debug" => {

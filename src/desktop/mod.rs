@@ -24,8 +24,6 @@ pub use wayland::{capture_snapshot, check, run_daemon};
 pub enum CommandAction {
     Hints,
     Grid,
-    TapF,
-    TapG,
     TapCaps,
     ToggleDebug,
     ToggleOptions,
@@ -37,8 +35,6 @@ impl CommandAction {
         match self {
             Self::Hints => "hints\n",
             Self::Grid => "grid\n",
-            Self::TapF => "tap-f\n",
-            Self::TapG => "tap-g\n",
             Self::TapCaps => "tap-caps\n",
             Self::ToggleDebug => "toggle-debug\n",
             Self::ToggleOptions => "toggle-options\n",
@@ -50,8 +46,6 @@ impl CommandAction {
         match text.trim() {
             "hints" => Some(Self::Hints),
             "grid" => Some(Self::Grid),
-            "tap-f" | "tap_f" => Some(Self::TapF),
-            "tap-g" | "tap_g" => Some(Self::TapG),
             "tap-caps" | "tap_caps" | "caps" => Some(Self::TapCaps),
             "toggle-debug" | "debug" => Some(Self::ToggleDebug),
             "toggle-options" | "options" => Some(Self::ToggleOptions),
@@ -78,13 +72,13 @@ pub struct RuntimeSettings {
     /// Auto-cancel an overlay after this many seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// Maximum interval (ms) between the 1st and 2nd tap for `ff` / `gg` / `CapsLock`.
+    /// Maximum interval (ms) between CapsLock taps.
     pub double_tap_ms: u64,
     /// Maximum age (ms) of the speculative 1st-tap pre-computed detection cache.
     pub cache_ttl_ms: u64,
     /// Whether to dim the background screenshot slightly for higher hint contrast.
     pub spotlight_dim: bool,
-    /// Whether to listen on `/dev/input/event*` for passive `ff` / `CapsLock` chords.
+    /// Whether to listen on `/dev/input/event*` for CapsLock gestures.
     pub use_evdev: bool,
     /// Whether to show the status & telemetry pill at the top-left of the overlay.
     pub show_status_bar: bool,

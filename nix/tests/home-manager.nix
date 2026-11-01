@@ -131,7 +131,6 @@ let
           hintsBind = "SUPER, semicolon";
           gridBind = "SUPER, G";
           doubleTapCapsLock = true;
-          doubleTapF = true;
           evdev = false;
         };
         settings = {
@@ -223,9 +222,8 @@ let
       lib.elem "SUPER, semicolon, global, univim:hints" globalValues.bind
       && lib.elem "SUPER, G, global, univim:grid" globalValues.bind
     ))
-    (check "double-tap CapsLock and f bindings are non-consuming" (
+    (check "double-tap CapsLock binding is non-consuming" (
       lib.elem ", CAPS, global, univim:caps-lock" globalValues.bindn
-      && lib.elem ", f, global, univim:tap-f" globalValues.bindn
     ))
     (check "settings configure the daemon and evdev" (
       lib.hasInfix "\"double_tap_ms\":240" globalSettings
