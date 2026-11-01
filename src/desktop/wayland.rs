@@ -331,9 +331,18 @@ fn daemon_loop(
             };
             let ready = poll_fds(wayland_fd, listener.as_fd(), evdev_fd, timeout)?;
             if ready.wayland_readable {
-                read_guard
-                    .read()
-                    .map_err(|err| format!("failed to read Wayland events: {err}"))?;
+                // poll(2) can report readability that is consumed before the
+                // read guard runs, which surfaces as EAGAIN on the nonblocking
+                // Wayland socket. It is not a connection failure.
+                if let Err(err) = read_guard.read()
+                    && !matches!(
+                        &err,
+                        wayland_client::backend::WaylandError::Io(io)
+                            if io.kind() == io::ErrorKind::WouldBlock
+                    )
+                {
+                    return Err(format!("failed to read Wayland events: {err}"));
+                }
             } else {
                 drop(read_guard);
             }
