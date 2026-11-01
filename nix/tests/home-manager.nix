@@ -130,7 +130,8 @@ let
           enable = true;
           hintsBind = "SUPER, semicolon";
           gridBind = "SUPER, G";
-          doubleTapCapsLock = true;
+          activationKey = "caps-lock";
+          doubleTap = true;
           evdev = false;
         };
         settings = {
@@ -147,8 +148,9 @@ let
       services.univim = {
         enable = true;
         hyprland.enable = true;
-        hyprland.singlePressCapsLock = true;
-        hyprland.altActivation = "off";
+        hyprland.activationKey = "caps-lock";
+        hyprland.doubleTap = false;
+        hyprland.disableCapsLock = true;
         settings.pointerMotion = "ease_out";
         settings.pointerSpeed = 1800;
       };
@@ -160,7 +162,9 @@ let
       services.univim = {
         enable = true;
         hyprland.enable = true;
-        hyprland.singlePressCapsLock = true;
+        hyprland.activationKey = "caps-lock";
+        hyprland.doubleTap = false;
+        hyprland.disableCapsLock = true;
       };
     }
   ];
@@ -170,7 +174,7 @@ let
       services.univim = {
         enable = true;
         hyprland.enable = true;
-        hyprland.altActivation = "single";
+        hyprland.doubleTap = false;
       };
     }
   ];
@@ -180,7 +184,34 @@ let
       services.univim = {
         enable = true;
         hyprland.enable = true;
-        hyprland.altActivation = "single";
+        hyprland.doubleTap = false;
+      };
+    }
+  ];
+  defaultAlt = evaluate [
+    (hyprland { })
+    { services.univim = { enable = true; hyprland.enable = true; }; }
+  ];
+  doubleCtrl = evaluate [
+    (hyprland { })
+    { services.univim = { enable = true; hyprland.enable = true; hyprland.activationKey = "left-ctrl"; }; }
+  ];
+  disabledActivation = evaluate [
+    (hyprland { })
+    { services.univim = { enable = true; hyprland.enable = true; hyprland.activationKey = "off"; }; }
+  ];
+  disabledCaps = evaluate [
+    (hyprland { })
+    { services.univim = { enable = true; hyprland.enable = true; hyprland.disableCapsLock = true; }; }
+  ];
+  customAppearance = evaluate [
+    {
+      services.univim.enable = true;
+      services.univim.settings.appearance = {
+        hintFontScale = 1.0;
+        uiScale = 2.0;
+        badgeBackground = "#AABBCC";
+        typedForeground = "#112233";
       };
     }
   ];
@@ -208,6 +239,11 @@ let
   singleCapsLuaText = singleCapsLua.xdg.configFile."hypr/hyprland.lua".text;
   singleAltValues = singleAlt.wayland.windowManager.hyprland.settings;
   singleAltLuaText = singleAltLua.xdg.configFile."hypr/hyprland.lua".text;
+  defaultAltValues = defaultAlt.wayland.windowManager.hyprland.settings;
+  doubleCtrlValues = doubleCtrl.wayland.windowManager.hyprland.settings;
+  disabledActivationValues = disabledActivation.wayland.windowManager.hyprland.settings;
+  disabledCapsValues = disabledCaps.wayland.windowManager.hyprland.settings;
+  customAppearanceSettings = customAppearance.xdg.configFile."univim/settings.json".text;
 
   checks = [
     (check "disabled by default" (
@@ -271,11 +307,17 @@ let
       && lib.elem "SUPER, G, global, univim:grid" globalValues.bind
     ))
     (check "double-tap CapsLock binding is non-consuming" (
-      lib.elem ", CAPS, global, univim:caps-lock" globalValues.bindn
+      lib.elem ", code:66, global, univim:caps-lock" globalValues.bindn
     ))
     (check "left Alt double-tap defaults to a non-consuming global binding" (
-      lib.elem ", Alt_L, global, univim:alt-left" globalValues.bindn
-      && !lib.elem ", Alt_R, global, univim:alt-left" globalValues.bindn
+      lib.elem ", Alt_L, global, univim:alt-left" defaultAltValues.bindn
+      && !lib.elem ", Alt_R, global, univim:alt-left" defaultAltValues.bindn
+      && (!(defaultAltValues ? input) || !(defaultAltValues.input ? kb_options))
+    ))
+    (check "Ctrl double tap and disabled activation generate only the requested binding" (
+      lib.elem ", Control_L, global, univim:ctrl-left" doubleCtrlValues.bindn
+      && !(disabledActivationValues ? bindn)
+      && disabledCapsValues.input.kb_options == "caps:none"
     ))
     (check "single left Alt uses the hints shortcut without intercepting Alt chords" (
       lib.elem ", Alt_L, global, univim:hints" singleAltValues.bindn
@@ -290,6 +332,14 @@ let
       lib.hasInfix "\"double_tap_ms\":240" globalSettings
       && lib.hasInfix "\"use_evdev\":false" globalSettings
       && lib.hasInfix "\"min_score\":0.52" globalSettings
+      && lib.hasInfix "\"hint_font_scale\":0.68" globalSettings
+      && lib.hasInfix "\"ui_scale\":1.6" globalSettings
+    ))
+    (check "appearance settings generate typed colors and independent UI/hint sizes" (
+      lib.hasInfix "\"hint_font_scale\":1.0" customAppearanceSettings
+      && lib.hasInfix "\"ui_scale\":2.0" customAppearanceSettings
+      && lib.hasInfix "\"badge_background\":\"#AABBCC\"" customAppearanceSettings
+      && lib.hasInfix "\"typed_foreground\":\"#112233\"" customAppearanceSettings
     ))
     (check "opt-in single CapsLock generates consuming bindings and disables evdev gestures" (
       lib.any (value: lib.hasInfix ", code:66, exec," value && lib.hasInfix "univim-desktop hints" value) singleCapsValues.bind

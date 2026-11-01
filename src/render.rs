@@ -18,6 +18,23 @@ fn color(kind: &str) -> Scalar {
 }
 
 pub fn overlay(bgr: &Mat, targets: &[Target]) -> opencv::Result<Mat> {
+    overlay_with_style(bgr, targets, "", None)
+}
+
+pub(crate) struct BadgeStyle {
+    pub font_scale: f64,
+    pub background: Scalar,
+    pub foreground: Scalar,
+    pub typed_foreground: Scalar,
+}
+
+/// The public overlay keeps the reference pixels; desktop-only styling is opt-in.
+pub(crate) fn overlay_with_style(
+    bgr: &Mat,
+    targets: &[Target],
+    typed: &str,
+    style: Option<&BadgeStyle>,
+) -> opencv::Result<Mat> {
     let mut canvas = bgr.try_clone()?;
     let mut fill = bgr.try_clone()?;
     for t in targets {
@@ -71,10 +88,19 @@ pub fn overlay(bgr: &Mat, targets: &[Target]) -> opencv::Result<Mat> {
             imgproc::LINE_AA,
         )?;
         let label = if t.hint.is_empty() { "??" } else { &t.hint };
+        let scale = style.map_or(0.36, |style| style.font_scale);
+        let pad = style
+            .map_or(3, |_| ((scale / 0.36) * 3.).round() as i32)
+            .max(3);
         let mut baseline = 0;
-        let size =
-            imgproc::get_text_size(label, imgproc::FONT_HERSHEY_SIMPLEX, 0.36, 1, &mut baseline)?;
-        let (bw, bh) = (size.width + 6, size.height + 5);
+        let size = imgproc::get_text_size(
+            label,
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            scale,
+            1,
+            &mut baseline,
+        )?;
+        let (bw, bh) = (size.width + pad * 2, size.height + pad + 2);
         let (bx, by) = if t.kind == "text_link" && t.w <= 54 && t.h <= 32 && x >= bw + 6 {
             ((x - bw - 3).max(0), (y + (t.h - bh).div_euclid(2)).max(0))
         } else if t.h <= 18 && y >= bh + 2 {
@@ -94,11 +120,16 @@ pub fn overlay(bgr: &Mat, targets: &[Target]) -> opencv::Result<Mat> {
             -1,
             imgproc::LINE_8,
         )?;
-        let bg = if t.kind == "text_block" {
-            Scalar::new(180., 225., 245., 0.)
-        } else {
-            Scalar::new(55., 215., 255., 0.)
-        };
+        let bg = style.map_or_else(
+            || {
+                if t.kind == "text_block" {
+                    Scalar::new(180., 225., 245., 0.)
+                } else {
+                    Scalar::new(55., 215., 255., 0.)
+                }
+            },
+            |style| style.background,
+        );
         rect(
             &mut canvas,
             bx,
@@ -109,17 +140,35 @@ pub fn overlay(bgr: &Mat, targets: &[Target]) -> opencv::Result<Mat> {
             -1,
             imgproc::LINE_8,
         )?;
+        let text_x = bx + pad;
+        let text_y = bottom - pad;
         imgproc::put_text(
             &mut canvas,
             label,
-            Point::new(bx + 3, bottom - 3),
+            Point::new(text_x, text_y),
             imgproc::FONT_HERSHEY_SIMPLEX,
-            0.36,
-            Scalar::all(10.),
+            scale,
+            style.map_or(Scalar::all(10.), |style| style.foreground),
             1,
             imgproc::LINE_AA,
             false,
         )?;
+        if let Some(style) = style
+            && !typed.is_empty()
+            && label.starts_with(typed)
+        {
+            imgproc::put_text(
+                &mut canvas,
+                typed,
+                Point::new(text_x, text_y),
+                imgproc::FONT_HERSHEY_SIMPLEX,
+                scale,
+                style.typed_foreground,
+                2,
+                imgproc::LINE_AA,
+                false,
+            )?;
+        }
     }
     Ok(canvas)
 }
@@ -276,4 +325,40 @@ pub fn hierarchy_overlay(bgr: &Mat, targets: &[Target]) -> Result<Mat, String> {
         draw(&mut canvas, target, &mut path, 0)?;
     }
     Ok(canvas)
+}
+
+#[cfg(test)]
+mod style_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_overlay_emphasizes_typed_prefix_without_changing_reference_overlay() {
+        let base = Mat::new_rows_cols_with_default(120, 180, CV_8UC3, Scalar::all(240.)).unwrap();
+        let target = Target {
+            x: 40,
+            y: 50,
+            w: 55,
+            h: 30,
+            score: 1.0,
+            kind: "frame".into(),
+            hint: "SA".into(),
+            level: "control".into(),
+            children: vec![],
+        };
+        let style = BadgeStyle {
+            font_scale: 0.68,
+            background: Scalar::new(20., 30., 40., 0.),
+            foreground: Scalar::all(250.),
+            typed_foreground: Scalar::new(0., 0., 255., 0.),
+        };
+        let plain =
+            overlay_with_style(&base, std::slice::from_ref(&target), "", Some(&style)).unwrap();
+        let emphasized =
+            overlay_with_style(&base, std::slice::from_ref(&target), "S", Some(&style)).unwrap();
+        assert_ne!(
+            plain.data_bytes().unwrap(),
+            emphasized.data_bytes().unwrap()
+        );
+        assert_eq!(overlay(&base, &[target]).unwrap().cols(), 180);
+    }
 }

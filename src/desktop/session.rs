@@ -223,6 +223,7 @@ impl PrecomputedFrame {
 pub enum GestureKey {
     CapsLock,
     LeftAlt,
+    LeftCtrl,
     Grid,
     Debug,
 }
@@ -1065,6 +1066,14 @@ mod tests {
         );
         assert_eq!(
             tracker.on_tap(GestureKey::LeftAlt, Duration::from_millis(250)),
+            TapEvent::Activate
+        );
+        assert_eq!(
+            tracker.on_tap(GestureKey::LeftCtrl, Duration::from_millis(250)),
+            TapEvent::Warmup
+        );
+        assert_eq!(
+            tracker.on_tap(GestureKey::LeftCtrl, Duration::from_millis(250)),
             TapEvent::Activate
         );
         // Next tap starts a fresh cycle

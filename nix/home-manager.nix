@@ -64,10 +64,20 @@ let
     double_tap_ms = settings.doubleTapMs;
     cache_ttl_ms = settings.cacheTtlMs;
     spotlight_dim = settings.spotlightDim;
-    use_evdev = cfg.hyprland.evdev && !cfg.hyprland.singlePressCapsLock;
+    use_evdev = cfg.hyprland.evdev && !(cfg.hyprland.activationKey == "caps-lock" && !cfg.hyprland.doubleTap);
     show_status_bar = true;
     pointer_motion = settings.pointerMotion;
     pointer_speed = settings.pointerSpeed;
+    appearance = {
+      hint_font_scale = settings.appearance.hintFontScale;
+      ui_scale = settings.appearance.uiScale;
+      badge_background = settings.appearance.badgeBackground;
+      badge_foreground = settings.appearance.badgeForeground;
+      typed_foreground = settings.appearance.typedForeground;
+      ui_background = settings.appearance.uiBackground;
+      ui_foreground = settings.appearance.uiForeground;
+      ui_accent = settings.appearance.uiAccent;
+    };
   };
 
   globalBind = key: event: "${bindingKey key}, global, ${event}";
@@ -92,16 +102,24 @@ let
           globalBind cfg.hyprland.gridBind "univim:grid")
       ])
     );
-  doubleTapBindings =
-    lib.optionals (cfg.hyprland.enable && cfg.hyprland.doubleTapCapsLock) (
-      (lib.optional cfg.hyprland.doubleTapCapsLock (
-        if luaConfiguration then
-          luaGestureBind ", Caps_Lock" "hl.dsp.global(\"univim:caps-lock\")"
-        else
-          ", CAPS, global, univim:caps-lock"
-      ))
-    );
-  singleCapsBindings = lib.optionals (cfg.hyprland.enable && cfg.hyprland.singlePressCapsLock) (
+  activation = cfg.hyprland;
+  modifierKey = {
+    left-alt = "Alt_L";
+    left-ctrl = "Control_L";
+    caps-lock = "code:66";
+  }.${activation.activationKey} or null;
+  tapEvent = {
+    left-alt = "univim:alt-left";
+    left-ctrl = "univim:ctrl-left";
+    caps-lock = "univim:caps-lock";
+  }.${activation.activationKey} or null;
+  doubleTapBindings = lib.optionals (activation.enable && modifierKey != null && activation.doubleTap) [
+    (if luaConfiguration then
+      luaGestureBind ", ${modifierKey}" "hl.dsp.global(${builtins.toJSON tapEvent})"
+    else
+      ", ${modifierKey}, global, ${tapEvent}")
+  ];
+  singleCapsBindings = lib.optionals (activation.enable && activation.activationKey == "caps-lock" && !activation.doubleTap) (
     if luaConfiguration then
       [
         (luaBind ", code:66" "hl.dsp.exec_cmd(${builtins.toJSON "${desktop} hints"})")
@@ -115,24 +133,12 @@ let
         (hyprlangBind "ALT, code:66" [ desktop "debug-open" ])
       ]
   );
-  altBindings = lib.optionals cfg.hyprland.enable (
-    if cfg.hyprland.altActivation == "double" then
-      [
-        (if luaConfiguration then
-          luaGestureBind ", Alt_L" "hl.dsp.global(\"univim:alt-left\")"
-        else
-          ", Alt_L, global, univim:alt-left")
-      ]
-    else if cfg.hyprland.altActivation == "single" then
-      [
-        (if luaConfiguration then
-          luaGestureBind ", Alt_L" "hl.dsp.global(\"univim:hints\")"
-        else
-          ", Alt_L, global, univim:hints")
-      ]
+  singleModifierBindings = lib.optionals (activation.enable && modifierKey != null && !activation.doubleTap && activation.activationKey != "caps-lock") [
+    (if luaConfiguration then
+      luaGestureBind ", ${modifierKey}" "hl.dsp.global(\"univim:hints\")"
     else
-      [ ]
-  );
+      ", ${modifierKey}, global, univim:hints")
+  ];
 
   bindingParts = value: map lib.trim (lib.splitString "," value);
   validBinding =
@@ -305,15 +311,67 @@ in
         default = 1600;
         description = "Cursor glide speed in logical pixels per second.";
       };
+      appearance = {
+        hintFontScale = lib.mkOption {
+          type = lib.types.numbers.between 0.25 2.0;
+          default = 0.68;
+          description = "OpenCV Hershey font scale of hint badges (previously fixed at 0.36).";
+        };
+        uiScale = lib.mkOption {
+          type = lib.types.numbers.between 0.75 3.0;
+          default = 1.6;
+          description = "Scale of the status pill, keystroke display, debug HUD and options menu.";
+        };
+        badgeBackground = lib.mkOption {
+          type = lib.types.strMatching "#[0-9a-fA-F]{6}";
+          default = "#FFD737";
+          description = "Hint badge background in #RRGGBB format.";
+        };
+        badgeForeground = lib.mkOption {
+          type = lib.types.strMatching "#[0-9a-fA-F]{6}";
+          default = "#0A0A0A";
+          description = "Unselected hint label color.";
+        };
+        typedForeground = lib.mkOption {
+          type = lib.types.strMatching "#[0-9a-fA-F]{6}";
+          default = "#5B158C";
+          description = "Bold typed-prefix color on matching hints.";
+        };
+        uiBackground = lib.mkOption {
+          type = lib.types.strMatching "#[0-9a-fA-F]{6}";
+          default = "#121214";
+          description = "Status, debug and options panel background.";
+        };
+        uiForeground = lib.mkOption {
+          type = lib.types.strMatching "#[0-9a-fA-F]{6}";
+          default = "#FAF5F0";
+          description = "Status, debug and options panel text.";
+        };
+        uiAccent = lib.mkOption {
+          type = lib.types.strMatching "#[0-9a-fA-F]{6}";
+          default = "#FFD000";
+          description = "Panel border, title and selection highlight.";
+        };
+      };
     };
 
     hyprland = {
       enable = lib.mkEnableOption "global UniVim Hyprland shortcuts";
 
-      altActivation = lib.mkOption {
-        type = lib.types.enum [ "off" "single" "double" ];
-        default = "double";
-        description = "Left Alt hints activation when Hyprland shortcuts are enabled. Double-tap preserves ordinary Alt chords best-effort; single-press also triggers on Alt chords.";
+      activationKey = lib.mkOption {
+        type = lib.types.enum [ "left-alt" "left-ctrl" "caps-lock" "off" ];
+        default = "left-alt";
+        description = "Key to activate hints; off disables the automatic gesture.";
+      };
+      doubleTap = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Require two presses of activationKey; a single modifier press also triggers on ordinary chords.";
+      };
+      disableCapsLock = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Suppress the ordinary CapsLock toggle with XKB caps:none, even if CapsLock is not the activation key. Merge existing kb_options yourself.";
       };
 
       hintsBind = lib.mkOption {
@@ -330,21 +388,9 @@ in
         description = "Global grid binding in '<modifiers>, <key>' form; null disables it.";
       };
 
-      doubleTapCapsLock = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Bind non-consuming CapsLock taps for instant hints on double-tap.";
-      };
-
-      singlePressCapsLock = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Opt-in CapsLock keycode bindings and caps:none XKB option: Caps for hints, Shift+Caps for grid, Alt+Caps for debug. Disables evdev gestures and normal CapsLock. Merge any other kb_options yourself.";
-      };
-
       evdev = lib.mkOption {
         type = lib.types.bool;
-        default = true;
+        default = false;
         description = "Listen passively on /dev/input/event* for modifier-aware CapsLock gestures.";
       };
     };
@@ -407,10 +453,6 @@ in
         message = "services.univim hints and grid bindings must differ.";
       }
       {
-        assertion = !cfg.hyprland.singlePressCapsLock || (cfg.hyprland.enable && !cfg.hyprland.doubleTapCapsLock);
-        message = "services.univim.hyprland.singlePressCapsLock requires hyprland.enable and conflicts with doubleTapCapsLock.";
-      }
-      {
         assertion = sessionTarget != "";
         message = "services.univim.sessionTarget must not be empty.";
       }
@@ -419,9 +461,6 @@ in
     home.packages = [ cfg.package ];
     xdg.configFile."univim/settings.json".text = runtimeSettingsJson;
 
-    # XKB consumes the CapsLock action; binding consumption alone only prevents
-    # client delivery, not the compositor's internal lock-state update.
-    # An existing kb_options definition will conflict rather than be discarded.
     systemd.user.services.univim = {
       Unit = {
         Description = "UniVim desktop navigation";
@@ -438,13 +477,15 @@ in
     };
 
     wayland.windowManager.hyprland.settings = lib.mkMerge [
-      (lib.mkIf cfg.hyprland.singlePressCapsLock { input.kb_options = "caps:none"; })
+      # Binding consumption does not prevent the compositor's lock-state update.
+      # An existing kb_options definition conflicts rather than being discarded.
+      (lib.mkIf (cfg.hyprland.enable && cfg.hyprland.disableCapsLock) { input.kb_options = "caps:none"; })
       (lib.mkIf (hyprlandEnabled && (bindings.enable || bindings.modifierGestures || cfg.hyprland.enable))
         (
           if luaConfiguration then
             {
               bind = explicitBindings ++ gestureBindings ++ globalBindings ++ singleCapsBindings;
-              bindn = doubleTapBindings ++ altBindings;
+              bindn = doubleTapBindings ++ singleModifierBindings;
             }
           else
             let
@@ -452,7 +493,7 @@ in
                 lib.optionalAttrs bindings.enable { bind = explicitBindings; }
                 // lib.optionalAttrs bindings.modifierGestures { bindn = gestureBindings; };
               bindList = (base.bind or [ ]) ++ globalBindings ++ singleCapsBindings;
-              bindnList = (base.bindn or [ ]) ++ doubleTapBindings ++ altBindings;
+              bindnList = (base.bindn or [ ]) ++ doubleTapBindings ++ singleModifierBindings;
             in
             base
             // lib.optionalAttrs (bindList != [ ]) { bind = bindList; }

@@ -9,7 +9,7 @@ use univim::{
 
 fn print_usage() {
     eprintln!(
-        "Usage: univim-desktop <daemon|snapshot|check|bindings|hints|grid|debug-open|tap-caps|tap-alt|debug|options|stop> [options]
+        "Usage: univim-desktop <daemon|snapshot|check|bindings|hints|grid|debug-open|tap-caps|tap-alt|tap-ctrl|debug|options|stop> [options]
 
 Commands:
   daemon         Run the background Wayland/Hyprland overlay daemon (alias: serve)
@@ -21,6 +21,7 @@ Commands:
   debug-open     Open the live pipeline inspector from the desktop
   tap-caps       Record a 'CapsLock' tap (1st tap pre-computes cache, 2nd tap opens hints in 0ms)
   tap-alt        Record a left Alt tap (1st warms cache, 2nd opens hints)
+  tap-ctrl       Record a left Ctrl tap (1st warms cache, 2nd opens hints)
   debug          Toggle the live pipeline inspector HUD (also F2 inside overlay)
   options        Toggle the live GUI options modal (also F1 / ? inside overlay)
   stop           Stop the running daemon
@@ -199,6 +200,8 @@ fn main() {
             .map_err(|err| format!("failed to send tap-caps on {}: {err}", socket.display())),
         "tap-alt" => send_command_or_autospawn(&socket, CommandAction::TapAlt, options)
             .map_err(|err| format!("failed to send tap-alt on {}: {err}", socket.display())),
+        "tap-ctrl" => send_command_or_autospawn(&socket, CommandAction::TapCtrl, options)
+            .map_err(|err| format!("failed to send tap-ctrl on {}: {err}", socket.display())),
         "debug" | "toggle-debug" => {
             send_command_or_autospawn(&socket, CommandAction::ToggleDebug, options)
                 .map_err(|err| format!("failed to toggle debug on {}: {err}", socket.display()))

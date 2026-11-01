@@ -189,7 +189,7 @@ automatic restarts, because restarting cannot repair a stale socket.
 Here is a complete Home Manager example. Import the module and pass `inputs`
 as shown above; replace the example file path and host name with yours. Every
 UniVim module option is set explicitly below; comments identify defaults.
-This example **opts in to single-press CapsLock**, replacing its normal action.
+This example chooses **single-press left Alt**; double-tap left Alt is the default.
 
 ```nix
 # In a Home Manager module imported by your host configuration:
@@ -220,6 +220,16 @@ This example **opts in to single-press CapsLock**, replacing its normal action.
       spotlightDim = true; # Default: true; dim screenshot behind hints.
       pointerMotion = "instant"; # Default: "instant"; also "linear" or "ease_out".
       pointerSpeed = 1600; # Default: 1600 logical px/s; 200–6000. Ignored if instant.
+      appearance = {
+        hintFontScale = 0.68; # Default: 0.68 (formerly 0.36); size of hint labels.
+        uiScale = 1.6; # Default: 1.6; status/keystrokes, debug HUD, options menu.
+        badgeBackground = "#FFD737";
+        badgeForeground = "#0A0A0A";
+        typedForeground = "#5B158C"; # Bold prefix on matching hint labels.
+        uiBackground = "#121214";
+        uiForeground = "#FAF5F0";
+        uiAccent = "#FFD000";
+      };
     };
 
     keybindings = {
@@ -230,14 +240,13 @@ This example **opts in to single-press CapsLock**, replacing its normal action.
     };
 
     hyprland = {
-      enable = true; # Default: false; required for the CapsLock bindings below.
+      enable = true; # Default: false; installs the requested activation binding.
       hintsBind = null; # Default: null; e.g. "SUPER, F" for a global hint shortcut.
       gridBind = null; # Default: null; e.g. "SUPER, G" for a global grid shortcut.
-      singlePressCapsLock = true; # Default: false; Caps=hints, Shift+Caps=grid,
-        # Alt+Caps=debug. Adds XKB caps:none + physical code:66 bindings;
-        # normal CapsLock no longer works. Conflicts with existing kb_options.
-      doubleTapCapsLock = false; # Default: false; cannot combine with single-press.
-      evdev = false; # Default: true; set false for single-press (also auto-disabled).
+      activationKey = "left-alt"; # Default: "left-alt"; also "left-ctrl", "caps-lock", "off".
+      doubleTap = false; # Default: true; single left Alt also triggers on Alt chords.
+      disableCapsLock = false; # Default: false; true sets XKB caps:none.
+      evdev = false; # Default: false; legacy passive CapsLock gesture listener.
     };
   };
 
@@ -247,12 +256,18 @@ This example **opts in to single-press CapsLock**, replacing its normal action.
 }
 ```
 
-For ordinary CapsLock instead, set `singlePressCapsLock = false` and choose
-`keybindings.enable = true` for SUPER+F/G, or set `evdev = true` for passive
-double-CapsLock. If using `doubleTapCapsLock = true`, keep single-press off;
-the optional nonconsuming Hyprland shortcut and the passive evdev listener can
-both see CapsLock, so prefer **one** activation method. Keep `hyprland.enable`
-enabled only if you want its optional bindings. Avoid declaring the same
+For CapsLock hints instead, set `activationKey = "caps-lock"` and choose
+`doubleTap = true` or `false`; set `disableCapsLock = true` if you do not
+want CapsLock to toggle the lock state. Single CapsLock also binds Shift+Caps
+to grid and Alt+Caps to debug. Disabling CapsLock is independent of the
+activation key. An existing `input.kb_options` conflicts with `caps:none`;
+merge them yourself as shown above. Keep `evdev = false` unless you specifically
+need legacy passive CapsLock gestures, to avoid duplicate activations.
+When upgrading from older versions, replace `hyprland.altActivation`,
+`hyprland.singlePressCapsLock` and `hyprland.doubleTapCapsLock` with the
+`activationKey` / `doubleTap` pair; set `disableCapsLock = true` explicitly if
+you previously relied on single CapsLock to disable its normal lock action.
+Avoid declaring the same
 SUPER+F/G shortcuts under both `keybindings` and `hyprland.hintsBind/gridBind`.
 
 Binding values use Hyprland's `"<modifiers>, <key>"` form. They are merged with
@@ -404,29 +419,28 @@ Transient popup menus may dismiss when the overlay takes keyboard focus;
 those cannot be reliably selected with the current exclusive layer-shell
 overlay. Avoid claiming success for menu items whose popup has closed.
 
-The Home Manager opt-in `services.univim.hyprland.singlePressCapsLock = true;`
-(with `hyprland.enable = true`) generates consuming CapsLock, Shift+CapsLock
-and Alt+CapsLock bindings for hints, grid and debug. It adds `caps:none` XKB
-mapping and binds physical `code:66`, because consuming binds alone need not
-prevent the compositor's CapsLock state from toggling. If you already set
-Hyprland `input.kb_options`, merge your existing options with `caps:none`
-yourself (for example `"grp:alt_shift_toggle,caps:none"`) and give that
-definition priority with `lib.mkForce` if necessary; the module does not
-silently discard your existing keyboard options. It disables UniVim's
-passive double-tap evdev gestures and conflicts with `doubleTapCapsLock`.
-It replaces normal CapsLock behavior; test the bindings in your Hyprland
-session before relying on them. Nothing edits external configuration.
 With `services.univim.hyprland.enable = true`, left Alt defaults to **double-tap
-for hints** (`hyprland.altActivation = "double"`). Set it to `"single"` to
-open hints on one left Alt press, or `"off"` to leave left Alt unbound.
+for hints** (`activationKey = "left-alt"; doubleTap = true;`). Use
+`activationKey = "left-ctrl"` for left Ctrl, `"caps-lock"` for CapsLock, or
+`"off"` for no activation gesture. `doubleTap = false` makes one press open
+hints. `disableCapsLock = true` sets `caps:none` regardless of activation key;
+merge any existing Hyprland `input.kb_options` yourself. Single-press CapsLock
+also binds Shift+Caps to grid and Alt+Caps to debug. These shortcuts are opt-in
+and do not modify external configuration files.
 The non-consuming shortcut leaves ordinary Alt events available, but a single
 press also activates on the first press of ordinary Alt chords. Double-tap
 recognition via compositor global shortcuts is best-effort: unrelated keys
-between taps cannot always be detected. Right Alt is never bound by this option.
+between taps cannot always be detected. Right Alt/Ctrl are never bound by this option.
 The modifier-only binding uses an empty modifier field (`bindn = , Alt_L`):
 requiring `ALT` as a modifier prevents Hyprland from matching the Alt key itself.
-CapsLock modes remain separately opt-in; disable single-press CapsLock if you
-want its normal lock behavior alongside the Alt shortcut.
+
+The desktop overlay uses larger fonts by default: hint labels use scale 0.68
+instead of 0.36, and the status pill, typed-keystroke display, debug HUD and
+options menu use `uiScale = 1.6`. Configure both sizes and the six `#RRGGBB`
+colors via `settings.appearance` (example above). As you type a partial hint,
+matching labels emphasize the typed prefix in bold `typedForeground`; completed
+hints select their target immediately. These are desktop-only presentation
+settings; detector output and annotated snapshots keep their reference styling.
 
 `services.univim.settings.pointerMotion` selects `"instant"` (default),
 `"linear"` or `"ease_out"`; `pointerSpeed` (200–6000 logical px/s, default 1600)

@@ -1,5 +1,5 @@
 use super::{
-    PointerMotion, RuntimeSettings,
+    Appearance, PointerMotion, RuntimeSettings,
     geometry::FrameGeometry,
     session::{DebugView, Mode, Session},
 };
@@ -24,17 +24,22 @@ pub fn render_session_surface(
     debug_data: Option<&DebugData>,
     settings: &RuntimeSettings,
 ) -> opencv::Result<RenderedSurface> {
-    let mut canvas =
-        render_debug_stage_canvas(base_bgr, session, debug_data, settings.spotlight_dim)?;
+    let mut canvas = render_debug_stage_canvas_styled(
+        base_bgr,
+        session,
+        debug_data,
+        settings.spotlight_dim,
+        Some(&settings.appearance),
+    )?;
 
     draw_focused_window_And_reticule(&mut canvas, session)?;
 
     if settings.show_status_bar || !session.typed().is_empty() || session.show_debug_hud() {
-        draw_status_pill(&mut canvas, session)?;
+        draw_status_pill(&mut canvas, session, &settings.appearance)?;
     }
 
     if session.show_debug_hud() {
-        draw_debug_hud(&mut canvas, session, debug_data)?;
+        draw_debug_hud(&mut canvas, session, debug_data, &settings.appearance)?;
     }
 
     if session.show_options_menu() {
@@ -55,12 +60,22 @@ pub(super) fn render_debug_stage_canvas(
     debug_data: Option<&DebugData>,
     spotlight_dim: bool,
 ) -> opencv::Result<Mat> {
+    render_debug_stage_canvas_styled(base_bgr, session, debug_data, spotlight_dim, None)
+}
+
+fn render_debug_stage_canvas_styled(
+    base_bgr: &Mat,
+    session: &Session,
+    debug_data: Option<&DebugData>,
+    spotlight_dim: bool,
+    appearance: Option<&Appearance>,
+) -> opencv::Result<Mat> {
     let Some(dbg) = debug_data else {
         let mut base = base_bgr.try_clone()?;
         if spotlight_dim {
             dim_mat_with_focus(&mut base, session.focused_rect())?;
         }
-        return render_standard_overlay(&base, session);
+        return render_standard_overlay(&base, session, appearance);
     };
 
     match session.debug_view() {
@@ -69,7 +84,7 @@ pub(super) fn render_debug_stage_canvas(
             if spotlight_dim {
                 dim_mat_with_focus(&mut base, session.focused_rect())?;
             }
-            render_standard_overlay(&base, session)
+            render_standard_overlay(&base, session, appearance)
         }
         DebugView::RawPhysics => {
             let mut vis = base_bgr.try_clone()?;
@@ -169,12 +184,24 @@ pub(super) fn render_debug_stage_canvas(
     }
 }
 
-fn render_standard_overlay(base_bgr: &Mat, session: &Session) -> opencv::Result<Mat> {
+fn render_standard_overlay(
+    base_bgr: &Mat,
+    session: &Session,
+    appearance: Option<&Appearance>,
+) -> opencv::Result<Mat> {
     let filtered = visible_targets(session.targets(), session.typed());
     match session.mode() {
         // Drill-down sessions already replace their targets with the immediate
         // children, so the ordinary labelled overlay is the correct surface.
-        Mode::Hints | Mode::Drilldown | Mode::Grid => crate::render::overlay(base_bgr, &filtered),
+        Mode::Hints | Mode::Drilldown | Mode::Grid => {
+            let style = appearance.map(|a| crate::render::BadgeStyle {
+                font_scale: a.hint_font_scale,
+                background: Appearance::color(&a.badge_background),
+                foreground: Appearance::color(&a.badge_foreground),
+                typed_foreground: Appearance::color(&a.typed_foreground),
+            });
+            crate::render::overlay_with_style(base_bgr, &filtered, session.typed(), style.as_ref())
+        }
     }
 }
 
@@ -387,7 +414,15 @@ fn visible_targets(targets: &[Target], typed: &str) -> Vec<Target> {
         .collect()
 }
 
-fn draw_status_pill(canvas: &mut Mat, session: &Session) -> opencv::Result<()> {
+fn scaled(value: i32, scale: f64) -> i32 {
+    ((value as f64 * scale).round() as i32).max(1)
+}
+
+fn draw_status_pill(
+    canvas: &mut Mat,
+    session: &Session,
+    appearance: &Appearance,
+) -> opencv::Result<()> {
     let mode_text = match session.mode() {
         Mode::Hints => "HINTS",
         Mode::Drilldown => "DRILL",
@@ -435,14 +470,14 @@ fn draw_status_pill(canvas: &mut Mat, session: &Session) -> opencv::Result<()> {
     );
 
     let font = imgproc::FONT_HERSHEY_SIMPLEX;
-    let scale = 0.44;
+    let scale = 0.44 * appearance.ui_scale;
     let thickness = 1;
     let mut baseline = 0;
     let size = imgproc::get_text_size(&status, font, scale, thickness, &mut baseline)?;
-    let pad_x = 10;
-    let pad_y = 7;
-    let x = 14;
-    let y = 14;
+    let pad_x = scaled(10, appearance.ui_scale);
+    let pad_y = scaled(7, appearance.ui_scale);
+    let x = scaled(14, appearance.ui_scale);
+    let y = scaled(14, appearance.ui_scale);
     let rect = Rect::new(
         x,
         y,
@@ -453,7 +488,7 @@ fn draw_status_pill(canvas: &mut Mat, session: &Session) -> opencv::Result<()> {
     imgproc::rectangle(
         canvas,
         rect,
-        Scalar::new(20.0, 18.0, 18.0, 0.0),
+        Appearance::color(&appearance.ui_background),
         -1,
         imgproc::LINE_8,
         0,
@@ -461,7 +496,7 @@ fn draw_status_pill(canvas: &mut Mat, session: &Session) -> opencv::Result<()> {
     let border_col = if session.cached_hit() {
         Scalar::new(80.0, 235.0, 130.0, 0.0)
     } else {
-        Scalar::new(0.0, 200.0, 255.0, 0.0)
+        Appearance::color(&appearance.ui_accent)
     };
     imgproc::rectangle(canvas, rect, border_col, 1, imgproc::LINE_8, 0)?;
     imgproc::put_text(
@@ -470,7 +505,7 @@ fn draw_status_pill(canvas: &mut Mat, session: &Session) -> opencv::Result<()> {
         Point::new(x + pad_x, y + pad_y + size.height - 1),
         font,
         scale,
-        Scalar::new(240.0, 245.0, 250.0, 0.0),
+        Appearance::color(&appearance.ui_foreground),
         thickness,
         LINE_AA,
         false,
@@ -482,17 +517,19 @@ fn draw_debug_hud(
     canvas: &mut Mat,
     session: &Session,
     debug_data: Option<&DebugData>,
+    appearance: &Appearance,
 ) -> opencv::Result<()> {
-    let panel_w = 385.min(canvas.cols() - 24).max(220);
-    let panel_h = 250.min(canvas.rows() - 24).max(140);
-    let x = (canvas.cols() - panel_w - 14).max(8);
-    let y = 14;
+    let scale = appearance.ui_scale;
+    let panel_w = scaled(385, scale).min(canvas.cols() - 24).max(220);
+    let panel_h = scaled(250, scale).min(canvas.rows() - 24).max(140);
+    let x = (canvas.cols() - panel_w - scaled(14, scale)).max(8);
+    let y = scaled(14, scale);
     let rect = Rect::new(x, y, panel_w, panel_h);
 
     imgproc::rectangle(
         canvas,
         rect,
-        Scalar::new(18.0, 16.0, 22.0, 0.0),
+        Appearance::color(&appearance.ui_background),
         -1,
         imgproc::LINE_8,
         0,
@@ -500,40 +537,40 @@ fn draw_debug_hud(
     imgproc::rectangle(
         canvas,
         rect,
-        Scalar::new(90.0, 210.0, 255.0, 0.0),
+        Appearance::color(&appearance.ui_accent),
         1,
         imgproc::LINE_8,
         0,
     )?;
 
     let font = imgproc::FONT_HERSHEY_SIMPLEX;
-    let mut cy = y + 22;
+    let mut cy = y + scaled(22, scale);
     let title = format!("PIPELINE INSPECTOR ({})", session.debug_view().label());
     imgproc::put_text(
         canvas,
         &title,
-        Point::new(x + 12, cy),
+        Point::new(x + scaled(12, scale), cy),
         font,
-        0.46,
-        Scalar::new(80.0, 220.0, 255.0, 0.0),
+        0.46 * scale,
+        Appearance::color(&appearance.ui_accent),
         1,
         LINE_AA,
         false,
     )?;
-    cy += 18;
+    cy += scaled(18, scale);
 
     imgproc::put_text(
         canvas,
         "Views 1..6 visualizations | F3/F4 cycle | F2 hide",
-        Point::new(x + 12, cy),
+        Point::new(x + scaled(12, scale), cy),
         font,
-        0.38,
-        Scalar::new(175.0, 185.0, 195.0, 0.0),
+        0.38 * scale,
+        Appearance::color(&appearance.ui_foreground),
         1,
         LINE_AA,
         false,
     )?;
-    cy += 20;
+    cy += scaled(20, scale);
 
     if let Some(dbg) = debug_data {
         let p = &dbg.physics;
@@ -564,17 +601,17 @@ fn draw_debug_hud(
             imgproc::put_text(
                 canvas,
                 line,
-                Point::new(x + 12, cy),
+                Point::new(x + scaled(12, scale), cy),
                 font,
-                0.38,
-                Scalar::new(235.0, 240.0, 245.0, 0.0),
+                0.38 * scale,
+                Appearance::color(&appearance.ui_foreground),
                 1,
                 LINE_AA,
                 false,
             )?;
-            cy += 17;
+            cy += scaled(17, scale);
         }
-        cy += 4;
+        cy += scaled(4, scale);
 
         let stages = [
             (
@@ -599,16 +636,16 @@ fn draw_debug_hud(
             ),
         ];
         let denom = t.total_ms.max(1.0);
-        let bar_max_w = (panel_w - 165).max(40);
+        let bar_max_w = (panel_w - scaled(165, scale)).max(40);
         for (name, ms, col) in stages {
             let label = format!("{name:<12} {:>5.1}ms", ms);
             imgproc::put_text(
                 canvas,
                 &label,
-                Point::new(x + 12, cy),
+                Point::new(x + scaled(12, scale), cy),
                 font,
-                0.37,
-                Scalar::new(220.0, 225.0, 230.0, 0.0),
+                0.37 * scale,
+                Appearance::color(&appearance.ui_foreground),
                 1,
                 LINE_AA,
                 false,
@@ -616,22 +653,27 @@ fn draw_debug_hud(
             let bw = (((ms / denom) * (bar_max_w as f64)).round() as i32).clamp(2, bar_max_w);
             imgproc::rectangle(
                 canvas,
-                Rect::new(x + 150, cy - 9, bw, 9),
+                Rect::new(
+                    x + scaled(150, scale),
+                    cy - scaled(9, scale),
+                    bw,
+                    scaled(9, scale),
+                ),
                 col,
                 -1,
                 imgproc::LINE_8,
                 0,
             )?;
-            cy += 16;
+            cy += scaled(16, scale);
         }
     } else {
         imgproc::put_text(
             canvas,
             "Debug buffers unavailable in Grid mode.",
-            Point::new(x + 12, cy),
+            Point::new(x + scaled(12, scale), cy),
             font,
-            0.40,
-            Scalar::new(200.0, 200.0, 200.0, 0.0),
+            0.40 * scale,
+            Appearance::color(&appearance.ui_foreground),
             1,
             LINE_AA,
             false,
@@ -646,8 +688,9 @@ fn draw_options_modal(
     session: &Session,
     settings: &RuntimeSettings,
 ) -> opencv::Result<()> {
-    let modal_w = 460.min(canvas.cols() - 24).max(260);
-    let modal_h = 370.min(canvas.rows() - 24).max(200);
+    let scale = settings.appearance.ui_scale;
+    let modal_w = scaled(620, scale).min(canvas.cols() - 24).max(260);
+    let modal_h = scaled(370, scale).min(canvas.rows() - 24).max(200);
     let x = ((canvas.cols() - modal_w) / 2).max(8);
     let y = ((canvas.rows() - modal_h) / 2).max(8);
     let rect = Rect::new(x, y, modal_w, modal_h);
@@ -655,7 +698,7 @@ fn draw_options_modal(
     imgproc::rectangle(
         canvas,
         rect,
-        Scalar::new(22.0, 20.0, 26.0, 0.0),
+        Appearance::color(&settings.appearance.ui_background),
         -1,
         imgproc::LINE_8,
         0,
@@ -663,26 +706,26 @@ fn draw_options_modal(
     imgproc::rectangle(
         canvas,
         rect,
-        Scalar::new(0.0, 215.0, 140.0, 0.0),
+        Appearance::color(&settings.appearance.ui_accent),
         2,
         imgproc::LINE_8,
         0,
     )?;
 
     let font = imgproc::FONT_HERSHEY_SIMPLEX;
-    let mut cy = y + 26;
+    let mut cy = y + scaled(26, scale);
     imgproc::put_text(
         canvas,
         "UNIVIM OPTIONS MENU (j/k select, h/l adjust, s save, Esc close)",
-        Point::new(x + 14, cy),
+        Point::new(x + scaled(14, scale), cy),
         font,
-        0.41,
-        Scalar::new(90.0, 240.0, 160.0, 0.0),
+        0.41 * scale,
+        Appearance::color(&settings.appearance.ui_accent),
         1,
         LINE_AA,
         false,
     )?;
-    cy += 24;
+    cy += scaled(24, scale);
 
     let rows = [
         (
@@ -702,7 +745,7 @@ fn draw_options_modal(
             on_off(settings.detector.collapse_paragraphs),
         ),
         (
-            "Double-Tap Window (Caps)",
+            "Double-Tap Window",
             format!("{} ms", settings.double_tap_ms),
         ),
         ("1st-Tap Cache TTL", format!("{} ms", settings.cache_ttl_ms)),
@@ -725,7 +768,12 @@ fn draw_options_modal(
         if selected {
             imgproc::rectangle(
                 canvas,
-                Rect::new(x + 10, cy - 15, modal_w - 20, 21),
+                Rect::new(
+                    x + scaled(10, scale),
+                    cy - scaled(15, scale),
+                    modal_w - scaled(20, scale),
+                    scaled(21, scale),
+                ),
                 Scalar::new(55.0, 50.0, 68.0, 0.0),
                 -1,
                 imgproc::LINE_8,
@@ -735,16 +783,16 @@ fn draw_options_modal(
         let prefix = if selected { "> " } else { "  " };
         let text = format!("{prefix}{label}");
         let color = if selected {
-            Scalar::new(110.0, 250.0, 180.0, 0.0)
+            Appearance::color(&settings.appearance.ui_accent)
         } else {
-            Scalar::new(225.0, 230.0, 235.0, 0.0)
+            Appearance::color(&settings.appearance.ui_foreground)
         };
         imgproc::put_text(
             canvas,
             &text,
-            Point::new(x + 14, cy),
+            Point::new(x + scaled(14, scale), cy),
             font,
-            0.42,
+            0.42 * scale,
             color,
             1,
             LINE_AA,
@@ -753,15 +801,15 @@ fn draw_options_modal(
         imgproc::put_text(
             canvas,
             val,
-            Point::new(x + modal_w - 115, cy),
+            Point::new(x + modal_w - scaled(135, scale), cy),
             font,
-            0.42,
+            0.42 * scale,
             color,
             1,
             LINE_AA,
             false,
         )?;
-        cy += 24;
+        cy += scaled(24, scale);
     }
 
     Ok(())

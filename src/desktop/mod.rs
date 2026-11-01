@@ -27,6 +27,7 @@ pub enum CommandAction {
     DebugOpen,
     TapCaps,
     TapAlt,
+    TapCtrl,
     ToggleDebug,
     ToggleOptions,
     Stop,
@@ -40,6 +41,7 @@ impl CommandAction {
             Self::DebugOpen => "debug-open\n",
             Self::TapCaps => "tap-caps\n",
             Self::TapAlt => "tap-alt\n",
+            Self::TapCtrl => "tap-ctrl\n",
             Self::ToggleDebug => "toggle-debug\n",
             Self::ToggleOptions => "toggle-options\n",
             Self::Stop => "stop\n",
@@ -53,6 +55,7 @@ impl CommandAction {
             "debug-open" => Some(Self::DebugOpen),
             "tap-caps" | "tap_caps" | "caps" => Some(Self::TapCaps),
             "tap-alt" | "tap_alt" => Some(Self::TapAlt),
+            "tap-ctrl" | "tap_ctrl" => Some(Self::TapCtrl),
             "toggle-debug" | "debug" => Some(Self::ToggleDebug),
             "toggle-options" | "options" => Some(Self::ToggleOptions),
             "stop" => Some(Self::Stop),
@@ -92,6 +95,52 @@ pub struct RuntimeSettings {
     pub pointer_motion: PointerMotion,
     #[serde(default = "default_pointer_speed")]
     pub pointer_speed: u32,
+    #[serde(default)]
+    pub appearance: Appearance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Appearance {
+    pub hint_font_scale: f64,
+    pub ui_scale: f64,
+    pub badge_background: String,
+    pub badge_foreground: String,
+    pub typed_foreground: String,
+    pub ui_background: String,
+    pub ui_foreground: String,
+    pub ui_accent: String,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            hint_font_scale: 0.68,
+            ui_scale: 1.6,
+            badge_background: "#FFD737".into(),
+            badge_foreground: "#0A0A0A".into(),
+            typed_foreground: "#5B158C".into(),
+            ui_background: "#121214".into(),
+            ui_foreground: "#FAF5F0".into(),
+            ui_accent: "#FFD000".into(),
+        }
+    }
+}
+
+impl Appearance {
+    pub fn color(value: &str) -> opencv::core::Scalar {
+        let hex = value.strip_prefix('#').unwrap_or("");
+        if hex.len() != 6 || !hex.is_ascii() {
+            return opencv::core::Scalar::all(255.);
+        }
+        let rgb = (0..3)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
+            .collect::<Result<Vec<_>, _>>();
+        match rgb {
+            Ok(rgb) => opencv::core::Scalar::new(rgb[2].into(), rgb[1].into(), rgb[0].into(), 0.),
+            Err(_) => opencv::core::Scalar::all(255.),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +175,7 @@ impl Default for RuntimeSettings {
             show_status_bar: true,
             pointer_motion: PointerMotion::Instant,
             pointer_speed: default_pointer_speed(),
+            appearance: Appearance::default(),
         }
     }
 }
@@ -312,6 +362,15 @@ mod tests {
         assert!(!settings.detector.turbo);
         assert_eq!(settings.double_tap_ms, 240);
         assert!(!settings.use_evdev);
+        assert_eq!(settings.appearance.hint_font_scale, 0.68);
+        assert_eq!(settings.appearance.ui_scale, 1.6);
+        let appearance: super::Appearance = serde_json::from_str(
+            r##"{"hint_font_scale":1.0,"ui_scale":2.0,"typed_foreground":"#123456"}"##,
+        )
+        .unwrap();
+        assert_eq!(appearance.hint_font_scale, 1.0);
+        assert_eq!(appearance.ui_scale, 2.0);
+        assert_eq!(appearance.typed_foreground, "#123456");
         assert_eq!(settings.timeout_secs, 30);
         assert!(!settings.no_click);
     }

@@ -808,7 +808,16 @@ impl DaemonState {
                 qh,
                 CommandAction::TapAlt,
             );
-            self.shortcuts.extend([hints, grid, tap_caps, tap_alt]);
+            let tap_ctrl = manager.register_shortcut(
+                "ctrl-left".to_string(),
+                "univim".to_string(),
+                "Double-tap left Ctrl to show hints".to_string(),
+                "Warm up on the first left Ctrl tap and show hints on the second".to_string(),
+                qh,
+                CommandAction::TapCtrl,
+            );
+            self.shortcuts
+                .extend([hints, grid, tap_caps, tap_alt, tap_ctrl]);
         }
         Ok(())
     }
@@ -875,7 +884,13 @@ impl DaemonState {
         qh: &QueueHandle<Self>,
     ) -> Result<(), String> {
         match (key, tap_ev) {
-            (GestureKey::CapsLock | GestureKey::LeftAlt | GestureKey::Debug, TapEvent::Warmup) => {
+            (
+                GestureKey::CapsLock
+                | GestureKey::LeftAlt
+                | GestureKey::LeftCtrl
+                | GestureKey::Debug,
+                TapEvent::Warmup,
+            ) => {
                 let ttl = Duration::from_millis(self.settings.cache_ttl_ms);
                 let has_fresh_cache = self
                     .cached_frame
@@ -886,7 +901,10 @@ impl DaemonState {
                 }
             }
             (
-                GestureKey::CapsLock | GestureKey::LeftAlt | GestureKey::Debug,
+                GestureKey::CapsLock
+                | GestureKey::LeftAlt
+                | GestureKey::LeftCtrl
+                | GestureKey::Debug,
                 TapEvent::Activate,
             ) => {
                 self.debug_on_present = key == GestureKey::Debug;
@@ -983,15 +1001,15 @@ impl DaemonState {
                 }
                 return Ok(());
             }
-            CommandAction::TapCaps | CommandAction::TapAlt => {
+            CommandAction::TapCaps | CommandAction::TapAlt | CommandAction::TapCtrl => {
                 if self.overlay.is_some() {
                     self.close_overlay();
                     return Ok(());
                 }
-                let key = if action == CommandAction::TapAlt {
-                    GestureKey::LeftAlt
-                } else {
-                    GestureKey::CapsLock
+                let key = match action {
+                    CommandAction::TapAlt => GestureKey::LeftAlt,
+                    CommandAction::TapCtrl => GestureKey::LeftCtrl,
+                    _ => GestureKey::CapsLock,
                 };
                 let ev = self.tap_tracker.on_tap(
                     key,
