@@ -189,6 +189,15 @@ def fixtures(quick):
                                 "import cv2", "import numpy as np")):
         text(table, code, 100, 520 + row * 35, 0.64)
     yield "column-rails-and-code", table
+    # Square glyph pairs with short and long gaps exercise the two-primitive
+    # space threshold and prevent badge-clearance merging across icon gutters.
+    glyph_pairs = np.full((480, 640, 3), 250, np.uint8)
+    for row, gap in enumerate((3, 5, 8, 12)):
+        y = 65 + row * 90
+        text(glyph_pairs, "O", 80, y, 0.75)
+        text(glyph_pairs, "O", 97 + gap, y, 0.75)
+        text(glyph_pairs, "A B", 220, y, 0.75)
+    yield "square-glyph-pairs", glyph_pairs
     # Borderless rounded pills exercise contour-ladder recovery of controls
     # without rectangular card borders; the ellipse has no pure H/V seed.
     pills = np.full((900, 1440, 3), 246, np.uint8)

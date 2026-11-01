@@ -364,15 +364,28 @@ pub fn score_and_segment(
         let p85_pw = percentile(&v_widths, k85_w) as f64;
         let k65_g = ((gaps_f32.len() as f64 * 0.65) as usize).min(gaps_f32.len() - 1);
         let kern_base = percentile(&gaps_f32, k65_g) as f64;
-        let is_monospace = p85_pw <= 0.56 * rh as f64 && p85_pw <= 1.45 * med_pw;
+        let icon_pair = valid.len() == 2
+            && v_widths
+                .iter()
+                .all(|&width| (0.68..=1.38).contains(&(width as f64 / rh.max(1) as f64)));
+        let is_monospace = p85_pw <= 0.56 * rh as f64
+            && p85_pw <= 1.45 * med_pw
+            && !(g_max >= 4.max((rh as f64 * 0.45).round_ties_even() as i32) as f64
+                && kern_base <= 2.0
+                && g_max >= 3.0 * kern_base.max(1.0))
+            && !(icon_pair && gaps[0] >= 3.max((rh as f64 * 0.22).round_ties_even() as i32));
         let kern_prop = percentile(&gaps_f32, gaps.len() >> 1) as f64;
         let min_space_thr = if is_monospace {
             ((rh as f64 * 0.36).round_ties_even() as i32)
                 .max((kern_base * 2.2).round_ties_even() as i32 + 1)
                 .max((med_pw * 0.85).round_ties_even() as i32)
         } else {
-            3.max((rh as f64 * 0.22).round_ties_even() as i32)
-                .max((kern_prop * 1.9).round_ties_even() as i32 + 1)
+            let base = 3.max((rh as f64 * 0.22).round_ties_even() as i32);
+            if icon_pair {
+                base
+            } else {
+                base.max((kern_prop * 1.9).round_ties_even() as i32 + 1)
+            }
         };
         if g_max < min_space_thr as f64 {
             raw_words.push((valid[0].0, valid.last().unwrap().1, valid.len()));
@@ -481,7 +494,17 @@ pub fn score_and_segment(
             let (px0, px1) = *merged.last().unwrap();
             let (pw, cw) = (px1 - px0, wx1 - wx0);
             let gap = wx0 - px1;
-            if gap <= max_attach_gap && (pw < min_standalone_w || cw < min_standalone_w) {
+            let icon_width =
+                |width: i32| (0.68..=1.38).contains(&(width as f64 / rh.max(1) as f64));
+            let icon_sep = (gap >= 4.max((rh as f64 * 0.45).round_ties_even() as i32)
+                && (icon_width(pw) || icon_width(cw)))
+                || (gap >= 3.max((rh as f64 * 0.22).round_ties_even() as i32)
+                    && icon_width(pw)
+                    && icon_width(cw));
+            if !icon_sep
+                && gap <= max_attach_gap
+                && (pw < min_standalone_w || cw < min_standalone_w)
+            {
                 *merged.last_mut().unwrap() = (px0, wx1);
             } else {
                 merged.push((wx0, wx1));

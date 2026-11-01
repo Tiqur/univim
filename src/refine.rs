@@ -616,7 +616,15 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
         let min_g_thr = if is_micro_icon {
             60.
         } else if is_single_char_ui {
-            85.
+            if local_flat >= 0.65
+                && rw >= 7
+                && rh >= 7
+                && (0.65..=1.50).contains(&(rw as f64 / rh.max(1) as f64))
+            {
+                42.
+            } else {
+                85.
+            }
         } else if local_flat >= 0.58 {
             42.
         } else {
