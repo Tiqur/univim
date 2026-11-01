@@ -335,8 +335,9 @@ The session timeout defaults to 30 seconds
 
 In hints mode, type a label to select its target and click its center. Labels
 filter as you type without being reassigned. Hold **Shift** or **Ctrl** on the
-final hint character to drill into immediate children (Shift) or word fragments
-(Ctrl). **Backspace** edits the prefix, or returns to the parent when the prefix
+final hint character to drill: Shift reaches word fragments and Ctrl reaches
+immediate children. On a leaf, Shift middle-clicks and Ctrl right-clicks.
+**Backspace** edits the prefix, or returns to the parent when the prefix
 is empty. **Escape** cancels. **Arrow keys** or **Ctrl+H/J/K/L** snap a
 reticule to the nearest target; **Enter** clicks it. **;** or **Tab** cycles the
 click action, **v** starts a two-point drag, **Ctrl+W** toggles focused-window
