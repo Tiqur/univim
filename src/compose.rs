@@ -496,65 +496,103 @@ pub fn compose(
                 }
             }
             row_cands.sort_by_key(|&k| rem_rbs[k].x);
-            let first_k = row_cands[0];
-            let first = &rem_rbs[first_k];
-            let (first_y, first_h) = (first.y, first.h);
-            let mut same_row = vec![first_k];
-            used_consolidated[first_k] = true;
-            let mut curr_right = first.right();
-            let mut curr_h = first.h;
-            for &k in &row_cands[1..] {
-                if used_consolidated[k] {
+            for &first_k in &row_cands {
+                if used_consolidated[first_k] {
                     continue;
                 }
-                let candidate = &rem_rbs[k];
-                let h_gap = candidate.x - curr_right;
-                let max_merge_gap =
-                    (1.8 * (curr_h.max(candidate.h) as f64).max(state.l0)).round_ties_even() as i32;
-                let min_merge_gap = -((0.25 * curr_h as f64).round_ties_even() as i32);
-                if (min_merge_gap..=max_merge_gap).contains(&h_gap) {
-                    let (gy1, gy2) = (
-                        first_y.max(candidate.y),
-                        (first_y + first_h).min(candidate.bottom()),
+                let first = &rem_rbs[first_k];
+                let mut same_row = vec![first_k];
+                used_consolidated[first_k] = true;
+                let (mut curr_x0, mut curr_y0, mut curr_right, mut curr_y1) =
+                    (first.x, first.y, first.right(), first.bottom());
+                let mut curr_h = first.h;
+                let mut env_area = first.area() as f64;
+                let mut word_area = env_area;
+                for &k in &row_cands {
+                    if used_consolidated[k] || rem_rbs[k].x < curr_x0 {
+                        continue;
+                    }
+                    let candidate = &rem_rbs[k];
+                    let h_gap = candidate.x - curr_right;
+                    let max_gap = (2.45 * (curr_h.max(candidate.h) as f64).max(state.l0))
+                        .round_ties_even() as i32;
+                    if !(-((0.25 * curr_h as f64).round_ties_even() as i32)..=max_gap)
+                        .contains(&h_gap)
+                    {
+                        continue;
+                    }
+                    let rail = rem_rbs
+                        .iter()
+                        .filter(|rb| {
+                            matches!(rb.kind.as_str(), "text_block" | "text_link" | "inline_link")
+                                && (rb.x - candidate.x).abs()
+                                    <= 4.max((0.28 * state.l0).round_ties_even() as i32)
+                                && (rb.y - candidate.y).abs()
+                                    <= (12.0 * state.l0).round_ties_even() as i32
+                        })
+                        .count()
+                        >= 4;
+                    if h_gap >= 3.max((0.22 * curr_h as f64).round_ties_even() as i32)
+                        && curr_right - curr_x0 <= (12.0 * state.l0).round_ties_even() as i32
+                        && rail
+                    {
+                        continue;
+                    }
+                    let (gy1, gy2) = (curr_y0.max(candidate.y), curr_y1.min(candidate.bottom()));
+                    if candidate.x > curr_right
+                        && gy2 > gy1
+                        && pure_column_barrier(curr_right, gy1, candidate.x, gy2)?
+                    {
+                        continue;
+                    }
+                    let (nx0, ny0, nx1, ny1) = (
+                        curr_x0.min(candidate.x),
+                        curr_y0.min(candidate.y),
+                        curr_right.max(candidate.right()),
+                        curr_y1.max(candidate.bottom()),
                     );
-                    let (gx1, gx2) = (curr_right, candidate.x);
-                    if gx2 > gx1 && gy2 > gy1 && pure_column_barrier(gx1, gy1, gx2, gy2)? {
+                    let new_area = ((nx1 - nx0) * (ny1 - ny0)) as f64;
+                    let seg_area = candidate.area() as f64;
+                    if new_area < env_area + 0.50 * seg_area
+                        || (word_area + seg_area) / new_area.max(1.0) < 0.58
+                    {
                         continue;
                     }
                     same_row.push(k);
                     used_consolidated[k] = true;
-                    curr_right = curr_right.max(candidate.right());
-                    curr_h = curr_h.max(candidate.h);
+                    (curr_x0, curr_y0, curr_right, curr_y1) = (nx0, ny0, nx1, ny1);
+                    curr_h = ny1 - ny0;
+                    env_area = new_area;
+                    word_area += seg_area;
                 }
-            }
-
-            if same_row.len() == 1 {
-                line_consolidated.push(rem_rbs[same_row[0]].clone());
-                continue;
-            }
-            let lx = same_row.iter().map(|&k| rem_rbs[k].x).min().unwrap();
-            let ly = same_row.iter().map(|&k| rem_rbs[k].y).min().unwrap();
-            let lw = same_row.iter().map(|&k| rem_rbs[k].right()).max().unwrap() - lx;
-            let lh = same_row.iter().map(|&k| rem_rbs[k].bottom()).max().unwrap() - ly;
-            let mut line = Target::new(lx, ly, lw, lh, 0.85, "text_block", "line");
-            for &k in &same_row {
-                let fragment = &rem_rbs[k];
-                if !fragment.children.is_empty() {
-                    line.children.extend(fragment.children.iter().cloned());
-                } else {
-                    let (kind, level) = if fragment.kind == "inline_link" {
-                        ("inline_link", "control")
+                if same_row.len() == 1 {
+                    line_consolidated.push(rem_rbs[first_k].clone());
+                    continue;
+                }
+                let lx = same_row.iter().map(|&k| rem_rbs[k].x).min().unwrap();
+                let ly = same_row.iter().map(|&k| rem_rbs[k].y).min().unwrap();
+                let lw = same_row.iter().map(|&k| rem_rbs[k].right()).max().unwrap() - lx;
+                let lh = same_row.iter().map(|&k| rem_rbs[k].bottom()).max().unwrap() - ly;
+                let mut line = Target::new(lx, ly, lw, lh, 0.85, "text_block", "line");
+                for &k in &same_row {
+                    let fragment = &rem_rbs[k];
+                    if !fragment.children.is_empty() {
+                        line.children.extend(fragment.children.iter().cloned());
                     } else {
-                        ("word", "word")
-                    };
-                    line.children.push(make_child(fragment, kind, level, ""));
+                        let (kind, level) = if fragment.kind == "inline_link" {
+                            ("inline_link", "control")
+                        } else {
+                            ("word", "word")
+                        };
+                        line.children.push(make_child(fragment, kind, level, ""));
+                    }
                 }
+                let labels = hints(line.children.len());
+                for (item, label) in line.children.iter_mut().zip(labels) {
+                    item["hint"] = serde_json::json!(label);
+                }
+                line_consolidated.push(line);
             }
-            let labels = hints(line.children.len());
-            for (item, label) in line.children.iter_mut().zip(labels) {
-                item["hint"] = serde_json::json!(label);
-            }
-            line_consolidated.push(line);
         }
         rem_rbs = line_consolidated;
 
@@ -588,6 +626,11 @@ pub fn compose(
             let mut curr_left = curr.x;
             let mut curr_h = curr.h;
             let mut prev_pitch: Option<i32> = None;
+            let (mut px0, mut py0, mut px1, mut py1) =
+                (curr.x, curr.y, curr.right(), curr.bottom());
+            let mut para_area = curr.area() as f64;
+            let mut line_area = para_area;
+            let mut max_width = curr.w;
 
             for &idx2 in &text_line_indices {
                 if merged[idx2] {
@@ -617,10 +660,40 @@ pub fn compose(
                 if pure_row_barrier(x1, curr.bottom(), x2, candidate.y)? {
                     continue;
                 }
+                if curr.w <= (10.5 * state.l0).round_ties_even() as i32
+                    && rem_rbs.iter().any(|other| {
+                        other.x >= curr.right()
+                            && (curr.bottom().min(other.bottom()) - curr.y.max(other.y)) as f64
+                                >= 0.5 * curr.h.min(other.h) as f64
+                    })
+                {
+                    continue;
+                }
+                let new_max_width = max_width.max(candidate.w);
+                if (curr.w as f64) < 0.65 * new_max_width as f64 {
+                    continue;
+                }
+                let (nx0, ny0, nx1, ny1) = (
+                    px0.min(candidate.x),
+                    py0.min(candidate.y),
+                    px1.max(candidate.right()),
+                    py1.max(candidate.bottom()),
+                );
+                let new_area = ((nx1 - nx0) * (ny1 - ny0)) as f64;
+                let candidate_area = candidate.area() as f64;
+                if new_area < para_area + 0.85 * candidate_area
+                    || (line_area + candidate_area) / new_area.max(1.0) < 0.56
+                {
+                    continue;
+                }
                 chain.push(idx2);
                 merged[idx2] = true;
                 prev_pitch = Some(pitch);
                 curr = candidate.clone();
+                (px0, py0, px1, py1) = (nx0, ny0, nx1, ny1);
+                para_area = new_area;
+                line_area += candidate_area;
+                max_width = new_max_width;
                 curr_left = {
                     let mut xs: Vec<i32> = chain.iter().map(|&k| rem_rbs[k].x).collect();
                     xs.sort_unstable();
@@ -772,7 +845,38 @@ pub fn compose(
         }
         if !absorbed {
             absorbed = clean_rbs.iter().any(|kept| {
-                overlap(&rb, kept) as f64 >= 0.65 * area as f64 && area <= kept.w * kept.h
+                if (overlap(&rb, kept) as f64) < 0.65 * area as f64 || area > kept.area() {
+                    return false;
+                }
+                if kept.level == "paragraph" && !kept.children.is_empty() {
+                    let (rx, ry, rr, rb_bottom) = (
+                        (rb.x as f64 * scale_back) as i32,
+                        (rb.y as f64 * scale_back) as i32,
+                        ((rb.x + rb.w) as f64 * scale_back) as i32,
+                        ((rb.y + rb.h) as f64 * scale_back) as i32,
+                    );
+                    let child_inter: i64 = kept
+                        .children
+                        .iter()
+                        .map(|ch| {
+                            let (x, y, w, h) = (
+                                ch["x"].as_i64().unwrap_or(0) as i32,
+                                ch["y"].as_i64().unwrap_or(0) as i32,
+                                ch["w"].as_i64().unwrap_or(0) as i32,
+                                ch["h"].as_i64().unwrap_or(0) as i32,
+                            );
+                            (0.max(rr.min(x + w) - rx.max(x))
+                                * 0.max(rb_bottom.min(y + h) - ry.max(y)))
+                                as i64
+                        })
+                        .sum();
+                    if (child_inter as f64)
+                        < 0.45 * (area as f64 * scale_back * scale_back).max(1.0)
+                    {
+                        return false;
+                    }
+                }
+                true
             });
         }
         if !absorbed {

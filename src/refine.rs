@@ -529,11 +529,35 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
                     be_t += 1;
                 }
                 let bw_t = be_t - bs_t;
-                let has_left_neutral = bs_t >= 16 && col_proj[..bs_t].iter().sum::<u64>() >= 12;
-                let has_right_neutral =
-                    rw as usize - be_t >= 16 && col_proj[be_t..].iter().sum::<u64>() >= 12;
-                if bw_t >= 26 && (has_left_neutral || has_right_neutral) {
-                    if has_left_neutral {
+                let min_side_w = 18.max((rh as f64 * 1.35).round_ties_even() as usize);
+                let left_gap_ok = bs_t == 0
+                    || (bs_t >= min_side_w
+                        && is_ink[bs_t.saturating_sub(3)..(bs_t + 2).min(rw as usize)]
+                            .iter()
+                            .filter(|&&v| v)
+                            .count()
+                            <= 2);
+                let right_gap_ok = be_t == rw as usize
+                    || (rw as usize - be_t >= min_side_w
+                        && is_ink[be_t.saturating_sub(2)..(be_t + 3).min(rw as usize)]
+                            .iter()
+                            .filter(|&&v| v)
+                            .count()
+                            <= 2);
+                let left_sum = col_proj[..bs_t].iter().sum::<u64>();
+                let right_sum = col_proj[be_t..].iter().sum::<u64>();
+                let has_left_part = bs_t >= min_side_w && left_sum >= 12;
+                let has_right_part = rw as usize - be_t >= min_side_w && right_sum >= 12;
+                let has_left_neutral = has_left_part
+                    && col_blue[..bs_t].iter().sum::<u64>() <= (left_sum as f64 * 0.12) as u64;
+                let has_right_neutral = has_right_part
+                    && col_blue[be_t..].iter().sum::<u64>() <= (right_sum as f64 * 0.12) as u64;
+                if bw_t >= 28.max((rh as f64 * 1.6).round_ties_even() as usize)
+                    && left_gap_ok
+                    && right_gap_ok
+                    && (has_left_neutral || has_right_neutral)
+                {
+                    if has_left_part {
                         refine_region(
                             state,
                             options,
@@ -551,7 +575,7 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
                         refined,
                         inner,
                     )?;
-                    if has_right_neutral {
+                    if has_right_part {
                         refine_region(
                             state,
                             options,
@@ -661,13 +685,14 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
             } else {
                 crate::glyph::score_and_segment(state, rx, ry, rw, rh)?.1
             };
-            if raw_words.len() >= 2 {
+            if !raw_words.is_empty() {
                 let word_hints = hints(raw_words.len());
                 for (wi, &(wx0, wx1)) in raw_words.iter().enumerate() {
                     let ww = wx1 - wx0;
                     let is_lead_icon = wi == 0
                         && rh >= 14
                         && (0.65..=1.40).contains(&(ww as f64 / rh as f64))
+                        && raw_words.len() >= 2
                         && raw_words[1].0 - wx1 >= 5.max((rh as f64 * 0.25) as i32);
                     target.children.push(json!({
                         "x": ((rx + wx0) as f64 * state.scale_back) as i32,

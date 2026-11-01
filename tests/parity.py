@@ -173,6 +173,22 @@ def fixtures(quick):
         for col in range(20):
             text(dense, "Menu", 14 + col * 71, 30 + row * 58, 0.43)
     yield "dense-hints", dense
+    # Repeated aligned labels and value rails exercise row partitioning and
+    # paragraph conservation across a wide table gutter; blue names exercise
+    # accent splits with neutral words on either side.
+    table = np.full((900, 1440, 3), 250, np.uint8)
+    for row, (label, value) in enumerate((
+        ("Original language", "English"), ("Written by", "William Shakespeare"),
+        ("Based on", "Legend of Amleth"), ("Characters", "Hamlet Ophelia"),
+        ("Published", "Gesta Danorum"), ("Category", "Drama"),
+    )):
+        y = 130 + row * 43
+        text(table, label, 100, y, 0.62)
+        text(table, value, 480, y, 0.62, (220, 80, 20) if row == 1 else (30, 30, 30))
+    for row, code in enumerate(("from dataclasses import dataclass, field",
+                                "import cv2", "import numpy as np")):
+        text(table, code, 100, 520 + row * 35, 0.64)
+    yield "column-rails-and-code", table
     # Borderless rounded pills exercise contour-ladder recovery of controls
     # without rectangular card borders; the ellipse has no pure H/V seed.
     pills = np.full((900, 1440, 3), 246, np.uint8)

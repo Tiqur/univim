@@ -91,11 +91,15 @@ pub fn foreground_line_bands(
     }
     let mean_thr = (peak_mean * 0.12).max((peak_mean * 0.24).min(18.0));
     let p95_thr = (peak_p95 * 0.18).max((peak_p95 * 0.36).min(52.0));
+    let stroke_peak = *strokes.iter().max().unwrap();
     let active: Vec<bool> = (0..h as usize)
         .map(|i| {
             !(means[i] as f64 <= mean_thr
                 && p95[i] as f64 <= p95_thr
-                && strokes[i] <= 2.max((w as f64 * 0.045) as i32))
+                && (strokes[i]
+                    <= 2.max((w as f64 * 0.08) as i32)
+                        .max((stroke_peak as f64 * 0.16) as i32)
+                    || (means[i] as f64 <= peak_mean * 0.10 && p95[i] as f64 <= peak_p95 * 0.15)))
         })
         .collect();
     let bands: Vec<_> = runs(&active)
@@ -360,29 +364,58 @@ pub fn score_and_segment(
         let p85_pw = percentile(&v_widths, k85_w) as f64;
         let k65_g = ((gaps_f32.len() as f64 * 0.65) as usize).min(gaps_f32.len() - 1);
         let kern_base = percentile(&gaps_f32, k65_g) as f64;
-        let min_space_thr = if p85_pw <= 0.56 * rh as f64 && p85_pw <= 1.45 * med_pw {
+        let is_monospace = p85_pw <= 0.56 * rh as f64 && p85_pw <= 1.45 * med_pw;
+        let kern_prop = percentile(&gaps_f32, gaps.len() >> 1) as f64;
+        let min_space_thr = if is_monospace {
             ((rh as f64 * 0.36).round_ties_even() as i32)
                 .max((kern_base * 2.2).round_ties_even() as i32 + 1)
                 .max((med_pw * 0.85).round_ties_even() as i32)
         } else {
-            2.max((rh as f64 * 0.20).round_ties_even() as i32)
-                .max((kern_base * 2.0).round_ties_even() as i32 + 1)
+            3.max((rh as f64 * 0.22).round_ties_even() as i32)
+                .max((kern_prop * 1.9).round_ties_even() as i32 + 1)
         };
         if g_max < min_space_thr as f64 {
             raw_words.push((valid[0].0, valid.last().unwrap().1, valid.len()));
         } else {
-            let mut start = 0;
-            for (i, &gap) in gaps.iter().enumerate() {
-                if gap >= min_space_thr {
-                    if valid[i].1 - valid[start].0 >= min_tok_w {
-                        raw_words.push((valid[start].0, valid[i].1, i - start + 1));
-                    }
-                    start = i + 1;
+            let mut boundaries = vec![0];
+            boundaries.extend(
+                gaps.iter()
+                    .enumerate()
+                    .filter_map(|(i, &gap)| (gap >= min_space_thr).then_some(i + 1)),
+            );
+            boundaries.push(valid.len());
+            for pair in boundaries.windows(2) {
+                let (start, end) = (pair[0], pair[1]);
+                if valid[end - 1].1 - valid[start].0 < min_tok_w {
+                    continue;
                 }
-            }
-            let last = valid.len() - 1;
-            if valid[last].1 - valid[start].0 >= min_tok_w {
-                raw_words.push((valid[start].0, valid[last].1, last - start + 1));
+                if !is_monospace
+                    && (valid[end - 1].1 - valid[start].0) as i32
+                        > (rh as f64 * 5.0).round_ties_even() as i32
+                    && end - start > 1
+                {
+                    let sub_thr = 4
+                        .max((rh as f64 * 0.18).round_ties_even() as i32)
+                        .max((kern_prop * 2.0).round_ties_even() as i32 + 1);
+                    let mut sub_start = start;
+                    let mut split = false;
+                    for i in start..end - 1 {
+                        if gaps[i] >= sub_thr {
+                            if valid[i].1 - valid[sub_start].0 >= min_tok_w {
+                                raw_words.push((valid[sub_start].0, valid[i].1, i - sub_start + 1));
+                            }
+                            sub_start = i + 1;
+                            split = true;
+                        }
+                    }
+                    if split {
+                        if valid[end - 1].1 - valid[sub_start].0 >= min_tok_w {
+                            raw_words.push((valid[sub_start].0, valid[end - 1].1, end - sub_start));
+                        }
+                        continue;
+                    }
+                }
+                raw_words.push((valid[start].0, valid[end - 1].1, end - start));
             }
         }
     } else if valid[0].1 - valid[0].0 >= min_tok_w {

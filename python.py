@@ -422,9 +422,11 @@ class ViselDetector:
             k65_g = min(len(gaps) - 1, int(len(gaps) * 0.65))
             kern_base = float(np.partition(gaps, k65_g)[k65_g])
 
-            if p85_pw <= 0.56 * rh and p85_pw <= 1.45 * med_pw:
+            is_monospace = bool(p85_pw <= 0.56 * rh and p85_pw <= 1.45 * med_pw)
+            if is_monospace:
                 # Discrete-character / monospace font: a space character (' ') spans at least one full
                 # character cell plus kerning (>= 0.36 * rh, >= 2.2 * kern_base + 1, and >= 0.85 * med_pw).
+                kern_prop = kern_base
                 min_space_thr = max(
                     int(round(rh * 0.36)),
                     int(round(kern_base * 2.2)) + 1,
@@ -432,12 +434,14 @@ class ViselDetector:
                 )
             else:
                 # Proportional font (mix of single characters and multi-letter fused blobs):
-                # intra-word kerning is the 65th-percentile gap (`kern_base`, typically 1 px), while
-                # inter-word spaces are >= max(0.20 * rh, 2.0 * kern_base + 1).
+                # intra-word kerning is the 50th-percentile gap (`kern_prop`, typically 1 px), while
+                # inter-word spaces are >= max(3, round(rh * 0.22), round(kern_prop * 1.9) + 1).
+                k50_g = len(gaps) >> 1
+                kern_prop = float(np.partition(gaps, k50_g)[k50_g])
                 min_space_thr = max(
-                    2,
-                    int(round(rh * 0.20)),
-                    int(round(kern_base * 2.0)) + 1,
+                    3,
+                    int(round(rh * 0.22)),
+                    int(round(kern_prop * 1.9)) + 1,
                 )
 
             if g_max < min_space_thr:
@@ -449,11 +453,23 @@ class ViselDetector:
                 w_idx_s = np.concatenate(([0], w_splits + 1))
                 w_idx_e = np.concatenate((w_splits, [len(v_starts) - 1]))
                 min_tok_w = max(2, int(round(rh * 0.22)))
-                raw_words = [
-                    (int(v_starts[i0]), int(v_ends[i1]), int(i1 - i0 + 1))
-                    for i0, i1 in zip(w_idx_s, w_idx_e)
-                    if int(v_ends[i1] - v_starts[i0]) >= min_tok_w
-                ]
+                raw_words = []
+                for i0, i1 in zip(w_idx_s, w_idx_e):
+                    ww = int(v_ends[i1] - v_starts[i0])
+                    if ww < min_tok_w:
+                        continue
+                    if not is_monospace and ww > int(round(rh * 5.0)) and i1 > i0:
+                        sub_g = gaps[i0:i1]
+                        sub_thr = max(4, int(round(rh * 0.18)), int(round(kern_prop * 2.0)) + 1)
+                        sub_sp = np.flatnonzero(sub_g >= sub_thr)
+                        if len(sub_sp) > 0:
+                            si0 = [int(i0)] + [int(i0 + sp + 1) for sp in sub_sp]
+                            si1 = [int(i0 + sp) for sp in sub_sp] + [int(i1)]
+                            for a, b_idx in zip(si0, si1):
+                                if int(v_ends[b_idx] - v_starts[a]) >= min_tok_w:
+                                    raw_words.append((int(v_starts[a]), int(v_ends[b_idx]), int(b_idx - a + 1)))
+                            continue
+                    raw_words.append((int(v_starts[i0]), int(v_ends[i1]), int(i1 - i0 + 1)))
         else:
             min_tok_w = max(2, int(round(rh * 0.22)))
             if int(v_ends[0] - v_starts[0]) >= min_tok_w:
@@ -544,10 +560,14 @@ class ViselDetector:
         valley_mean_thr = max(peak_mean * 0.12, min(peak_mean * 0.24, 18.0))
         valley_p95_thr = max(peak_p95 * 0.18, min(peak_p95 * 0.36, 52.0))
         row_s = roi_s.sum(axis=1)
+        row_s_peak = int(row_s.max())
         is_valley = (
             (row_mean <= valley_mean_thr)
             & (row_p95 <= valley_p95_thr)
-            & (row_s <= max(2, int(rw * 0.045)))
+            & (
+                (row_s <= max(2, int(rw * 0.08), int(row_s_peak * 0.16)))
+                | ((row_mean <= peak_mean * 0.10) & (row_p95 <= peak_p95 * 0.15))
+            )
         )
         is_line_row = ~is_valley
         r_pad = np.concatenate(([False], is_line_row, [False]))
@@ -1197,13 +1217,18 @@ class ViselDetector:
                         be_t += 1
                     bw_t = be_t - bs_t
 
-                    has_left_neutral = bs_t >= 16 and col_proj[:bs_t].sum() >= 12
-                    has_right_neutral = (rw - be_t) >= 16 and col_proj[be_t:].sum() >= 12
-                    if bw_t >= 26 and (has_left_neutral or has_right_neutral):
-                        if has_left_neutral:
+                    min_side_w = max(18, int(round(rh * 1.35)))
+                    left_gap_ok = bs_t == 0 or (bs_t >= min_side_w and int(is_ink[max(0, bs_t - 3) : min(rw, bs_t + 2)].sum()) <= 2)
+                    right_gap_ok = be_t == rw or ((rw - be_t) >= min_side_w and int(is_ink[max(0, be_t - 2) : min(rw, be_t + 3)].sum()) <= 2)
+                    has_left_part = bs_t >= min_side_w and col_proj[:bs_t].sum() >= 12
+                    has_right_part = (rw - be_t) >= min_side_w and col_proj[be_t:].sum() >= 12
+                    has_left_neutral = has_left_part and col_blue[:bs_t].sum() <= int(col_proj[:bs_t].sum() * 0.12)
+                    has_right_neutral = has_right_part and col_blue[be_t:].sum() <= int(col_proj[be_t:].sum() * 0.12)
+                    if bw_t >= max(28, int(round(rh * 1.6))) and left_gap_ok and right_gap_ok and (has_left_neutral or has_right_neutral):
+                        if has_left_part:
                             refine_region(rx, ry, bs_t, rh, depth + 1)
                         refine_region(rx + bs_t, ry, bw_t, rh, depth + 1)
-                        if has_right_neutral:
+                        if has_right_part:
                             refine_region(rx + be_t, ry, rw - be_t, rh, depth + 1)
                         return
 
@@ -1311,12 +1336,13 @@ class ViselDetector:
                         L_0,
                     )
                 raw_words = glyph_words
-                if len(raw_words) >= 2:
+                if len(raw_words) >= 1:
                     w_hints = generate_vimium_hints(len(raw_words))
                     for wi, (wx0, wx1) in enumerate(raw_words):
                         ww = wx1 - wx0
                         is_lead_icon = (
                             wi == 0
+                            and len(raw_words) >= 2
                             and rh >= 14
                             and 0.65 <= ww / float(rh) <= 1.40
                             and (raw_words[1][0] - wx1) >= max(5, int(rh * 0.25))
@@ -1764,10 +1790,21 @@ class ViselDetector:
                         break
 
         if collapse_paragraphs and include_text:
-            # User-Designed Structural Paragraph Engine:
+            # User-Designed Area & Structure-Aware Line & Paragraph Engine:
+            # Detect vertical column rails (left-edges shared by >= 4 stacked items) so a left-column
+            # table/infobox label ('Original language', 'Written by') never merges across a column gutter.
+            def is_column_rail(x_val: int, y_val: int) -> bool:
+                peers = [
+                    rb for rb in rem_rbs
+                    if rb[5] in ("text_block", "text_link", "inline_link")
+                    and abs(rb[0] - x_val) <= max(4, int(round(0.28 * L_0)))
+                    and abs(rb[1] - y_val) <= int(round(12.0 * L_0))
+                ]
+                return len(peers) >= 4
+
             # 1. Consolidate collinear same-line fragments (inline links, highlighted terms, badges on same row)
-            #    Cluster into vertical row bands first and sort left-to-right by X (`b[0]`) within each row
-            #    so a 1-2 px top-edge difference (`y`) never reverses left-to-right order or causes negative `h_gap`.
+            #    Partition each row band left-to-right across all `start_k in row_cands` so non-merged right-hand
+            #    segments are NEVER dropped, and enforce per-word/segment monotonic area growth & fill conservation.
             line_consolidated = []
             rem_rbs.sort(key=lambda b: (b[1] + (b[3] >> 1), b[0]))
             used_cons = set()
@@ -1791,61 +1828,87 @@ class ViselDetector:
                         ry0 = min(ry0, rbj[1])
                         ry1 = max(ry1, rbj[1] + rbj[3])
                 row_cands.sort(key=lambda k: rem_rbs[k][0])
-                first_k = row_cands[0]
-                rbf = rem_rbs[first_k]
-                same_row = [first_k]
-                used_cons.add(first_k)
-                curr_right = rbf[0] + rbf[2]
-                curr_h = rbf[3]
-                for k in row_cands[1:]:
-                    if k in used_cons:
+                for start_k in row_cands:
+                    if start_k in used_cons:
                         continue
-                    rbj = rem_rbs[k]
-                    h_gap = rbj[0] - curr_right
-                    max_merge_gap = int(round(1.8 * max(curr_h, rbj[3], L_0)))
-                    if -int(round(0.25 * curr_h)) <= h_gap <= max_merge_gap:
-                        gy1, gy2 = max(rbf[1], rbj[1]), min(rbf[1] + rbf[3], rbj[1] + rbj[3])
-                        gx1, gx2 = curr_right, rbj[0]
-                        if gx2 > gx1 and gy2 > gy1 and np.any(v_pure_gray[gy1:gy2, gx1:gx2].mean(axis=0) >= 0.55):
+                    rbf = rem_rbs[start_k]
+                    same_row = [start_k]
+                    used_cons.add(start_k)
+                    curr_x0, curr_y0 = rbf[0], rbf[1]
+                    curr_right, curr_y1 = rbf[0] + rbf[2], rbf[1] + rbf[3]
+                    curr_h = rbf[3]
+                    curr_env_area = float(rbf[2] * rbf[3])
+                    curr_word_area = float(rbf[2] * rbf[3])
+                    for k in row_cands:
+                        if k in used_cons or rem_rbs[k][0] < curr_x0:
                             continue
-                        same_row.append(k)
-                        used_cons.add(k)
-                        curr_right = max(curr_right, rbj[0] + rbj[2])
-                        curr_h = max(curr_h, rbj[3])
-                if len(same_row) == 1:
-                    line_consolidated.append(rem_rbs[same_row[0]])
-                else:
-                    lx = min(rem_rbs[k][0] for k in same_row)
-                    ly = min(rem_rbs[k][1] for k in same_row)
-                    lw = max(rem_rbs[k][0] + rem_rbs[k][2] for k in same_row) - lx
-                    lh = max(rem_rbs[k][1] + rem_rbs[k][3] for k in same_row) - ly
-                    flat_words: List[Dict[str, Any]] = []
-                    for k in same_row:
-                        sub_words = rem_rbs[k][7]
-                        if sub_words:
-                            for sw in sub_words:
-                                flat_words.append(dict(sw))
-                        else:
-                            flat_words.append(
-                                make_child_dict(
-                                    rem_rbs[k][0],
-                                    rem_rbs[k][1],
-                                    rem_rbs[k][2],
-                                    rem_rbs[k][3],
-                                    rem_rbs[k][4],
-                                    "word" if rem_rbs[k][5] != "inline_link" else "inline_link",
-                                    "word" if rem_rbs[k][5] != "inline_link" else "control",
-                                    "",
-                                    [],
+                        rbj = rem_rbs[k]
+                        h_gap = rbj[0] - curr_right
+                        max_merge_gap = int(round(2.45 * max(curr_h, rbj[3], L_0)))
+                        if -int(round(0.25 * curr_h)) <= h_gap <= max_merge_gap:
+                            if h_gap >= max(3, int(round(0.22 * curr_h))) and (curr_right - curr_x0) <= int(round(12.0 * L_0)) and is_column_rail(rbj[0], rbj[1]):
+                                continue
+                            gy1, gy2 = max(curr_y0, rbj[1]), min(curr_y1, rbj[1] + rbj[3])
+                            gx1, gx2 = curr_right, rbj[0]
+                            if gx2 > gx1 and gy2 > gy1 and np.any(v_pure_gray[gy1:gy2, gx1:gx2].mean(axis=0) >= 0.55):
+                                continue
+                            nx0 = min(curr_x0, rbj[0])
+                            ny0 = min(curr_y0, rbj[1])
+                            nx1 = max(curr_right, rbj[0] + rbj[2])
+                            ny1 = max(curr_y1, rbj[1] + rbj[3])
+                            new_env_area = float((nx1 - nx0) * (ny1 - ny0))
+                            seg_area = float(rbj[2] * rbj[3])
+                            new_word_area = curr_word_area + seg_area
+                            if new_env_area < curr_env_area + 0.50 * seg_area:
+                                continue
+                            if new_word_area / max(1.0, new_env_area) < 0.58:
+                                continue
+                            same_row.append(k)
+                            used_cons.add(k)
+                            curr_x0, curr_y0 = nx0, ny0
+                            curr_right, curr_y1 = nx1, ny1
+                            curr_h = ny1 - ny0
+                            curr_env_area = new_env_area
+                            curr_word_area = new_word_area
+                    if len(same_row) == 1:
+                        line_consolidated.append(rem_rbs[same_row[0]])
+                    else:
+                        lx = min(rem_rbs[k][0] for k in same_row)
+                        ly = min(rem_rbs[k][1] for k in same_row)
+                        lw = max(rem_rbs[k][0] + rem_rbs[k][2] for k in same_row) - lx
+                        lh = max(rem_rbs[k][1] + rem_rbs[k][3] for k in same_row) - ly
+                        flat_words: List[Dict[str, Any]] = []
+                        for k in same_row:
+                            sub_words = rem_rbs[k][7]
+                            if sub_words:
+                                for sw in sub_words:
+                                    flat_words.append(dict(sw))
+                            else:
+                                flat_words.append(
+                                    make_child_dict(
+                                        rem_rbs[k][0],
+                                        rem_rbs[k][1],
+                                        rem_rbs[k][2],
+                                        rem_rbs[k][3],
+                                        rem_rbs[k][4],
+                                        "word" if rem_rbs[k][5] != "inline_link" else "inline_link",
+                                        "word" if rem_rbs[k][5] != "inline_link" else "control",
+                                        "",
+                                        [],
+                                    )
                                 )
-                            )
-                    for fw_item, h_str in zip(flat_words, generate_vimium_hints(len(flat_words))):
-                        fw_item["hint"] = h_str
-                    line_consolidated.append([lx, ly, lw, lh, 0.85, "text_block", "line", flat_words])
+                        for fw_item, h_str in zip(flat_words, generate_vimium_hints(len(flat_words))):
+                            fw_item["hint"] = h_str
+                        line_consolidated.append([lx, ly, lw, lh, 0.85, "text_block", "line", flat_words])
 
             rem_rbs = line_consolidated
 
-            # 2. Structural Paragraph Chaining (Straight left edge, uniform line height, uniform vertical pitch, ragged right)
+            # 2. Structural & Area-Conservation Paragraph Chaining
+            #    Enforces:
+            #      - Straight left edge, uniform line height, and uniform vertical pitch
+            #      - Monotonic per-line area growth (`new_para_area >= prev_para_area + 0.85 * cand_area`)
+            #      - Cumulative line-to-paragraph fill density (`sum_line_area / new_para_area >= 0.56`)
+            #      - Prose width continuity: non-final lines in a paragraph must span >= 58% of the paragraph's max line width
             text_line_indices = [
                 i for i, rb in enumerate(rem_rbs)
                 if rb[5] in ("text_block", "text_link")
@@ -1866,6 +1929,11 @@ class ViselDetector:
                 curr_left = curr[0]
                 curr_h = curr[3]
                 prev_pitch = None
+                px0, py0 = curr[0], curr[1]
+                px1, py1 = curr[0] + curr[2], curr[1] + curr[3]
+                para_env_area = float(curr[2] * curr[3])
+                sum_line_area = float(curr[2] * curr[3])
+                max_w_chain = curr[2]
 
                 for idx2 in text_line_indices:
                     if idx2 in merged_tb:
@@ -1880,12 +1948,38 @@ class ViselDetector:
                         if 1 <= v_gap <= max_v_gap:
                             pitch = v_gap
                             if prev_pitch is None or abs(pitch - prev_pitch) <= max(4, int(0.24 * L_0)):
-                                if not np.any(h_pure_gray[curr[1]+curr[3]:cand[1], min(curr[0], cand[0]):min(curr[0]+curr[2], cand[0]+cand[2])].mean(axis=1) >= 0.55):
-                                    chain_tb.append(idx2)
-                                    merged_tb.add(idx2)
-                                    prev_pitch = pitch
-                                    curr = cand
-                                    curr_left = int(round(np.median([rem_rbs[k][0] for k in chain_tb])))
+                                if np.any(h_pure_gray[curr[1]+curr[3]:cand[1], min(curr[0], cand[0]):min(curr[0]+curr[2], cand[0]+cand[2])].mean(axis=1) >= 0.55):
+                                    continue
+                                # Do not chain narrow two-column table/infobox labels into a paragraph when they have a right-hand column neighbor on the same row
+                                if curr[2] <= int(round(10.5 * L_0)) and any(
+                                    other[0] >= curr[0] + curr[2]
+                                    and min(curr[1] + curr[3], other[1] + other[3]) - max(curr[1], other[1]) >= 0.5 * min(curr[3], other[3])
+                                    for other in rem_rbs
+                                ):
+                                    continue
+                                new_max_w = max(max_w_chain, cand[2])
+                                if curr[2] < 0.65 * new_max_w:
+                                    continue
+                                npx0 = min(px0, cand[0])
+                                npy0 = min(py0, cand[1])
+                                npx1 = max(px1, cand[0] + cand[2])
+                                npy1 = max(py1, cand[1] + cand[3])
+                                new_env_area = float((npx1 - npx0) * (npy1 - npy0))
+                                cand_area = float(cand[2] * cand[3])
+                                new_sum_line_area = sum_line_area + cand_area
+                                if new_env_area < para_env_area + 0.85 * cand_area:
+                                    continue
+                                if new_sum_line_area / max(1.0, new_env_area) < 0.56:
+                                    continue
+                                chain_tb.append(idx2)
+                                merged_tb.add(idx2)
+                                prev_pitch = pitch
+                                curr = cand
+                                px0, py0, px1, py1 = npx0, npy0, npx1, npy1
+                                para_env_area = new_env_area
+                                sum_line_area = new_sum_line_area
+                                max_w_chain = new_max_w
+                                curr_left = int(round(np.median([rem_rbs[k][0] for k in chain_tb])))
 
                 if len(chain_tb) >= 2:
                     px = min(rem_rbs[k][0] for k in chain_tb)
@@ -2009,6 +2103,14 @@ class ViselDetector:
                     kx, ky, kw, kh = k_rb[:4]
                     inter = max(0, min(rx + rw, kx + kw) - max(rx, kx)) * max(0, min(ry + rh, ky + kh) - max(ry, ky))
                     if inter >= 0.65 * r_area and r_area <= kw * kh:
+                        if k_rb[6] == "paragraph" and k_rb[7]:
+                            child_inter = sum(
+                                max(0, min(int(rx * scale_back + rw * scale_back), ch["x"] + ch["w"]) - max(int(rx * scale_back), ch["x"]))
+                                * max(0, min(int(ry * scale_back + rh * scale_back), ch["y"] + ch["h"]) - max(int(ry * scale_back), ch["y"]))
+                                for ch in k_rb[7]
+                            )
+                            if child_inter < 0.45 * max(1.0, r_area * scale_back * scale_back):
+                                continue
                         absorbed_into_parent = True
                         break
             if not absorbed_into_parent:
