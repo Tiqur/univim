@@ -149,6 +149,25 @@ def fixtures(quick):
             cv2.line(prose, (40 + col * 700, 670), (670 + col * 700, 670), (100, 100, 100), 1)
             text(prose, "Blue reference link", 40 + col * 700, 710, 0.7, (230, 65, 15))
         yield "dense-prose", prose
+        # Terminal rows repeat a left label and a long unbroken path with a
+        # one-pixel vertical skew between the fragments. This exercises
+        # row-band consolidation, monospace path tokenization, and the
+        # paragraph-to-line drill step for blocks with many word leaves.
+        terminal = np.full((1200, 900, 3), (18, 20, 22), np.uint8)
+        plain = cv2.FONT_HERSHEY_PLAIN
+        for row in range(52):
+            y = 24 + row * 20
+            left = "[tiqur@nixos:~]$" if row == 0 else (
+                "deleting" if row % 4 else "copying")
+            path = "/nix/store/" + ("abcdefghijklmnopqrstuvwxyz0123456789" * (1 + row % 2))
+            color = (120, 220, 130) if row == 0 else (
+                (225, 225, 225) if row % 3 else (165, 165, 165))
+            skew = row & 1
+            cv2.putText(terminal, left, (24, y + skew), plain, 0.62, color, 1, cv2.LINE_AA)
+            cv2.putText(terminal, f"'{path}'", (78, y - skew), plain, 0.62, color, 1, cv2.LINE_AA)
+        cv2.putText(terminal, "52 files deleted, 3.4 GiB freed",
+                    (24, 24 + 52 * 20), plain, 0.62, (120, 220, 130), 1, cv2.LINE_AA)
+        yield "terminal-log", terminal
     dense = np.full((900, 1440, 3), 255, np.uint8)
     for row in range(15):
         for col in range(20):
@@ -536,7 +555,7 @@ def main():
         before = len(harness.failures)
         for index, options in enumerate(matrix):
             harness.check(name, image, image_path, options, index,
-                          drill=options == Options() and name in ("ui-light-native", "ui-dark-native", "dense-hints", "blank-light"))
+                          drill=options == Options() and name in ("ui-light-native", "ui-dark-native", "dense-hints", "blank-light", "terminal-log"))
         if name == "ui-light-native" and not args.quick:
             # Inclusive filtering at every detector score and its nearest f64 neighbors.
             boundaries = (0.0, 0.78, 0.80, 0.84, 0.85, 0.91, 0.92, 0.93, 0.94, 0.95, 1.0)

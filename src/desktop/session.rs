@@ -979,6 +979,14 @@ mod tests {
     }
 
     #[test]
+    fn hints_session_keeps_composite_targets_as_single_overlay_labels() {
+        let session = Session::hints(800, 600, vec![sample_target()]);
+        assert_eq!(session.targets().len(), 1);
+        assert_eq!(session.targets()[0].hint, "S");
+        assert_eq!(session.targets()[0].children.len(), 2);
+    }
+
+    #[test]
     fn hints_session_clicks_matching_target() {
         let mut session = Session::hints(800, 600, vec![sample_target()]);
         let outcome = session.handle_input(Input::Char {

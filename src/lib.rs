@@ -587,6 +587,11 @@ pub fn drill_down(target: &Target, to_words: bool) -> Result<Vec<Target>, serde_
     let mut leaves = vec![];
     if to_words {
         collect(&target.children, &mut leaves);
+        // Massive paragraph blocks step to their lines first; otherwise every
+        // line's word badges would be expanded and overlap on one screen.
+        if target.level == "paragraph" && target.children.len() >= 8 && leaves.len() > 75 {
+            leaves = target.children.clone();
+        }
     } else {
         leaves.extend(target.children.iter().cloned());
     }
@@ -625,6 +630,12 @@ pub fn flatten_leaves(targets: &[Target]) -> Result<Vec<Target>, serde_json::Err
     let mut leaves = vec![];
     for target in targets {
         visit(target, &mut leaves)?;
+    }
+    // Child hints are local to their parent and repeat across siblings. A flat
+    // list is a single overlay level, so relabel every leaf globally.
+    let labels = hints(leaves.len());
+    for (target, hint) in leaves.iter_mut().zip(labels) {
+        target.hint = hint;
     }
     Ok(leaves)
 }
@@ -677,6 +688,25 @@ mod tests {
     }
 
     #[test]
+    fn drilldown_large_paragraph_steps_to_lines_before_words() {
+        let word = |i: usize| json!({"x":i,"y":0,"w":1,"h":1,"score":0.85,"kind":"word","level":"word","hint":"","children":[]});
+        let line = |line: usize| {
+            json!({"x":line*10,"y":line*10,"w":100,"h":8,"score":0.78,"kind":"line","level":"line","hint":"",
+                "children":(0..10).map(|i| word(line * 10 + i)).collect::<Vec<_>>()})
+        };
+        let mut parent = Target::new(0, 0, 100, 100, 0.82, "text_block", "paragraph");
+        parent.children = (0..8).map(line).collect();
+        let lines = drill_down(&parent, true).unwrap();
+        assert_eq!(lines.len(), 8);
+        assert!(lines.iter().all(|target| target.kind == "line"));
+        assert_eq!(lines[0].hint, "S");
+
+        // Below the threshold the same hierarchy still drills straight to words.
+        parent.children.truncate(7);
+        assert_eq!(drill_down(&parent, true).unwrap().len(), 70);
+    }
+
+    #[test]
     fn drilldown_keeps_a_leaf_unchanged() {
         let mut leaf = Target::new(1, 2, 3, 4, 0.85, "icon", "control");
         leaf.hint = "DA".into();
@@ -710,6 +740,8 @@ mod tests {
         assert_eq!(leaves.len(), 2);
         assert_eq!(leaves[0].x, 2);
         assert_eq!(leaves[1].x, 3);
+        assert_eq!(leaves[0].hint, "S");
+        assert_eq!(leaves[1].hint, "A");
         assert!(leaves.iter().all(|target| target.children.is_empty()));
     }
 

@@ -476,12 +476,12 @@ copy the working directory before that filter is evaluated. Prefer the ordinary
 Git-backed flake once new source files are tracked; `.gitignore` alone cannot
 prevent the initial `path:.` snapshot.
 
-The full differential suite passed **561 exact detection comparisons**, **561
-hint checks**, and **585 pixel-exact overlay comparisons**, including **24
-drill-down cases**. It uses 22 deterministic synthetic fixtures, with light/dark
+The full differential suite passed **585 exact detection comparisons**, **585
+hint checks**, and **613 pixel-exact overlay comparisons**, including **28
+drill-down cases**. It uses 23 deterministic synthetic fixtures, with light/dark
 UI, paragraphs, blue links, controls, textures, noise, dense hints, a portrait
-crop, a tiny glyph chain, and widths 640 through 2880, including resize
-boundaries. All boolean option combinations and score boundaries are exercised.
+crop, a tiny glyph chain, a multi-line terminal log with line-level drill-down,
+and widths 640 through 2880, including resize boundaries. All boolean option combinations and score boundaries are exercised.
 It checks list ordering, all coordinates, scores, kinds, levels, hints, nested
 children, and missing versus empty child keys. Timing fields are intentionally
 excluded. Library unit tests additionally cover hint generation, both drill-down
@@ -513,12 +513,12 @@ OpenCV 4.13.0, NumPy 2.5.3. Results vary with system load and image content.
 
 | Synthetic Workload | Resolution | Mode | Python | Rust | Speedup |
 | --- | --- | --- | ---: | ---: | ---: |
-| Light UI | 2561 x 1601 | Normal | 62.69 | 68.88 | 0.91x |
-| Light UI | 2561 x 1601 | Turbo | 24.91 | 19.45 | 1.28x |
-| Light UI | 1440 x 900 | Normal | 14.41 | 12.06 | 1.19x |
-| Light UI | 1440 x 900 | Turbo | 14.51 | 8.15 | 1.78x |
-| Dense controls | 1440 x 900 | Normal | 62.67 | 13.64 | 4.59x |
-| Dense controls | 1440 x 900 | Turbo | 62.28 | 13.00 | 4.79x |
+| Light UI | 2561 x 1601 | Normal | 103.88 | 81.18 | 1.28x |
+| Light UI | 2561 x 1601 | Turbo | 38.12 | 24.61 | 1.55x |
+| Light UI | 1440 x 900 | Normal | 30.15 | 19.08 | 1.58x |
+| Light UI | 1440 x 900 | Turbo | 30.81 | 19.23 | 1.60x |
+| Dense controls | 1440 x 900 | Normal | 128.05 | 27.62 | 4.64x |
+| Dense controls | 1440 x 900 | Turbo | 128.98 | 27.46 | 4.70x |
 
 Per-stage medians use the reference's boundaries: `signal` covers scaling,
 gradients and structural barriers; `frames` covers frame/thumbnail recovery and
@@ -528,23 +528,23 @@ Python / Rust milliseconds.
 
 | Workload | Mode | Signal | Frames | Coarse | Recursive |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Light UI 2561 x 1601 | Normal | 39.2 / 40.0 | 8.6 / 14.3 | 3.2 / 8.7 | 10.4 / 1.3 |
-| Light UI 2561 x 1601 | Turbo | 17.0 / 16.5 | 2.7 / 1.8 | 0.8 / 0.7 | 4.2 / 0.4 |
-| Light UI 1440 x 900 | Normal | 4.0 / 3.5 | 4.6 / 4.7 | 0.9 / 2.7 | 4.7 / 0.5 |
-| Light UI 1440 x 900 | Turbo | 4.1 / 3.5 | 4.7 / 3.6 | 0.6 / 0.5 | 4.8 / 0.5 |
-| Dense controls 1440 x 900 | Normal | 3.8 / 3.3 | 3.7 / 5.8 | 1.2 / 2.8 | 53.7 / 1.2 |
-| Dense controls 1440 x 900 | Turbo | 3.8 / 3.5 | 3.6 / 5.9 | 0.9 / 1.7 | 53.6 / 1.4 |
+| Light UI 2561 x 1601 | Normal | 50.4 / 46.0 | 22.4 / 22.1 | 3.1 / 8.3 | 27.0 / 3.4 |
+| Light UI 2561 x 1601 | Turbo | 18.8 / 17.8 | 7.3 / 5.0 | 0.75 / 0.64 | 10.9 / 1.1 |
+| Light UI 1440 x 900 | Normal | 6.4 / 5.5 | 11.0 / 9.1 | 0.95 / 2.75 | 11.4 / 1.2 |
+| Light UI 1440 x 900 | Turbo | 6.6 / 5.6 | 11.3 / 9.1 | 0.95 / 2.73 | 11.7 / 1.3 |
+| Dense controls 1440 x 900 | Normal | 6.3 / 11.7 | 7.7 / 8.8 | 1.2 / 2.7 | 112.6 / 2.3 |
+| Dense controls 1440 x 900 | Turbo | 6.6 / 11.9 | 7.8 / 8.6 | 1.2 / 2.7 | 112.8 / 2.2 |
 
-The large normal-mode regression is localized: signal processing is essentially
-equal and recursive/composition work is much faster in Rust, while `frames` and
-`coarse` are slower. Those stages repeatedly allocate and inspect full-resolution
-masks and contour ROIs, so large-image memory traffic, allocation and cache
-behavior are the likely bottleneck rather than the core gradient operations.
-The effect is not uniform across sizes; the 1440 x 900 normal case is faster in
-Rust. Turbo changes the algorithm's working resolution/coarse pass, so compare
-implementations within the same mode rather than normal versus turbo. Stage
-medians may not sum exactly to wall-clock totals because they are measured at
-internal boundaries.
+Rust is faster overall in every measured configuration. The remaining relative
+weaknesses are localized: `coarse` is slower on the large and 1440 x 900 UI cases,
+and `signal` is slower on the dense-controls case. Those stages repeatedly
+allocate and inspect full-resolution masks and contour ROIs, so memory traffic,
+allocation and cache behavior are likely contributors. The largest absolute win
+comes from recursive refinement and composition, which dominates Python's dense
+controls time. Turbo changes the algorithm's working resolution and coarse pass,
+so compare implementations within the same mode rather than normal versus turbo.
+Stage medians may not sum exactly to wall-clock totals because they are measured
+at internal boundaries.
 
 See `AGENTS.md` for architecture, parity pitfalls, comment conventions and the
 required workflow for future changes.

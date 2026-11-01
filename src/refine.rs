@@ -656,35 +656,11 @@ pub fn refine(state: &mut State, options: Options) -> opencv::Result<(Vec<Target
             && rh <= (56. * s) as i32
             && (ink_runs.len() >= 2 || rw >= 18.max((rh as f64 * 2.2) as i32))
         {
-            let mut raw_words = if let Some(words) = glyph_words {
+            let raw_words = if let Some(words) = glyph_words {
                 words
             } else {
                 crate::glyph::score_and_segment(state, rx, ry, rw, rh)?.1
             };
-            if raw_words.len() < 2 && ink_runs.len() >= 2 {
-                let w_gap_thr = (if rh <= 13.max((0.95 * l0) as i32) {
-                    2
-                } else {
-                    3
-                })
-                .max((rh as f64 * 0.15) as i32) as usize;
-                let splits: Vec<_> = (0..ink_runs.len() - 1)
-                    .filter(|&i| ink_runs[i + 1].0 - ink_runs[i].1 >= w_gap_thr)
-                    .collect();
-                if !splits.is_empty() {
-                    raw_words.clear();
-                    let mut start = 0;
-                    for end in splits
-                        .into_iter()
-                        .chain(std::iter::once(ink_runs.len() - 1))
-                    {
-                        if ink_runs[end].1 - ink_runs[start].0 >= 3 {
-                            raw_words.push((ink_runs[start].0 as i32, ink_runs[end].1 as i32));
-                        }
-                        start = end + 1;
-                    }
-                }
-            }
             if raw_words.len() >= 2 {
                 let word_hints = hints(raw_words.len());
                 for (wi, &(wx0, wx1)) in raw_words.iter().enumerate() {

@@ -2,15 +2,15 @@
 //! and word segmentation.
 //!
 //! These routines mirror NumPy's float32 pipeline in the reference detector:
-//! contrast, span, aspect, and fill statistics stay in `f32`, while Python
-//! scalars such as `int(rw * 0.95)` and the thresholds derived from them are
-//! evaluated in `f64`. Keeping that split avoids changing clamp and valley
-//! decisions that would otherwise differ in the last few bits.
+//! contrast, span, aspect, and fill statistics stay in `f32`, while column
+//! gradient means and Python scalars such as `int(rw * 0.95)` are evaluated in
+//! `f64`. Keeping that split avoids changing clamp and valley decisions that
+//! would otherwise differ in the last few bits.
 //!
 //! `score_and_segment` follows the reference stages in order: adaptive ink
 //! threshold, per-column background bounds, local letter-likeness, one-
-//! dimensional contextual propagation, line-local bimodal gap clustering, then
-//! pitch-guided valley splitting of fused runs.
+//! dimensional contextual propagation, relative bimodal gap separation, then
+//! valley refinement of fused single primitives and badge-clearance merging.
 use crate::signals::State;
 use opencv::prelude::*;
 
@@ -52,7 +52,7 @@ pub fn foreground_line_bands(
     h: i32,
     min_h: i32,
 ) -> opencv::Result<Vec<(i32, i32)>> {
-    if h < min_h * 2 + 2 || w < 24 {
+    if h < min_h * 2 + 2 || w < h * 2 {
         return Ok(vec![]);
     }
     let width = w as usize;
@@ -89,22 +89,19 @@ pub fn foreground_line_bands(
     if peak_mean < 12.0 || peak_p95 < 28.0 {
         return Ok(vec![]);
     }
-    let mean_thr = (peak_mean * 0.20).clamp(4.0, 18.0);
-    let p95_thr = (peak_p95 * 0.36).clamp(16.0, 52.0);
+    let mean_thr = (peak_mean * 0.12).max((peak_mean * 0.24).min(18.0));
+    let p95_thr = (peak_p95 * 0.18).max((peak_p95 * 0.36).min(52.0));
     let active: Vec<bool> = (0..h as usize)
         .map(|i| {
             !(means[i] as f64 <= mean_thr
                 && p95[i] as f64 <= p95_thr
-                && strokes[i] <= 4.max((w as f64 * 0.045) as i32))
+                && strokes[i] <= 2.max((w as f64 * 0.045) as i32))
         })
         .collect();
     let bands: Vec<_> = runs(&active)
         .into_iter()
         .filter(|&(a, b)| {
-            b - a >= min_h as usize
-                && means[a..b]
-                    .iter()
-                    .any(|&v| v as f64 >= 12.0_f64.max(peak_mean * 0.20))
+            b - a >= min_h as usize && means[a..b].iter().any(|&v| v as f64 >= peak_mean * 0.20)
         })
         .map(|(a, b)| (a as i32, b as i32))
         .collect();
@@ -118,7 +115,7 @@ pub fn score_and_segment(
     w: i32,
     h: i32,
 ) -> opencv::Result<(f32, Vec<(i32, i32)>)> {
-    if h < 4 || w < 6 {
+    if h < 4 || w < ((h as f64 * 1.2) as i32) {
         return Ok((0.0, vec![]));
     }
     let (rw, rh) = (w as usize, h as usize);
@@ -138,7 +135,13 @@ pub fn score_and_segment(
             all.len() / 2,
         )
     };
-    let trim = if rh >= 7 { 1 } else { 0 };
+    let trim = if rh >= 7 {
+        ((rh as f64 * 0.12).round_ties_even() as usize).max(1)
+    } else {
+        0
+    };
+    let use_core = rh >= 2 * trim + 3;
+    let core_rows = if use_core { rh - 2 * trim } else { rh };
     let mut col_max = vec![0.0_f32; rw];
     let mut col_mean = vec![0.0_f32; rw];
     let mut fg = vec![vec![0.0_f32; rw]; rh];
@@ -147,22 +150,27 @@ pub fn score_and_segment(
         for xx in 0..rw {
             let v = (row[x as usize + xx] as f32 - bg).abs();
             fg_row[xx] = v;
-            if yy >= trim && yy < rh - trim {
+            if !use_core || (yy >= trim && yy < rh - trim) {
                 col_max[xx] = col_max[xx].max(v);
                 col_mean[xx] += v;
             }
         }
     }
     for v in &mut col_mean {
-        *v /= (rh - 2 * trim) as f32;
+        *v /= core_rows as f32;
     }
-    let peak = percentile(&col_max, ((rw as f64 * 0.85) as usize).min(rw - 1));
+    let peak = if rw >= 6 {
+        percentile(&col_max, ((rw as f64 * 0.85) as usize).min(rw - 1))
+    } else {
+        col_max.iter().copied().fold(0.0_f32, f32::max)
+    };
     if peak < 11.0 {
         return Ok((0.0, vec![]));
     }
-    let ink_thr = (peak as f64 * 0.27).clamp(10.0, 42.0);
+    let ink_thr = (peak as f64 * 0.27).clamp(peak as f64 * 0.18, peak as f64 * 0.45);
     let mut ink: Vec<bool> = col_max.iter().map(|&v| v as f64 > ink_thr).collect();
-    if ink.iter().filter(|&&v| v).count() < 3 {
+    let min_ink_cols = 3.max((rh as f64 * 0.4) as usize);
+    if ink.iter().filter(|&&v| v).count() < min_ink_cols {
         ink = (0..rw)
             .map(|xx| {
                 (0..rh).any(|yy| {
@@ -174,7 +182,7 @@ pub fn score_and_segment(
                 })
             })
             .collect();
-        if ink.iter().filter(|&&v| v).count() < 3 {
+        if ink.iter().filter(|&&v| v).count() < min_ink_cols {
             return Ok((0.0, vec![]));
         }
     }
@@ -182,8 +190,8 @@ pub fn score_and_segment(
     let mut top_y = vec![rh as i32; rw];
     let mut bot_y = vec![-1; rw];
     let mut counts = vec![0_i32; rw];
-    let mut dx = vec![0.0_f32; rw];
-    let mut dy = vec![0.0_f32; rw];
+    let mut dx = vec![0.0_f64; rw];
+    let mut dy = vec![0.0_f64; rw];
     for (yy, fg_row) in fg.iter().enumerate() {
         let dx_row = state.dx.at_row::<u8>(y + yy as i32)?;
         let dy_row = state.dy.at_row::<u8>(y + yy as i32)?;
@@ -193,21 +201,20 @@ pub fn score_and_segment(
                 bot_y[xx] = yy as i32;
                 counts[xx] += 1;
             }
-            // NumPy means over the uint8 gradient columns in float32.
-            dx[xx] += dx_row[x as usize + xx] as f32;
-            dy[xx] += dy_row[x as usize + xx] as f32;
+            dx[xx] += dx_row[x as usize + xx] as f64;
+            dy[xx] += dy_row[x as usize + xx] as f64;
         }
     }
     for xx in 0..rw {
-        dx[xx] /= rh as f32;
-        dy[xx] /= rh as f32;
+        dx[xx] /= rh as f64;
+        dy[xx] /= rh as f64;
     }
+    let dx_peak = dx.iter().copied().fold(0.0_f64, f64::max);
+    let dx_peak_thr = 2.5_f64.max(dx_peak * 0.20);
     let mut osc = vec![0_i32; rw + 1];
     let mut fg_prefix = vec![0_i32; rw + 1];
     let mut dx_prefix = vec![0.0_f64; rw + 1];
     let mut dy_prefix = vec![0.0_f64; rw + 1];
-    // NumPy cumsum stays float32 before `concatenate` upcasts it to float64.
-    let (mut dx_sum, mut dy_sum) = (0.0_f32, 0.0_f32);
     for xx in 0..rw {
         osc[xx + 1] = osc[xx]
             + i32::from(
@@ -215,13 +222,11 @@ pub fn score_and_segment(
                     && xx + 1 < rw
                     && dx[xx] >= dx[xx - 1]
                     && dx[xx] >= dx[xx + 1]
-                    && dx[xx] > 4.0,
+                    && dx[xx] > dx_peak_thr,
             );
         fg_prefix[xx + 1] = fg_prefix[xx] + counts[xx];
-        dx_sum += dx[xx];
-        dy_sum += dy[xx];
-        dx_prefix[xx + 1] = dx_sum as f64;
-        dy_prefix[xx + 1] = dy_sum as f64;
+        dx_prefix[xx + 1] = dx_prefix[xx] + dx[xx];
+        dy_prefix[xx + 1] = dy_prefix[xx] + dy[xx];
     }
     let mut local = Vec::new();
     let mut mids = Vec::new();
@@ -243,8 +248,8 @@ pub fn score_and_segment(
         let ar = (b - a) as f32 / rh as f32;
         let aspect = if (0.15..=1.25).contains(&ar) {
             1.0
-        } else if ar > 1.25 && ar <= 7.5 {
-            if osc[b] - osc[a] >= 1.max((ar * 0.45) as i32) {
+        } else if ar > 1.25 && ar <= 8.5 {
+            if osc[b] - osc[a] >= 1.max((ar * 0.42) as i32) {
                 0.92
             } else {
                 0.55
@@ -262,9 +267,9 @@ pub fn score_and_segment(
         };
         let dx_m = (dx_prefix[b] - dx_prefix[a]) / (b - a) as f64;
         let dy_m = (dy_prefix[b] - dy_prefix[a]) / (b - a) as f64;
-        let stroke = if dx_m >= 2.2 && dx_m >= 0.52 * dy_m {
+        let stroke = if dx_m >= 0.52 * dy_m {
             1.0
-        } else if dx_m >= 1.2 {
+        } else if dx_m >= 0.35 * dy_m {
             0.60
         } else {
             0.20
@@ -279,10 +284,10 @@ pub fn score_and_segment(
     if primitives.len() >= 2 {
         let med = median_f32(&mids);
         // Python compares float32 spans to double-precision scalar cutoffs.
-        let max_dy = 2.5_f64.max(0.28 * rh as f64);
-        let max_dh = 3.5_f64.max(0.45 * rh as f64);
-        let max_gap1 = 18.max((2.4 * rh as f64) as i32);
-        let max_gap2 = 22.max((2.8 * rh as f64) as i32);
+        let max_dy = 0.28 * rh as f64;
+        let max_dh = 0.45 * rh as f64;
+        let max_gap1 = 2.4 * rh as f64;
+        let max_gap2 = 2.8 * rh as f64;
         for i in 0..primitives.len() {
             let (mut num, mut den) = (0.0_f32, 0.0_f32);
             for (step, weight) in [(-2, 0.16_f32), (-1, 0.34), (1, 0.34), (2, 0.16)] {
@@ -298,9 +303,9 @@ pub fn score_and_segment(
                 };
                 let dy_mid = (mids[i] - mids[j]).abs() as f64;
                 let dh = (spans[i] - spans[j]).abs() as f64;
-                let compat = if dy_mid <= max_dy && dh <= max_dh && gap <= max_gap1 {
+                let compat = if dy_mid <= max_dy && dh <= max_dh && (gap as f64) <= max_gap1 {
                     1.0
-                } else if (mids[j] - med).abs() as f64 <= max_dy && gap <= max_gap2 {
+                } else if (mids[j] - med).abs() as f64 <= max_dy && (gap as f64) <= max_gap2 {
                     0.82
                 } else {
                     0.20
@@ -332,80 +337,80 @@ pub fn score_and_segment(
     let mut confidence = (valid.iter().map(|&(_, _, v)| v).sum::<f32>() / valid.len() as f32
         + bonus)
         .clamp(0.0, 1.0);
-    if ink_width < 4.max((rw as f64 * 0.18) as usize) {
+    if ink_width < (rw as f64 * 0.18) as usize {
         confidence *= 0.65;
     }
-    let mut words = Vec::new();
+
+    // Step C: relative bimodal gap separation. Monospace strips expose every
+    // character as an isolated primitive, so a space must exceed both the
+    // baseline kerning and a sizeable fraction of a character cell. Proportional
+    // strips fuse letters into wider blobs and can use a lower relative cutoff.
+    let v_widths: Vec<f32> = valid.iter().map(|&(a, b, _)| (b - a) as f32).collect();
+    let gaps: Vec<i32> = valid
+        .windows(2)
+        .map(|p| p[1].0 as i32 - p[0].1 as i32)
+        .collect();
+    let min_tok_w = 2.max((rh as f64 * 0.22).round_ties_even() as usize);
+    let mut raw_words: Vec<(usize, usize, usize)> = Vec::new();
     if valid.len() >= 2 {
-        let gaps: Vec<i32> = valid
-            .windows(2)
-            .map(|p| p[1].0 as i32 - p[0].1 as i32)
-            .collect();
-        let std_thr = (if h <= 13.max((0.95 * state.l0) as i32) {
-            2
+        let med_pw = median_f32(&v_widths) as f64;
+        let gaps_f32: Vec<f32> = gaps.iter().map(|&g| g as f32).collect();
+        let g_max = *gaps.iter().max().unwrap() as f64;
+        let k85_w = ((v_widths.len() as f64 * 0.85) as usize).min(v_widths.len() - 1);
+        let p85_pw = percentile(&v_widths, k85_w) as f64;
+        let k65_g = ((gaps_f32.len() as f64 * 0.65) as usize).min(gaps_f32.len() - 1);
+        let kern_base = percentile(&gaps_f32, k65_g) as f64;
+        let min_space_thr = if p85_pw <= 0.56 * rh as f64 && p85_pw <= 1.45 * med_pw {
+            ((rh as f64 * 0.36).round_ties_even() as i32)
+                .max((kern_base * 2.2).round_ties_even() as i32 + 1)
+                .max((med_pw * 0.85).round_ties_even() as i32)
         } else {
-            3
-        })
-        .max((h as f64 * 0.15).round_ties_even() as i32);
-        let (g_min, g_max) = (*gaps.iter().min().unwrap(), *gaps.iter().max().unwrap());
-        let mut threshold = std_thr;
-        if g_min <= 1 && g_max >= 2 {
-            if g_max <= 3 {
-                threshold = 2;
-            } else {
-                let mut best = -1.0_f64;
-                for candidate in g_min + 1..(g_max + 1).min(5.max(std_thr + 2)) {
-                    let lo: Vec<_> = gaps.iter().copied().filter(|&v| v < candidate).collect();
-                    let hi: Vec<_> = gaps.iter().copied().filter(|&v| v >= candidate).collect();
-                    if lo.is_empty() || hi.is_empty() {
-                        continue;
+            2.max((rh as f64 * 0.20).round_ties_even() as i32)
+                .max((kern_base * 2.0).round_ties_even() as i32 + 1)
+        };
+        if g_max < min_space_thr as f64 {
+            raw_words.push((valid[0].0, valid.last().unwrap().1, valid.len()));
+        } else {
+            let mut start = 0;
+            for (i, &gap) in gaps.iter().enumerate() {
+                if gap >= min_space_thr {
+                    if valid[i].1 - valid[start].0 >= min_tok_w {
+                        raw_words.push((valid[start].0, valid[i].1, i - start + 1));
                     }
-                    // NumPy means the float32 gap array, then promotes to float64.
-                    let mu0 = (lo.iter().sum::<i32>() as f32 / lo.len() as f32) as f64;
-                    let mu1 = (hi.iter().sum::<i32>() as f32 / hi.len() as f32) as f64;
-                    if mu1 - mu0 >= 1.15 {
-                        let w0 = lo.len() as f64 / gaps.len() as f64;
-                        let variance = w0 * (1.0 - w0) * (mu1 - mu0).powi(2);
-                        if variance > best {
-                            best = variance;
-                            threshold = candidate;
-                        }
-                    }
+                    start = i + 1;
                 }
-                threshold = threshold.min(std_thr);
+            }
+            let last = valid.len() - 1;
+            if valid[last].1 - valid[start].0 >= min_tok_w {
+                raw_words.push((valid[start].0, valid[last].1, last - start + 1));
             }
         }
-        let mut start = 0;
-        for (i, &gap) in gaps.iter().enumerate() {
-            if gap >= threshold {
-                if valid[i].1 - valid[start].0 >= 3 {
-                    words.push((valid[start].0, valid[i].1));
-                }
-                start = i + 1;
-            }
-        }
-        if valid.last().unwrap().1 - valid[start].0 >= 3 {
-            words.push((valid[start].0, valid.last().unwrap().1));
-        }
-    } else if valid[0].1 - valid[0].0 >= 3 {
-        words.push((valid[0].0, valid[0].1));
+    } else if valid[0].1 - valid[0].0 >= min_tok_w {
+        raw_words.push((valid[0].0, valid[0].1, 1));
     }
-    let mut refined = Vec::new();
-    let min_step = 7.max((h as f64 * 1.10) as usize);
-    for (a, b) in words {
-        let ww = b - a;
-        if ww > 22.max((h as f64 * 4.4) as usize) && h <= 28.max((1.9 * state.l0) as i32) {
-            let p80 = percentile(&col_mean[a..b], ((ww as f64 * 0.80) as usize).min(ww - 1)) as f64;
+
+    // Step D: valley refinement only applies to one continuous primitive, never
+    // to a token already assembled from separated monospace characters.
+    let max_single_prim_w = (rh as f64 * 4.2).round_ties_even() as i64;
+    let min_word_step = ((rh as f64 * 1.25).round_ties_even() as usize)
+        .max((state.l0 * 0.65).round_ties_even() as usize);
+    let max_rh_subsplit = (state.l0 * 1.85).round_ties_even() as i32;
+    let min_refined_w = 2.max((rh as f64 * 0.25).round_ties_even() as usize);
+    let mut refined: Vec<(i32, i32)> = Vec::new();
+    for (wx0, wx1, n_sub) in raw_words {
+        let ww = wx1 - wx0;
+        if n_sub == 1 && ww as i64 > max_single_prim_w && rh as i32 <= max_rh_subsplit {
+            let p80 = percentile(&col_mean[wx0..wx1], (ww as f64 * 0.80) as usize) as f64;
             let mut cuts: Vec<usize> = Vec::new();
-            for c in min_step..ww.saturating_sub(min_step) {
-                if col_mean[a + c] <= col_mean[a + c - 1]
-                    && col_mean[a + c] <= col_mean[a + c + 1]
-                    && (col_mean[a + c] as f64) <= p80 * 0.38
-                    && (col_max[a + c] as f64) <= peak as f64 * 0.56
+            for c in min_word_step..ww.saturating_sub(min_word_step) {
+                if col_mean[wx0 + c] <= col_mean[wx0 + c - 1]
+                    && col_mean[wx0 + c] <= col_mean[wx0 + c + 1]
+                    && (col_mean[wx0 + c] as f64) <= p80 * 0.34
+                    && (col_max[wx0 + c] as f64) <= peak as f64 * 0.52
                 {
-                    if cuts.last().is_none_or(|&last| c - last >= min_step) {
+                    if cuts.last().is_none_or(|&last| c - last >= min_word_step) {
                         cuts.push(c);
-                    } else if col_mean[a + c] < col_mean[a + *cuts.last().unwrap()] {
+                    } else if col_mean[wx0 + c] < col_mean[wx0 + *cuts.last().unwrap()] {
                         *cuts.last_mut().unwrap() = c;
                     }
                 }
@@ -415,7 +420,7 @@ pub fn score_and_segment(
                 pts.extend(cuts);
                 pts.push(ww);
                 for pair in pts.windows(2) {
-                    let (mut s0, mut s1) = (a + pair[0], a + pair[1]);
+                    let (mut s0, mut s1) = (wx0 + pair[0], wx0 + pair[1]);
                     if let Some(first) = (s0..s1).find(|&i| col_max[i] as f64 > ink_thr * 0.80) {
                         let last = (s0..s1)
                             .rfind(|&i| col_max[i] as f64 > ink_thr * 0.80)
@@ -423,14 +428,34 @@ pub fn score_and_segment(
                         s0 = first;
                         s1 = last + 1;
                     }
-                    if s1 - s0 >= 3 {
+                    if s1 - s0 >= min_refined_w {
                         refined.push((s0 as i32, s1 as i32));
                     }
                 }
                 continue;
             }
         }
-        refined.push((a as i32, b as i32));
+        refined.push((wx0 as i32, wx1 as i32));
     }
+
+    // Step E: relative badge-clearance merge. Tiny punctuation fragments attach
+    // to a close neighbour so their badge rectangles cannot overlap.
+    if refined.len() >= 2 {
+        let min_standalone_w = (rh as f64 * 0.95).round_ties_even() as i32;
+        let max_attach_gap = (rh as f64 * 0.75).round_ties_even() as i32;
+        let mut merged: Vec<(i32, i32)> = vec![refined[0]];
+        for &(wx0, wx1) in &refined[1..] {
+            let (px0, px1) = *merged.last().unwrap();
+            let (pw, cw) = (px1 - px0, wx1 - wx0);
+            let gap = wx0 - px1;
+            if gap <= max_attach_gap && (pw < min_standalone_w || cw < min_standalone_w) {
+                *merged.last_mut().unwrap() = (px0, wx1);
+            } else {
+                merged.push((wx0, wx1));
+            }
+        }
+        refined = merged;
+    }
+
     Ok((confidence, refined))
 }

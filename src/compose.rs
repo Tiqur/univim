@@ -451,26 +451,30 @@ pub fn compose(
     // fragments, then chain lines whose left edge, height and vertical pitch
     // agree and whose gutters contain no horizontal divider.
     if options.collapse_paragraphs && options.include_text {
-        rem_rbs.sort_by_key(|rb| (rb.y, rb.x));
+        rem_rbs.sort_by_key(|rb| (rb.y + (rb.h >> 1), rb.x));
         let mut used_consolidated = vec![false; rem_rbs.len()];
         let mut line_consolidated = Vec::with_capacity(rem_rbs.len());
         for i in 0..rem_rbs.len() {
             if used_consolidated[i] {
                 continue;
             }
-            let first = rem_rbs[i].clone();
+            let rbi = &rem_rbs[i];
             if !matches!(
-                first.kind.as_str(),
+                rbi.kind.as_str(),
                 "text_block" | "text_link" | "inline_link"
             ) {
-                line_consolidated.push(first);
+                line_consolidated.push(rbi.clone());
                 continue;
             }
 
-            let mut same_row = vec![i];
-            used_consolidated[i] = true;
-            for j in (i + 1)..rem_rbs.len() {
-                if used_consolidated[j] {
+            // Gather the whole vertical row band first. A one-pixel top-edge
+            // difference must not reverse left-to-right order or make a gap
+            // negative, so candidates are sorted by x before chaining.
+            let mut row_cands = vec![i];
+            let mut ry0 = rbi.y;
+            let mut ry1 = rbi.bottom();
+            for j in 0..rem_rbs.len() {
+                if j == i || used_consolidated[j] {
                     continue;
                 }
                 let candidate = &rem_rbs[j];
@@ -480,30 +484,52 @@ pub fn compose(
                 ) {
                     continue;
                 }
-                let v_overlap = first.bottom().min(candidate.bottom()) - first.y.max(candidate.y);
-                let row_right = same_row
-                    .iter()
-                    .map(|&k| rem_rbs[k].right())
-                    .max()
-                    .unwrap_or(first.right());
-                let h_gap = candidate.x - row_right;
-                let max_gap = 18.max((1.8 * state.l0) as i32);
-                if v_overlap as f64 >= 0.70 * first.h.min(candidate.h) as f64
-                    && (0..=max_gap).contains(&h_gap)
+                let v_overlap = ry1.min(candidate.bottom()) - ry0.max(candidate.y);
+                let row_h = ry1 - ry0;
+                let h_limit = (0.45 * (row_h as f64).max(state.l0)).round_ties_even() as i32;
+                if v_overlap as f64 >= 0.62 * row_h.min(candidate.h) as f64
+                    && (row_h - candidate.h).abs() <= h_limit
                 {
-                    let y1 = first.y.max(candidate.y);
-                    let y2 = first.bottom().min(candidate.bottom());
-                    let x1 = candidate.x - h_gap;
-                    let x2 = candidate.x;
-                    if !pure_column_barrier(x1, y1, x2, y2)? {
-                        same_row.push(j);
-                        used_consolidated[j] = true;
+                    row_cands.push(j);
+                    ry0 = ry0.min(candidate.y);
+                    ry1 = ry1.max(candidate.bottom());
+                }
+            }
+            row_cands.sort_by_key(|&k| rem_rbs[k].x);
+            let first_k = row_cands[0];
+            let first = &rem_rbs[first_k];
+            let (first_y, first_h) = (first.y, first.h);
+            let mut same_row = vec![first_k];
+            used_consolidated[first_k] = true;
+            let mut curr_right = first.right();
+            let mut curr_h = first.h;
+            for &k in &row_cands[1..] {
+                if used_consolidated[k] {
+                    continue;
+                }
+                let candidate = &rem_rbs[k];
+                let h_gap = candidate.x - curr_right;
+                let max_merge_gap =
+                    (1.8 * (curr_h.max(candidate.h) as f64).max(state.l0)).round_ties_even() as i32;
+                let min_merge_gap = -((0.25 * curr_h as f64).round_ties_even() as i32);
+                if (min_merge_gap..=max_merge_gap).contains(&h_gap) {
+                    let (gy1, gy2) = (
+                        first_y.max(candidate.y),
+                        (first_y + first_h).min(candidate.bottom()),
+                    );
+                    let (gx1, gx2) = (curr_right, candidate.x);
+                    if gx2 > gx1 && gy2 > gy1 && pure_column_barrier(gx1, gy1, gx2, gy2)? {
+                        continue;
                     }
+                    same_row.push(k);
+                    used_consolidated[k] = true;
+                    curr_right = curr_right.max(candidate.right());
+                    curr_h = curr_h.max(candidate.h);
                 }
             }
 
             if same_row.len() == 1 {
-                line_consolidated.push(first);
+                line_consolidated.push(rem_rbs[same_row[0]].clone());
                 continue;
             }
             let lx = same_row.iter().map(|&k| rem_rbs[k].x).min().unwrap();
