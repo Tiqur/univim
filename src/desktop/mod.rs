@@ -110,6 +110,8 @@ pub struct Appearance {
     pub ui_background: String,
     pub ui_foreground: String,
     pub ui_accent: String,
+    pub badge_corner_radius: u8,
+    pub target_color: Option<String>,
 }
 
 impl Default for Appearance {
@@ -123,6 +125,8 @@ impl Default for Appearance {
             ui_background: "#121214".into(),
             ui_foreground: "#FAF5F0".into(),
             ui_accent: "#FFD000".into(),
+            badge_corner_radius: 0,
+            target_color: None,
         }
     }
 }

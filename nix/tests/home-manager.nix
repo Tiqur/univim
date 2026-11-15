@@ -212,6 +212,8 @@ let
         uiScale = 2.0;
         badgeBackground = "#AABBCC";
         typedForeground = "#112233";
+        badgeCornerRadius = 6;
+        targetColor = "#AA91FF";
       };
     }
   ];
@@ -334,12 +336,16 @@ let
       && lib.hasInfix "\"min_score\":0.52" globalSettings
       && lib.hasInfix "\"hint_font_scale\":0.68" globalSettings
       && lib.hasInfix "\"ui_scale\":1.6" globalSettings
+      && lib.hasInfix "\"badge_corner_radius\":0" globalSettings
+      && lib.hasInfix "\"target_color\":null" globalSettings
     ))
     (check "appearance settings generate typed colors and independent UI/hint sizes" (
       lib.hasInfix "\"hint_font_scale\":1.0" customAppearanceSettings
       && lib.hasInfix "\"ui_scale\":2.0" customAppearanceSettings
       && lib.hasInfix "\"badge_background\":\"#AABBCC\"" customAppearanceSettings
       && lib.hasInfix "\"typed_foreground\":\"#112233\"" customAppearanceSettings
+      && lib.hasInfix "\"badge_corner_radius\":6" customAppearanceSettings
+      && lib.hasInfix "\"target_color\":\"#AA91FF\"" customAppearanceSettings
     ))
     (check "opt-in single CapsLock generates consuming bindings and disables evdev gestures" (
       lib.any (value: lib.hasInfix ", code:66, exec," value && lib.hasInfix "univim-desktop hints" value) singleCapsValues.bind

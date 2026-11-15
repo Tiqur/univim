@@ -26,6 +26,9 @@ pub(crate) struct BadgeStyle {
     pub background: Scalar,
     pub foreground: Scalar,
     pub typed_foreground: Scalar,
+    pub corner_radius: i32,
+    pub border: Scalar,
+    pub target_color: Option<Scalar>,
 }
 
 /// The public overlay keeps the reference pixels; desktop-only styling is opt-in.
@@ -44,7 +47,9 @@ pub(crate) fn overlay_with_style(
             t.y,
             t.w,
             t.h,
-            color(&t.kind),
+            style
+                .and_then(|s| s.target_color)
+                .unwrap_or_else(|| color(&t.kind)),
             -1,
             imgproc::LINE_8,
         )?
@@ -83,7 +88,9 @@ pub(crate) fn overlay_with_style(
             t.y,
             t.w,
             t.h,
-            color(&t.kind),
+            style
+                .and_then(|s| s.target_color)
+                .unwrap_or_else(|| color(&t.kind)),
             thick,
             imgproc::LINE_AA,
         )?;
@@ -110,16 +117,18 @@ pub(crate) fn overlay_with_style(
         };
         let right = (bgr.cols() - 1).min(bx + bw);
         let bottom = (bgr.rows() - 1).min(by + bh);
-        rect(
-            &mut canvas,
-            bx - 1,
-            by - 1,
-            right - bx + 2,
-            bottom - by + 2,
-            Scalar::all(15.),
-            -1,
-            imgproc::LINE_8,
-        )?;
+        if style.is_none_or(|s| s.corner_radius == 0) {
+            rect(
+                &mut canvas,
+                bx - 1,
+                by - 1,
+                right - bx + 2,
+                bottom - by + 2,
+                Scalar::all(15.),
+                -1,
+                imgproc::LINE_8,
+            )?;
+        }
         let bg = style.map_or_else(
             || {
                 if t.kind == "text_block" {
@@ -130,16 +139,31 @@ pub(crate) fn overlay_with_style(
             },
             |style| style.background,
         );
-        rect(
-            &mut canvas,
-            bx,
-            by,
-            right - bx,
-            bottom - by,
-            bg,
-            -1,
-            imgproc::LINE_8,
-        )?;
+        if let Some(style) = style.filter(|s| s.corner_radius > 0) {
+            rounded_fill(
+                &mut canvas,
+                Rect::new(bx - 1, by - 1, right - bx + 3, bottom - by + 3),
+                style.corner_radius,
+                style.border,
+            )?;
+            rounded_fill(
+                &mut canvas,
+                Rect::new(bx, by, right - bx + 1, bottom - by + 1),
+                (style.corner_radius - 1).max(0),
+                bg,
+            )?;
+        } else {
+            rect(
+                &mut canvas,
+                bx,
+                by,
+                right - bx,
+                bottom - by,
+                bg,
+                -1,
+                imgproc::LINE_8,
+            )?;
+        }
         let text_x = bx + pad;
         let text_y = bottom - pad;
         imgproc::put_text(
@@ -171,6 +195,62 @@ pub(crate) fn overlay_with_style(
         }
     }
     Ok(canvas)
+}
+
+/// Clamp rounded corners to the available badge, including clipped edge targets.
+pub(crate) fn rounded_fill(
+    canvas: &mut Mat,
+    bounds: Rect,
+    radius: i32,
+    color: Scalar,
+) -> opencv::Result<()> {
+    if bounds.width <= 0 || bounds.height <= 0 {
+        return Ok(());
+    }
+    let radius = radius.clamp(0, (bounds.width.min(bounds.height) - 1) / 2);
+    if radius == 0 {
+        return imgproc::rectangle(canvas, bounds, color, -1, imgproc::LINE_AA, 0);
+    }
+    imgproc::rectangle(
+        canvas,
+        Rect::new(
+            bounds.x + radius,
+            bounds.y,
+            bounds.width - 2 * radius,
+            bounds.height,
+        ),
+        color,
+        -1,
+        imgproc::LINE_AA,
+        0,
+    )?;
+    imgproc::rectangle(
+        canvas,
+        Rect::new(
+            bounds.x,
+            bounds.y + radius,
+            bounds.width,
+            bounds.height - 2 * radius,
+        ),
+        color,
+        -1,
+        imgproc::LINE_AA,
+        0,
+    )?;
+    for x in [bounds.x + radius, bounds.x + bounds.width - radius - 1] {
+        for y in [bounds.y + radius, bounds.y + bounds.height - radius - 1] {
+            imgproc::circle(
+                canvas,
+                Point::new(x, y),
+                radius,
+                color,
+                -1,
+                imgproc::LINE_AA,
+                0,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub fn drilldown_overlay(bgr: &Mat, parent: &Target, to_words: bool) -> opencv::Result<Mat> {
@@ -350,6 +430,9 @@ mod style_tests {
             background: Scalar::new(20., 30., 40., 0.),
             foreground: Scalar::all(250.),
             typed_foreground: Scalar::new(0., 0., 255., 0.),
+            corner_radius: 6,
+            border: Scalar::all(120.),
+            target_color: Some(Scalar::new(255., 145., 170., 0.)),
         };
         let plain =
             overlay_with_style(&base, std::slice::from_ref(&target), "", Some(&style)).unwrap();
@@ -360,5 +443,22 @@ mod style_tests {
             emphasized.data_bytes().unwrap()
         );
         assert_eq!(overlay(&base, &[target]).unwrap().cols(), 180);
+    }
+
+    #[test]
+    fn rounded_badges_clip_and_bound_the_radius() {
+        let mut canvas = Mat::new_rows_cols_with_default(20, 20, CV_8UC3, Scalar::all(0.)).unwrap();
+        rounded_fill(&mut canvas, Rect::new(2, 2, 15, 15), 255, Scalar::all(255.)).unwrap();
+        assert_eq!(
+            *canvas.at_2d::<opencv::core::Vec3b>(9, 9).unwrap(),
+            opencv::core::Vec3b::all(255)
+        );
+        assert_eq!(
+            *canvas.at_2d::<opencv::core::Vec3b>(2, 2).unwrap(),
+            opencv::core::Vec3b::all(0)
+        );
+        rounded_fill(&mut canvas, Rect::new(-4, -4, 8, 8), 6, Scalar::all(80.)).unwrap();
+        rounded_fill(&mut canvas, Rect::new(19, 19, 1, 1), 6, Scalar::all(80.)).unwrap();
+        rounded_fill(&mut canvas, Rect::new(0, 0, 0, 0), 6, Scalar::all(80.)).unwrap();
     }
 }

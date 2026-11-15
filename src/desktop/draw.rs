@@ -200,6 +200,9 @@ fn render_standard_overlay(
                 background: Appearance::color(&a.badge_background),
                 foreground: Appearance::color(&a.badge_foreground),
                 typed_foreground: Appearance::color(&a.typed_foreground),
+                corner_radius: a.badge_corner_radius.into(),
+                border: Appearance::color(&a.ui_accent),
+                target_color: a.target_color.as_deref().map(Appearance::color),
             });
             crate::render::overlay_with_style(base_bgr, &filtered, session.typed(), style.as_ref())
         }
@@ -563,20 +566,12 @@ fn draw_status_pill(
         (size.height + pad_y * 2).min(canvas.rows() - y - 2).max(16),
     );
 
-    imgproc::rectangle(
-        canvas,
-        rect,
-        Appearance::color(&appearance.ui_background),
-        -1,
-        imgproc::LINE_8,
-        0,
-    )?;
     let border_col = if session.cached_hit() {
         Scalar::new(80.0, 235.0, 130.0, 0.0)
     } else {
         Appearance::color(&appearance.ui_accent)
     };
-    imgproc::rectangle(canvas, rect, border_col, 1, imgproc::LINE_8, 0)?;
+    draw_panel(canvas, rect, appearance, border_col)?;
     imgproc::put_text(
         canvas,
         &status,
@@ -589,6 +584,32 @@ fn draw_status_pill(
         false,
     )?;
     Ok(())
+}
+
+fn draw_panel(
+    canvas: &mut Mat,
+    bounds: Rect,
+    appearance: &Appearance,
+    border: Scalar,
+) -> opencv::Result<()> {
+    let background = Appearance::color(&appearance.ui_background);
+    if appearance.badge_corner_radius == 0 {
+        imgproc::rectangle(canvas, bounds, background, -1, imgproc::LINE_8, 0)?;
+        return imgproc::rectangle(canvas, bounds, border, 1, imgproc::LINE_8, 0);
+    }
+    let radius = scaled(appearance.badge_corner_radius.into(), appearance.ui_scale);
+    crate::render::rounded_fill(canvas, bounds, radius, border)?;
+    crate::render::rounded_fill(
+        canvas,
+        Rect::new(
+            bounds.x + 1,
+            bounds.y + 1,
+            bounds.width - 2,
+            bounds.height - 2,
+        ),
+        radius - 1,
+        background,
+    )
 }
 
 fn draw_debug_hud(
@@ -604,21 +625,11 @@ fn draw_debug_hud(
     let y = scaled(14, scale);
     let rect = Rect::new(x, y, panel_w, panel_h);
 
-    imgproc::rectangle(
+    draw_panel(
         canvas,
         rect,
-        Appearance::color(&appearance.ui_background),
-        -1,
-        imgproc::LINE_8,
-        0,
-    )?;
-    imgproc::rectangle(
-        canvas,
-        rect,
+        appearance,
         Appearance::color(&appearance.ui_accent),
-        1,
-        imgproc::LINE_8,
-        0,
     )?;
 
     let font = imgproc::FONT_HERSHEY_SIMPLEX;

@@ -442,6 +442,19 @@ matching labels emphasize the typed prefix in bold `typedForeground`; completed
 hints select their target immediately. These are desktop-only presentation
 settings; detector output and annotated snapshots keep their reference styling.
 
+Optional `badgeCornerRadius = 6` rounds desktop badges and panels (default `0`
+retains square corners). `targetColor = "#AA91FF"` gives desktop outlines/fills a
+coherent accent; the default `null` retains per-kind colors. These do not change
+target scoring, hint assignment or the standalone reference renderer. A dark
+theme can use `badgeBackground = "#0E0F16"`, `badgeForeground = "#EDF0F7"`,
+`typedForeground = "#71E9E9"`, `uiBackground = "#0B0C12"`,
+`uiForeground = "#EDF0F7"` and `uiAccent = "#AA91FF"`.
+Overlay entrance/exit animation belongs to the compositor, not a capture/render
+timer: a Hyprland layer rule for namespace `univim` can select `animation = "fade"`
+and `no_anim = false`. It follows compositor animation settings, including off;
+keep `no_anim = true` for instant presentation. Input and hint selection are not
+delayed by a client animation loop. OpenCV's built-in font remains in use.
+
 `services.univim.settings.pointerMotion` selects `"instant"` (default),
 `"linear"` or `"ease_out"`; `pointerSpeed` (200–6000 logical px/s, default 1600)
 controls the distance-dependent glide after hint selection (20 ms minimum,

@@ -77,6 +77,8 @@ let
       ui_background = settings.appearance.uiBackground;
       ui_foreground = settings.appearance.uiForeground;
       ui_accent = settings.appearance.uiAccent;
+      badge_corner_radius = settings.appearance.badgeCornerRadius;
+      target_color = settings.appearance.targetColor;
     };
   };
 
@@ -312,6 +314,16 @@ in
         description = "Cursor glide speed in logical pixels per second.";
       };
       appearance = {
+        badgeCornerRadius = lib.mkOption {
+          type = lib.types.ints.between 0 24;
+          default = 0;
+          description = "Rounded desktop hint corners in capture pixels; zero preserves square badges.";
+        };
+        targetColor = lib.mkOption {
+          type = lib.types.nullOr (lib.types.strMatching "#[0-9a-fA-F]{6}");
+          default = null;
+          description = "Desktop target outline/fill color; null preserves semantic target colors.";
+        };
         hintFontScale = lib.mkOption {
           type = lib.types.numbers.between 0.25 2.0;
           default = 0.68;
