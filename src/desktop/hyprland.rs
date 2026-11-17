@@ -92,6 +92,7 @@ pub fn selected_output(name: Option<&str>) -> Result<Output, String> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Context {
     outputs: Vec<(Output, bool)>,
+    monitor_ids: Vec<(i64, String)>,
     focused_output: String,
     workspaces: Vec<(String, i64, i64)>,
     client: Option<String>,
@@ -101,6 +102,18 @@ pub struct Context {
 impl Context {
     /// Name of the monitor that currently owns Hyprland's keyboard focus.
     pub fn focused_monitor(&self) -> Option<&str> {
+        // Keyboard-focused clients can differ from the pointer-focused monitor.
+        // Keep the raw monitor focus in the invalidation snapshot: our own layer
+        // temporarily clears activewindow, and must not invalidate itself.
+        if let Some(client) = self.client.as_deref()
+            && let Some(client) = self.visible_clients.iter().find(|c| c.address == client)
+            && let Some((_, name)) = self
+                .monitor_ids
+                .iter()
+                .find(|(id, _)| *id == client.monitor)
+        {
+            return Some(name);
+        }
         (!self.focused_output.is_empty()).then_some(self.focused_output.as_str())
     }
 
@@ -171,12 +184,49 @@ fn visible_clients(
     Ok(clients)
 }
 
+fn workspace_id(value: &Value, allow_empty: bool) -> Result<i64, String> {
+    if let Some(id) = value.as_i64() {
+        return Ok(id);
+    }
+    if let Some(id) = value.as_str() {
+        // Accept the legacy empty-ID representation only for special workspaces.
+        if allow_empty && id.is_empty() {
+            return Ok(0);
+        }
+        return id.parse().map_err(|_| "invalid workspace id".into());
+    }
+    Err("invalid workspace id".into())
+}
+
 pub fn context() -> Result<Context, String> {
-    let monitors = monitors()?;
+    context_from_values(monitors()?, query("activewindow")?, query("clients")?)
+}
+
+fn special_workspace_id(value: &Value) -> Result<i64, String> {
+    if let Some(id) = value.get("id") {
+        return workspace_id(id, true);
+    }
+    // Hyprland 0.57 omits `id` altogether for this exact empty-workspace shape.
+    // Missing/malformed IDs on a real special workspace must still fail closed.
+    if ["address", "type", "name"]
+        .iter()
+        .all(|key| value[*key].as_str() == Some(""))
+    {
+        return Ok(0);
+    }
+    Err("invalid special workspace".into())
+}
+
+fn context_from_values(
+    monitors: Vec<Value>,
+    active: Value,
+    clients: Value,
+) -> Result<Context, String> {
     let mut outputs = Vec::new();
     let mut workspaces = Vec::new();
     let mut focused_output = String::new();
     let mut visible_monitors = Vec::new();
+    let mut monitor_ids = Vec::new();
     for m in &monitors {
         if m["disabled"].as_bool().ok_or("invalid monitor disabled")? {
             continue;
@@ -187,14 +237,12 @@ pub fn context() -> Result<Context, String> {
         }
         workspaces.push((
             o.name.clone(),
-            m["activeWorkspace"]["id"]
-                .as_i64()
-                .ok_or("invalid active workspace")?,
-            m["specialWorkspace"]["id"]
-                .as_i64()
-                .ok_or("invalid special workspace")?,
+            workspace_id(&m["activeWorkspace"]["id"], false)?,
+            special_workspace_id(&m["specialWorkspace"])?,
         ));
-        visible_monitors.push(m["id"].as_i64().ok_or("invalid monitor id")?);
+        let id = m["id"].as_i64().ok_or("invalid monitor id")?;
+        visible_monitors.push(id);
+        monitor_ids.push((id, o.name.clone()));
         outputs.push((
             o,
             m["dpmsStatus"]
@@ -204,7 +252,7 @@ pub fn context() -> Result<Context, String> {
     }
     outputs.sort_by(|a, b| a.0.name.cmp(&b.0.name));
     workspaces.sort();
-    let active = query("activewindow")?;
+    monitor_ids.sort();
     let active = active.as_object().ok_or("invalid active window reply")?;
     let client = if active.is_empty() {
         None
@@ -218,9 +266,10 @@ pub fn context() -> Result<Context, String> {
                 .to_owned(),
         )
     };
-    let visible_clients = visible_clients(query("clients")?, &workspaces, &visible_monitors)?;
+    let visible_clients = visible_clients(clients, &workspaces, &visible_monitors)?;
     Ok(Context {
         outputs,
+        monitor_ids,
         focused_output,
         workspaces,
         client,
@@ -234,6 +283,7 @@ pub fn still_current(previous: &Context) -> Result<bool, String> {
     // Hyprland may report no active client while a layer owns keyboard focus.
     // A different nonempty active client, however, must never receive stale clicks.
     Ok(previous.outputs == current.outputs
+        && previous.monitor_ids == current.monitor_ids
         && previous.focused_output == current.focused_output
         && previous.workspaces == current.workspaces
         && previous.visible_clients == current.visible_clients
@@ -243,6 +293,70 @@ pub fn still_current(previous: &Context) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_057_empty_special_workspace_snapshot_selects_second_output() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/data/hyprland-057-context.json"))
+                .unwrap();
+        let context = context_from_values(
+            fixture["monitors"].as_array().unwrap().clone(),
+            fixture["activewindow"].clone(),
+            fixture["clients"].clone(),
+        )
+        .unwrap();
+        assert_eq!(context.focused_monitor(), Some("VMAGENT-TEST"));
+        assert!(
+            context
+                .workspaces
+                .iter()
+                .all(|(_, _, special)| *special == 0)
+        );
+        assert!(
+            special_workspace_id(&serde_json::json!({"id":null,"address":"","name":"","type":""}))
+                .is_err()
+        );
+        assert!(
+            special_workspace_id(
+                &serde_json::json!({"address":"1","name":"special:real","type":"special"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_ids_accept_new_empty_special_sentinel_without_accepting_bad_ids() {
+        assert_eq!(workspace_id(&serde_json::json!(""), true), Ok(0));
+        assert_eq!(workspace_id(&serde_json::json!(0), true), Ok(0));
+        assert_eq!(workspace_id(&serde_json::json!("9"), false), Ok(9));
+        assert_eq!(workspace_id(&serde_json::json!(-99), true), Ok(-99));
+        assert!(workspace_id(&serde_json::json!(""), false).is_err());
+        assert!(workspace_id(&serde_json::json!(null), true).is_err());
+        assert!(workspace_id(&serde_json::json!("garbage"), true).is_err());
+    }
+
+    #[test]
+    fn focused_window_output_wins_over_pointer_monitor_and_empty_desktop_falls_back() {
+        let client: Client = serde_json::from_value(serde_json::json!({
+            "address":"0x1", "at":[10,20], "size":[300,200],
+            "workspace":{"id":9}, "monitor":1, "mapped":true,
+            "hidden":false, "fullscreen":0, "floating":false, "pinned":false
+        }))
+        .unwrap();
+        let mut context = Context {
+            outputs: vec![],
+            monitor_ids: vec![(0, "DP-1".into()), (1, "DP-3".into())],
+            focused_output: "DP-1".into(),
+            workspaces: vec![],
+            client: Some("0x1".into()),
+            visible_clients: vec![client],
+        };
+        assert_eq!(context.focused_monitor(), Some("DP-3"));
+        // Layer focus does not rewrite the stored monitor-focus fingerprint.
+        assert_eq!(context.focused_output, "DP-1");
+        context.client = None;
+        assert_eq!(context.focused_monitor(), Some("DP-1"));
+    }
 
     #[test]
     fn client_snapshot_tracks_geometry_not_order_or_titles() {
@@ -314,6 +428,7 @@ mod tests {
         };
         let ctx = Context {
             outputs: vec![(out, true)],
+            monitor_ids: vec![(0, "DP-1".into())],
             focused_output: "DP-1".into(),
             workspaces: vec![("DP-1".into(), 1, 0)],
             client: Some("0xabc".into()),

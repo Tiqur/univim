@@ -1,0 +1,10 @@
+{
+  "monitors": [
+    {"id":0,"name":"Virtual-1","x":0,"y":0,"width":1920,"height":1080,"scale":1,"transform":0,"disabled":false,"dpmsStatus":true,"focused":false,
+     "activeWorkspace":{"address":"1","id":1,"type":"normal","name":"1"},"specialWorkspace":{"address":"","type":"","name":""}},
+    {"id":1,"name":"VMAGENT-TEST","x":1920,"y":0,"width":1080,"height":1920,"scale":1,"transform":0,"disabled":false,"dpmsStatus":true,"focused":true,
+     "activeWorkspace":{"address":"2","id":2,"type":"normal","name":"2"},"specialWorkspace":{"address":"","type":"","name":""}}
+  ],
+  "activewindow":{"address":"0x1"},
+  "clients":[{"address":"0x1","at":[1937,79],"size":[1046,1824],"workspace":{"address":"2","id":2,"type":"normal","name":"2"},"floating":false,"monitor":1,"mapped":true,"hidden":false,"pinned":false,"fullscreen":0}]
+}
